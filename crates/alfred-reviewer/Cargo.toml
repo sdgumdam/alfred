@@ -1,0 +1,12 @@
+[package]
+name = "alfred-reviewer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alfred-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

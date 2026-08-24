@@ -1,0 +1,19 @@
+[package]
+name = "alfred-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "alfred"
+path = "src/main.rs"
+
+[dependencies]
+alfred-core = { workspace = true }
+alfred-planner = { workspace = true }
+alfred-executor = { workspace = true }
+alfred-reviewer = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+[dev-dependencies]
+tempfile = { workspace = true }
