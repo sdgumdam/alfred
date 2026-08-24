@@ -1,4 +1,5 @@
 mod decide;
+mod ask_panel;
 mod plan;
 mod run;
 mod status;

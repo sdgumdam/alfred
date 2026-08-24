@@ -11,11 +11,12 @@
 //! SandboxProfile 从 DagSpec 入口节点的 params["sandbox"] 读，没有则用默认 deny-all。
 
 use crate::store;
+use crate::ask_panel;
 use crate::{EXIT_ESCALATED, EXIT_OK, EXIT_USAGE};
 use alfred_core::{
     now_millis, offline_mode, Artifact, Confidence, Event, ExecVerdict, FailureClass, NodeSpec,
-    Orchestrator, OwnerRequest, RouteAction, SessionDoc, State, TaskAssignment, VerdictValue,
-    HANDLER_RUN_INSPECT_EVAL,
+    Orchestrator, OwnerRequest, RouteAction, SessionDoc, State, TaskAssignment,
+    VerdictValue, HANDLER_RUN_INSPECT_EVAL,
 };
 use alfred_executor::{execute_in_container, SandboxProfile};
 use alfred_planner::{plan_owner_request, rejection_report, PlanError};
@@ -86,8 +87,9 @@ fn execute(request_path: &Path, out_dir: Option<&Path>) -> Result<u8, String> {
 
     if orch.state() == State::PlanRejected {
         // 计划被拒：挂起等待属主 decide，dagspec 不落地。
+        // ask panel 触发时 spawn pi 交互决策；不触发（离线/CI）直接 exit 1。
         print_summary(&run_dir, &orch);
-        return Ok(EXIT_ESCALATED);
+        return handle_suspension(&orch, &run_dir);
     }
 
     let dagspec_path = run_dir.join("dagspec.json");
@@ -136,12 +138,54 @@ fn execute(request_path: &Path, out_dir: Option<&Path>) -> Result<u8, String> {
         }
     }
 
-    print_summary(&run_dir, &orch);
     match orch.state() {
         State::Completed => Ok(EXIT_OK),
-        State::Escalated => Ok(EXIT_ESCALATED),
+        State::Escalated => handle_suspension(&orch, &run_dir),
         state => Err(format!("run ended in unexpected state {}", store::state_name(state))),
     }
+}
+/// 挂起态（PlanRejected / Escalated）的收尾：触发 ask panel 时 spawn pi 交互
+/// 决策并复用 decide 逻辑（apply OwnerDecided + 写回 state.json + audit.jsonl）；
+/// 不触发（离线模式 / ALFRED_NO_ASK_PANEL=1）时保持现有行为直接 EXIT_ESCALATED。
+/// ask panel 失败时打印错误 + 提示手动 alfred decide，exit 1。
+fn handle_suspension(orch: &Orchestrator, run_dir: &Path) -> Result<u8, String> {
+    if !ask_panel::should_trigger(orch.state()) {
+        return Ok(EXIT_ESCALATED);
+    }
+    // 读 verdicts.jsonl 最后一条，作为 ask panel 的升级上下文。
+    let verdict = read_last_verdict(run_dir)?;
+    match ask_panel::spawn_ask_panel(orch.state(), &verdict, run_dir, orch.attempts(), orch.retry_budget()) {
+        Ok(decision) => {
+            let mut orch = orch.clone();
+            let outcome = store::apply_event(&mut orch, run_dir, Event::OwnerDecided(decision))?;
+            println!("state: {}", store::state_name(outcome.new_state));
+            match outcome.new_state {
+                State::Completed => Ok(EXIT_OK),
+                // 重跑 / 改契约后回到执行或计划：本 run 闭环到此，后续由下一轮 run 继续。
+                _ => Ok(EXIT_ESCALATED),
+            }
+        }
+        Err(err) => {
+            eprintln!("ask panel failed: {err}");
+            eprintln!(
+                "  手动决策请运行: alfred decide {} <retry|revise-contract|abandon>",
+                run_dir.display()
+            );
+            Ok(EXIT_ESCALATED)
+        }
+    }
+}
+
+/// 读 verdicts.jsonl 最后一条记录（含 type/verdict/timestamp），用于 ask panel 上下文。
+/// 文件缺失或为空时返回错误，使 ask panel 不会在无裁决时触发。
+fn read_last_verdict(run_dir: &Path) -> Result<serde_json::Value, String> {
+    let path = run_dir.join(store::VERDICTS_FILE);
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    raw.lines()
+        .filter(|l| !l.is_empty())
+        .last()
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .ok_or_else(|| format!("no verdicts found in {}", path.display()))
 }
 
 fn read_owner_request(request_path: &Path) -> Result<OwnerRequest, String> {
@@ -357,5 +401,119 @@ mod tests {
             run_code(&request_path, Some(&tmp.path().join("run-bad"))),
             EXIT_USAGE
         );
+    }
+    fn dag_spec_for_test() -> alfred_core::DagSpec {
+        use alfred_core::{Contract, NodeType};
+        use serde_json::{Map, Value};
+        use std::collections::BTreeMap;
+        alfred_core::DagSpec {
+            name: "test".into(),
+            version: 1,
+            entrypoint: "n1".into(),
+            nodes: vec![NodeSpec {
+                node_id: "n1".into(),
+                node_type: NodeType::Step,
+                contract: Contract {
+                    prompt: "do it".into(),
+                    acceptance_criteria: "done".into(),
+                    reviewer_models: vec![],
+                },
+                params: Map::<String, Value>::new(),
+                input_schema: BTreeMap::new(),
+                routes: None,
+            }],
+            edges: vec![],
+        }
+    }
+
+    fn escalated_orchestrator() -> Orchestrator {
+        let mut orch = Orchestrator::new(RETRY_BUDGET);
+        orch.transition(Event::PlanSubmitted(dag_spec_for_test())).unwrap();
+        orch.transition(Event::PlanReviewed(alfred_core::PlanVerdict {
+            pass: true,
+            reason: "ok".into(),
+        }))
+        .unwrap();
+        orch.transition(Event::ExecutionDone(Artifact {
+            node_id: "n1".into(),
+            workspace_diff: "diff".into(),
+            produced_at: "2026-08-24T00:00:00Z".into(),
+        }))
+        .unwrap();
+        orch.transition(Event::ExecReviewed(ExecVerdict::failed(
+            VerdictValue::P,
+            FailureClass::ContractFault,
+            Confidence::Medium,
+            vec![],
+            "contract fault".into(),
+        )))
+        .unwrap();
+        orch
+    }
+
+    #[test]
+    fn handle_suspension_offline_skips_pi_and_returns_escalated() {
+        // 挂起态在离线模式（或显式 ALFRED_NO_ASK_PANEL=1）下不触发 ask panel：
+        // handle_suspension 直接返回 EXIT_ESCALATED，不 spawn pi，不修改 state.json。
+        // 同时设两个逃生舱，使本测试对 ALFRED_OFFLINE 的 env 竞态免疫（即使
+        // 并行测试临时 unset ALFRED_OFFLINE，no-ask-panel 仍保证 should_trigger=false）。
+        std::env::set_var("ALFRED_OFFLINE", "1");
+        std::env::set_var("ALFRED_NO_ASK_PANEL", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let orch = escalated_orchestrator();
+        store::save_orchestrator(dir, &orch).unwrap();
+        assert!(!ask_panel::should_trigger(orch.state()));
+        let result = handle_suspension(&orch, dir);
+        assert_eq!(result, Ok(EXIT_ESCALATED));
+        // state.json 未被修改（仍为 escalated）。
+        let restored = store::load_orchestrator(dir).unwrap();
+        assert_eq!(restored.state(), State::Escalated);
+        std::env::remove_var("ALFRED_NO_ASK_PANEL");
+    }
+
+    #[test]
+    fn no_ask_panel_flag_skips_panel() {
+        // ALFRED_NO_ASK_PANEL=1 显式跳过 pi 卡片，与 offline 并存都返回 false。
+        std::env::set_var("ALFRED_OFFLINE", "1");
+        std::env::set_var("ALFRED_NO_ASK_PANEL", "1");
+        assert!(!ask_panel::should_trigger(State::Escalated));
+        assert!(!ask_panel::should_trigger(State::PlanRejected));
+        std::env::remove_var("ALFRED_NO_ASK_PANEL");
+    }
+
+    #[test]
+    fn ask_panel_does_not_trigger_on_completed_run() {
+        // 正常完成（exit 0）和其他非挂起态不触发 ask panel。
+        std::env::set_var("ALFRED_OFFLINE", "1");
+        assert!(!ask_panel::should_trigger(State::Completed));
+        assert!(!ask_panel::should_trigger(State::Planning));
+        assert!(!ask_panel::should_trigger(State::Executing));
+    }
+    #[test]
+    fn read_last_verdict_returns_last_jsonl_line() {
+        // read_last_verdict 读 verdicts.jsonl 最后一条，含 type/verdict/timestamp。
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join(VERDICTS_FILE),
+            r#"{"type":"plan","verdict":{"pass":true},"timestamp":1}
+{"type":"exec","verdict":{"value":"I"},"timestamp":2}
+"#,
+        )
+        .unwrap();
+        let last = read_last_verdict(dir).unwrap();
+        assert_eq!(last["type"], "exec");
+        assert_eq!(last["verdict"]["value"], "I");
+    }
+
+    #[test]
+    fn read_last_verdict_errors_on_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(VERDICTS_FILE), "").unwrap();
+        assert!(read_last_verdict(dir).is_err());
     }
 }
