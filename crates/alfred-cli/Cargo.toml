@@ -1,0 +1,17 @@
+[package]
+name = "alfred-cli"
+version.workspace = true
+edition.workspace = true
+description = "alfred 命令行入口（R1：run 雏形）"
+
+[[bin]]
+name = "alfred"
+path = "src/main.rs"
+
+[dependencies]
+alfred-core = { workspace = true }
+alfred-executor = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,11 @@
+# alfred 执行者沙箱 compose 模板（R1）
+# network_mode: none —— 联网默认拒绝（P2）。容器内只有 lo。
+# 工作区卷由 alfred-executor 按 run 目录动态生成（executor.compose.yaml），
+# 本文件是"零挂载"的参考基座，供手工调试与文档引用。
+services:
+  default:
+    image: "alfred-executor:latest"
+    command: "tail -f /dev/null"
+    init: true
+    network_mode: none
+    stop_grace_period: 1s

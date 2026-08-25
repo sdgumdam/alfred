@@ -1,0 +1,24 @@
+//! alfred-executor：执行侧（R1）。
+//!
+//! 职责（实施计划 R1 交付）：
+//! 1. `task_gen`：Rust 生成 Inspect Task 定义（Python 文件）。
+//! 2. `compose_gen`：按 run 目录生成沙箱 compose（network none + 工作区卷）。
+//! 3. `driver`：spawn `inspect eval --detach --json`（venv python）→ 轮询
+//!    output_file 的 done 记录 → `inspect log dump` 取证据。
+//! 4. `artifact`：容器 workspace 卷的文件比对（前后快照 diff）。
+//! 5. `config`：R1 最小 executor 配置（roles.executor → 模型 → provider）。
+//!
+//! P1/P2 审计约束（R0报告）：
+//! - 执行 eval 进程只注入 executor 一个 provider 凭据（经 env：`{PROVIDER}_API_KEY`
+//!   + `ALFRED_EXEC_API_KEY`，env_clear + 白名单，不进 argv），容器内经桥只能
+//!   解析 executor 模型。
+//! - forward_generation_config 默认 False；宿主 Model 配置定死 max_tokens（≥1024，
+//!   glm-5.2 是 reasoning 模型）。
+//! - detach+ctl 首用：完成判定看 output_file 末行 done 记录；进程消失无 done = crash。
+
+pub mod artifact;
+pub mod compose_gen;
+pub mod config;
+pub mod driver;
+pub mod run;
+pub mod task_gen;

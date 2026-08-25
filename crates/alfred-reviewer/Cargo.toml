@@ -1,0 +1,8 @@
+[package]
+name = "alfred-reviewer"
+version.workspace = true
+edition.workspace = true
+description = "alfred 审查者（R2/R3 实现；R1 占位）"
+
+[dependencies]
+alfred-core = { workspace = true }

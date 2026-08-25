@@ -1,0 +1,15 @@
+[package]
+name = "alfred-executor"
+version.workspace = true
+edition.workspace = true
+description = "alfred 执行侧：生成 Inspect Task 定义、驱动 inspect eval --detach、ctl 轮询、产物采集"
+
+[dependencies]
+alfred-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+time = { workspace = true }

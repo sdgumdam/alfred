@@ -1,0 +1,10 @@
+[package]
+name = "alfred-core"
+version.workspace = true
+edition.workspace = true
+description = "alfred 共享实体（唯一真源）：OwnerRequest/Contract/SandboxProfile/TaskAssignment/Artifact/ExecVerdict"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
