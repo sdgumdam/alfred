@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+jobs:
+  build-macos:
+    runs-on: macos-14
     permissions:
       contents: write
     steps:
