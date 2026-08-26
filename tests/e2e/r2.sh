@@ -4,13 +4,15 @@
 #
 #   1. 执行审查正路径：alfred run（pi 真容器 + 内嵌 ExecVerdict scorer 判 C）
 #   1b. 执行审查部分兑现：alfred run（prompt 只建 hello.txt，验收要 hello+world
-#       → grader 判 P）
+#       → grader 判 P + fidelity_dispute → §3.3 升级挂起 escalated）
 #   2. 注定不忠实计划：alfred plan-review（需求 A 计划做 B → pass=false 打回）
 #   3. 解析失败 → unscored：alfred plan-review（reviewer=mockllm → 解析失败）
 #
 # 模型：默认 glm-4.7（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
 # ALFRED_CONFIG 提供）。可用 ALFRED_EXECUTOR_MODEL / ALFRED_REVIEWER_MODEL
 # 覆盖（config 缺失的模型 id 会沿用基础角色 provider——见 config.rs）。
+# R3 起 `alfred run` 是完整治理环：case1/1b 断言读治理环 state.json
+# （state_machine/exec_verdicts），执行产物在 exec-N/workspace/。
 # 验收：cargo test 全绿 + 本脚本四用例 PASS。
 # ============================================================================
 set -euo pipefail
@@ -46,7 +48,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 
 # --- 模型（glm-4.7 省钱；e2e 用 env 覆盖，config 缺失时沿用 zhipucoding provider）---
-export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-4.7}"
+export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.2}"
 export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-4.7}"
 
 # --- cargo build + test ---
@@ -79,17 +81,21 @@ cargo run --quiet -p alfred-cli -- run \
   --time-limit "${R2_TIME_LIMIT:-900}" \
   --image "$IMAGE"
 
-# 断言：hello.txt 内容 + verdict.value == C
-if [[ ! -f "$CASE1_DIR/workspace/hello.txt" ]]; then
-  echo "FAIL(case1): workspace/hello.txt not found" >&2
+# 断言：hello.txt 内容 + exec verdict C（R3 布局：产物在 exec-N/workspace/，
+# state.json 为治理环状态）
+EXEC1="$(ls -d "$CASE1_DIR"/exec-* 2>/dev/null | sort -V | tail -1 || true)"
+if [[ -z "$EXEC1" ]] || [[ ! -f "$EXEC1/workspace/hello.txt" ]]; then
+  echo "FAIL(case1): exec-N/workspace/hello.txt not found (exec=$EXEC1)" >&2
   exit 1
 fi
-[[ "$(cat "$CASE1_DIR/workspace/hello.txt")" == "Hello" ]] || { echo "FAIL(case1): hello.txt content wrong" >&2; exit 1; }
+[[ "$(cat "$EXEC1/workspace/hello.txt")" == "Hello" ]] || { echo "FAIL(case1): hello.txt content wrong" >&2; exit 1; }
 python3 - "$CASE1_DIR/state.json" <<'PY' || { echo "FAIL(case1): exec verdict not C" >&2; exit 1; }
 import json, sys
-st = json.load(open(sys.argv[1]))
-v = st["run"]["verdict"]
-assert v is not None, f"verdict is None (unscored={st['run'].get('verdict_unscored_reason')})"
+d = json.load(open(sys.argv[1]))
+assert d["state_machine"]["state"] == "completed", f"state={d['state_machine']['state']}"
+vs = d["exec_verdicts"]
+assert len(vs) >= 1, "no exec verdict"
+v = vs[-1]
 assert v["value"] == "C", f"expected C, got {v['value']} ({v})"
 assert v.get("failure_class") is None, f"C must have failure_class None, got {v.get('failure_class')}"
 PY
@@ -108,27 +114,50 @@ cat > "$CASE1B_DIR/request.json" <<'JSON'
 {
   "id": "req-r2-exec-partial",
   "title": "create hello.txt only (partial vs acceptance)",
-  "description": "Create exactly ONE file named hello.txt in the workspace. Its content must be exactly: Hello. Do NOT create any other file.",
+  "description": "Create exactly ONE file named hello.txt in the workspace. Its content must be exactly: Hello. Do NOT create any other file. Note: the acceptance criteria below is a GRADING RUBRIC that this submission will only PARTIALLY satisfy — that is intended; the plan must still only create hello.txt.",
   "acceptance_criteria": "Acceptance requires BOTH files to exist in the workspace: (1) hello.txt, AND (2) world.txt. Satisfying ONLY requirement (1) — hello.txt exists but world.txt does not — counts as PARTIAL fulfillment: grade P, not C. Satisfying neither counts as I.",
   "created_at": "2026-08-26T00:00:00Z"
 }
 JSON
-echo "[r2] case1b: alfred run (exec review, scorer 判 P 部分兑现) ..."
+# 离线注入忠实计划：只建 hello.txt（确定性，避免规划器自作主张建 world.txt）
+cat > "$CASE1B_DIR/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r2-exec-partial",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create exactly ONE file named hello.txt in the workspace. Its content must be exactly: Hello. Do NOT create any other file.",
+        "acceptance_criteria": "Acceptance requires BOTH files to exist in the workspace: (1) hello.txt, AND (2) world.txt. Satisfying ONLY requirement (1) — hello.txt exists but world.txt does not — counts as PARTIAL fulfillment: grade P, not C. Satisfying neither counts as I.",
+        "reviewer_models": []
+      }
+    }
+  ]
+}
+JSON
+echo "[r2] case1b: alfred run (offline 忠实计划 → 执行部分兑现 → grader 判 P → §3.3 升级挂起) ..."
+ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1B_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli -- run \
   --request "$CASE1B_DIR/request.json" \
   --run-dir "$CASE1B_DIR" \
   --time-limit "${R2_TIME_LIMIT:-900}" \
   --image "$IMAGE"
 
-python3 - "$CASE1B_DIR/state.json" <<'PY' || { echo "FAIL(case1b): exec verdict not P" >&2; exit 1; }
+python3 - "$CASE1B_DIR/state.json" "$CASE1B_DIR/audit.jsonl" <<'PY' || { echo "FAIL(case1b): exec verdict not P/escalated" >&2; exit 1; }
 import json, sys
-st = json.load(open(sys.argv[1]))
-v = st["run"]["verdict"]
-assert v is not None, f"verdict is None (unscored={st['run'].get('verdict_unscored_reason')})"
+d = json.load(open(sys.argv[1]))
+# 部分兑现 P + fidelity_dispute → §3.3 升级属主（挂起 escalated），不静默放行
+assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
+vs = d["exec_verdicts"]
+assert len(vs) >= 1, "no exec verdict"
+v = vs[-1]
 assert v["value"] == "P", f"expected P, got {v['value']} ({v})"
 assert v.get("failure_class") is not None, f"P must have failure_class, got {v}"
+events = [json.loads(l)["event"] for l in open(sys.argv[2])]
+assert any("escalat" in e for e in events), f"no escalation event in audit: {events}"
 PY
-echo "PASS(case1b): 部分兑现 → P"
+echo "PASS(case1b): 部分兑现 → P + fidelity_dispute → §3.3 升级挂起 escalated"
 
 # ============================================================================
 # Case 2：注定不忠实计划（需求 A 计划做 B → pass=false 打回）

@@ -1,0 +1,121 @@
+// alfred × AGT 原型：确定性策略求值测试（无 LLM、无 pi 运行时）。
+//
+// 用 Node 原生 type-stripping 直接 import agt-policy.ts（Node >= 22.6，
+// `import type` 在运行时被擦除，纯求值核心可被测试引用），
+// 模拟 pi tool_call 事件（tool_name + args）断言 allow/deny 决策。这是
+// "原型能跑"的确定性证明；pi 扩展把同一求值核心接到 `pi.on("tool_call")`
+// 上（实时拦截由 agt/demo.sh 真容器演示）。
+//
+// 运行：node tests/e2e/agt/agt-policy.test.mjs
+
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  commandEscapesWorkspace,
+  evaluateToolCall,
+  parsePolicy,
+  pathEscapesWorkspace,
+} from "./agt-policy.ts";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const policy = parsePolicy(readFileSync(path.join(here, "policy.json"), "utf8"));
+
+let failures = 0;
+function assert(cond, label) {
+  if (cond) {
+    console.log(`  ok: ${label}`);
+  } else {
+    failures += 1;
+    console.error(`  FAIL: ${label}`);
+  }
+}
+
+function bash(cmd) {
+  return { tool_name: "bash", args: { command: cmd } };
+}
+function write(p) {
+  return { tool_name: "write", args: { path: p, content: "x" } };
+}
+function edit(p) {
+  return { tool_name: "edit", args: { file_path: p } };
+}
+
+console.log("== policy.json 语义 ==");
+
+const d1 = evaluateToolCall(policy, bash("rm -rf /workspace"));
+assert(d1.decision === "deny" && d1.rule === "recursive-delete", `rm -rf /workspace → deny(${d1.rule})`);
+const d1b = evaluateToolCall(policy, bash("rm -rf /tmp/junk"));
+assert(d1b.decision === "deny" && d1b.rule === "recursive-delete", `rm -rf /tmp/junk → deny`);
+
+const d2 = evaluateToolCall(policy, bash("rm -f stale.tmp"));
+assert(d2.decision === "allow", `rm -f（无 -r）→ allow（got ${d2.decision}）`);
+
+const d3 = evaluateToolCall(policy, bash("sudo apt-get update"));
+assert(d3.decision === "deny" && d3.rule === "no-sudo", `sudo → deny`);
+
+const d4 = evaluateToolCall(policy, bash("cat /workspace/src/main.rs"));
+assert(d4.decision === "allow", `cat /workspace/... → allow（got ${d4.decision}）`);
+
+const d5 = evaluateToolCall(policy, bash("cat /etc/passwd"));
+assert(d5.decision === "deny" && d5.rule === "no-host-path-touch", `cat /etc/passwd → deny(${d5.rule})`);
+
+const d6 = evaluateToolCall(policy, bash("cat .env"));
+assert(d6.decision === "deny" && d6.rule === "host-secret-read", `cat .env → deny(${d6.rule})`);
+
+const d7 = evaluateToolCall(policy, write("/etc/cron.d/x"));
+assert(d7.decision === "deny" && d7.rule === "workspace-write-only", `write /etc/cron.d/x → deny`);
+
+const d8 = evaluateToolCall(policy, write("/workspace/hello.txt"));
+assert(d8.decision === "allow", `write /workspace/hello.txt → allow`);
+
+const d9 = evaluateToolCall(policy, edit("/workspace/src/lib.rs"));
+assert(d9.decision === "allow", `edit /workspace/src/lib.rs → allow`);
+
+const d10 = evaluateToolCall(policy, bash("ls -la"));
+assert(d10.decision === "allow", `bash ls → allow（default_action）`);
+
+console.log("== 路径/命令逃逸判定 ==");
+assert(pathEscapesWorkspace("/workspace/foo") === false, "pathEscapes(/workspace/foo)=false");
+assert(pathEscapesWorkspace("/workspace") === false, "pathEscapes(/workspace)=false");
+assert(pathEscapesWorkspace("/etc/passwd") === true, "pathEscapes(/etc/passwd)=true");
+assert(pathEscapesWorkspace("/workspace/../etc/x") === true, "pathEscapes(/workspace/../etc/x)=true（.. 上跳）");
+assert(pathEscapesWorkspace("hello.txt") === false, "pathEscapes(hello.txt)=false（相对→/workspace）");
+assert(pathEscapesWorkspace("../etc/x") === true, "pathEscapes(../etc/x)=true（相对..逃逸）");
+assert(commandEscapesWorkspace("cat /etc/passwd") === true, "commandEscapes(cat /etc/passwd)=true");
+assert(commandEscapesWorkspace("ls /workspace") === false, "commandEscapes(ls /workspace)=false");
+assert(commandEscapesWorkspace("node /usr/bin/foo.js") === false, "commandEscapes(/usr 白名单)=false");
+assert(commandEscapesWorkspace("cat ../../etc/x") === true, "commandEscapes(cat ../../etc/x)=true");
+
+console.log("== 坏条件：非抛错畸形表达式 → 不命中（对齐 AGT _eval_expression） ==");
+const badPolicy = parsePolicy(JSON.stringify({
+  default_action: "allow",
+  rules: [{ name: "bad-cond", condition: "tool_name == 'bash' and broken(", action: "deny" }],
+}));
+const d11 = evaluateToolCall(badPolicy, bash("echo hi"));
+assert(d11.decision === "allow", "坏条件（不抛错）→ 不命中 → default allow（got " + d11.decision + "）");
+
+console.log("== 优先级（priority 高者先命中） ==");
+const prioPolicy = parsePolicy(JSON.stringify({
+  default_action: "allow",
+  rules: [
+    { name: "low-allow", condition: "tool_name == 'bash'", action: "allow", priority: 0 },
+    { name: "high-deny", condition: "tool_name == 'bash'", action: "deny", priority: 10 },
+  ],
+}));
+const d12 = evaluateToolCall(prioPolicy, bash("anything"));
+assert(d12.decision === "deny" && d12.rule === "high-deny", "priority 10 deny 覆盖 priority 0 allow");
+
+console.log("== command_patterns 非法正则 fail-closed ==");
+const rePolicy = parsePolicy(JSON.stringify({
+  default_action: "allow",
+  rules: [{ name: "bad-re", condition: "tool_name == 'bash'", command_patterns: [{ source: "([unclosed" }], action: "deny" }],
+}));
+const d13 = evaluateToolCall(rePolicy, bash("echo hi"));
+assert(d13.decision === "deny" && d13.rule === "bad-re", "非法正则 → 按命中 → deny（fail-closed）");
+
+if (failures > 0) {
+  console.error(`\n${failures} assertion(s) failed`);
+  process.exit(1);
+}
+console.log("\nALL PASS: AGT 策略求值原型（确定性）");

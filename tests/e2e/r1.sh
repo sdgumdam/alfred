@@ -7,9 +7,10 @@
 #   2. 确保沙箱镜像 alfred-executor:latest（无则 tag r0-lab-pi / docker build）
 #   3. cargo build
 #   4. 写 OwnerRequest（创建 hello.txt，内容 Hello）
-#   5. cargo run -p alfred-cli -- run ...   （真容器 pi 执行 + 产物采集）
-#   6. 校验 run_dir/workspace/hello.txt 存在且内容为 Hello
-#   7. 校验 evals/ 证据归档（*.eval 与 *.dump.json，P9）
+#   5. cargo run -p alfred-cli -- run ...   （R3 起为完整治理环：规划→计划审查→
+#      执行→执行审查；执行产物/证据在最新 exec-N/ 下）
+#   6. 校验 exec-N/workspace/hello.txt 存在且内容为 Hello（R3 布局：执行子 run）
+#   7. 校验 exec-N/evals/ 证据归档（*.eval 与 *.dump.json，P9）
 #
 # 验收（施工清单 S2）："容器里真跑出文件且变化符合预期"
 # ============================================================================
@@ -75,35 +76,42 @@ cargo run --quiet -p alfred-cli -- run \
   --time-limit "${R1_TIME_LIMIT:-600}" \
   --image "$IMAGE"
 
-# --- 6. 校验产物 ---
-if [[ ! -f "$RUN_DIR/workspace/hello.txt" ]]; then
-  echo "FAIL: $RUN_DIR/workspace/hello.txt not found" >&2
+# --- 6. 校验产物（R3 布局：执行产物在最新 exec-N/workspace/） ---
+EXEC_DIR="$(ls -d "$RUN_DIR"/exec-* 2>/dev/null | sort -V | tail -1 || true)"
+if [[ -z "$EXEC_DIR" ]]; then
+  echo "FAIL: no exec-* dir in $RUN_DIR" >&2
   echo "--- run_dir 内容 ---" >&2
   find "$RUN_DIR" -maxdepth 2 -type f | sed "s|$REPO_ROOT/||" >&2
   exit 1
 fi
-CONTENT="$(cat "$RUN_DIR/workspace/hello.txt")"
+if [[ ! -f "$EXEC_DIR/workspace/hello.txt" ]]; then
+  echo "FAIL: $EXEC_DIR/workspace/hello.txt not found" >&2
+  echo "--- run_dir 内容 ---" >&2
+  find "$RUN_DIR" -maxdepth 2 -type f | sed "s|$REPO_ROOT/||" >&2
+  exit 1
+fi
+CONTENT="$(cat "$EXEC_DIR/workspace/hello.txt")"
 if [[ "$CONTENT" != "Hello" ]]; then
   echo "FAIL: hello.txt content is '$CONTENT', expected 'Hello'" >&2
   exit 1
 fi
 
-# --- 7. 校验证据归档（P9）：PASS 前断言 evals/ 有 *.eval 与 *.dump.json ---
+# --- 7. 校验证据归档（P9）：PASS 前断言 exec-N/evals/ 有 *.eval 与 *.dump.json ---
 shopt -s nullglob
-EVAL_FILES=("$RUN_DIR"/evals/*.eval)
-DUMP_FILES=("$RUN_DIR"/evals/*.dump.json)
+EVAL_FILES=("$EXEC_DIR"/evals/*.eval)
+DUMP_FILES=("$EXEC_DIR"/evals/*.dump.json)
 shopt -u nullglob
 if [[ ${#EVAL_FILES[@]} -eq 0 ]] || [[ ${#DUMP_FILES[@]} -eq 0 ]]; then
-  echo "FAIL: evals/ 缺少证据归档 (*.eval=${#EVAL_FILES[@]}, *.dump.json=${#DUMP_FILES[@]})" >&2
-  echo "--- evals/ 内容 ---" >&2
-  find "$RUN_DIR/evals" -maxdepth 1 -type f 2>/dev/null | sed "s|$REPO_ROOT/||" >&2
+  echo "FAIL: exec-N/evals/ 缺少证据归档 (*.eval=${#EVAL_FILES[@]}, *.dump.json=${#DUMP_FILES[@]})" >&2
+  echo "--- exec-N/evals/ 内容 ---" >&2
+  find "$EXEC_DIR/evals" -maxdepth 1 -type f 2>/dev/null | sed "s|$REPO_ROOT/||" >&2
   exit 1
 fi
 echo "[r1] evals arch : *.eval x${#EVAL_FILES[@]}, *.dump.json x${#DUMP_FILES[@]}"
 
 echo ""
 echo "PASS: 容器内 pi 完成小需求，产物落宿主 run 目录"
-echo "  run_dir : $RUN_DIR"
+echo "  exec_dir: $EXEC_DIR"
 echo "  content : $CONTENT"
-echo "  evals   : $(ls "$RUN_DIR/evals/" 2>/dev/null | tr '\n' ' ')"
+echo "  evals   : $(ls "$EXEC_DIR/evals/" 2>/dev/null | tr '\n' ' ')"
 exit 0
