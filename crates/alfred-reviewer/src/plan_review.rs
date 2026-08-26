@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use alfred_core::dagspec::DagSpec;
 use alfred_core::request::OwnerRequest;
+use alfred_core::session::SessionDoc;
 use alfred_core::util::{now_rfc3339, short_id};
 use alfred_core::verdict::PlanVerdict;
 use alfred_executor::config::ExecutorModel;
@@ -70,12 +71,16 @@ pub fn default_review_dir() -> PathBuf {
     base.join(short_id("planreview"))
 }
 
-/// 执行一次计划审查（同步阻塞直到 eval 结束）。
+///
+/// `session_doc` / `owner_message` 为审查者可见的补充上下文（§2.4：审查者全可见，
+/// 属主补充与审查摘要都骗不过审查）；独立 `alfred plan-review` 子命令可传 None。
 pub fn execute_plan_review(
     opts: &PlanReviewOptions,
     model: &ExecutorModel,
     request: &OwnerRequest,
     dagspec: &DagSpec,
+    session_doc: Option<&SessionDoc>,
+    owner_message: Option<&str>,
 ) -> Result<PlanReviewOutcome> {
     let started_at = now_rfc3339();
     let run_id = match opts.run_dir.file_name().and_then(|s| s.to_str()) {
@@ -99,7 +104,7 @@ pub fn execute_plan_review(
     )?;
 
     let task_py = run_dir.join("plan_review.py");
-    let py = generate_plan_review_py(request, dagspec)?;
+    let py = generate_plan_review_py(request, dagspec, session_doc, owner_message)?;
     std::fs::write(&task_py, py)?;
 
     append_audit(run_dir, "plan_review_started", &serde_json::json!({ "run_id": run_id, "request_id": request.id }))?;

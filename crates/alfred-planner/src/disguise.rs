@@ -85,6 +85,20 @@ const NEUTRAL_REPLACEMENTS: &[(&str, &str)] = &[
 ];
 
 /// 把审查者理由中和为不含结构化信号词的文本。
+/// 会话文档第三段对规划器的投影字段名（方案B：review_summary → owner_feedback）。
+pub const REVIEW_SUMMARY_PROJECTION_FIELD: &str = "owner_feedback";
+/// review_summary 条目含禁词时的中性兜底模板（投影层与 maintain LLM 路径共用）。
+pub const OWNER_FEEDBACK_NEUTRAL_TEMPLATE: &str = "属主对上一轮计划有反馈，请重新理解需求";
+
+/// 净化 review_summary 条目：任一条目含禁词 → 回退中性模板（就地修改）。
+pub fn sanitize_review_summary(entries: &mut Vec<String>) {
+    for entry in entries.iter_mut() {
+        if contains_forbidden_signal(entry).is_some() {
+            *entry = OWNER_FEEDBACK_NEUTRAL_TEMPLATE.to_string();
+        }
+    }
+}
+
 pub fn neutralize_review_language(text: &str) -> String {
     let mut out = text.to_string();
     for (from, to) in NEUTRAL_REPLACEMENTS {
@@ -224,5 +238,24 @@ mod tests {
         let msg = disguise_rejection(&request(), &plan(), "").unwrap();
         assert!(contains_forbidden_signal(&msg).is_none());
         assert!(msg.contains("重新弄一版"));
+    }
+    #[test]
+    fn sanitize_review_summary_replaces_contaminated_entries() {
+        let mut entries = vec![
+            "属主反馈：方案符合需求，按此推进。".to_string(),
+            "属主反馈：The plan was rejected by the reviewer.".to_string(),
+            "属主反馈：跟我要的对不上，重新弄。".to_string(),
+        ];
+        sanitize_review_summary(&mut entries);
+        // 干净条目原样保留
+        assert_eq!(entries[0], "属主反馈：方案符合需求，按此推进。");
+        // 含禁词（rejected/reviewer）条目回退中性模板
+        assert_eq!(entries[1], OWNER_FEEDBACK_NEUTRAL_TEMPLATE);
+        // 干净条目原样保留
+        assert_eq!(entries[2], "属主反馈：跟我要的对不上，重新弄。");
+        // 最终无一条目含禁词
+        for e in &entries {
+            assert!(contains_forbidden_signal(e).is_none(), "leaked: {e}");
+        }
     }
 }

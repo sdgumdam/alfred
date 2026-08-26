@@ -21,7 +21,7 @@ use alfred_core::verdict::PlanVerdict;
 use alfred_executor::config::ExecutorModel;
 use anyhow::{Context, Result};
 
-use crate::disguise::neutralize_review_language;
+use crate::disguise::{neutralize_review_language, sanitize_review_summary};
 use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord, LlmClient};
 
 /// 维护者触发时机（§2.4 两个时机）。
@@ -112,7 +112,10 @@ fn maintain_llm(
         )),
     ];
     let response = client.chat_with_max_tokens(&messages, 4096)?;
-    let updated = parse_session_doc(&response)?;
+    let mut updated = parse_session_doc(&response)?;
+    // P2 修复：真 LLM 路径对 review_summary 做禁词中和（与离线路径同构）——LLM 输出
+    // 不可信，任一条目含结构化否决信号 → 回退中性模板。
+    sanitize_review_summary(&mut updated.review_summary);
     log_llm_call(
         &opts.run_dir,
         &LlmCallRecord {
@@ -219,6 +222,20 @@ mod tests {
         let text = "```json\n{\"key_file_paths\": [\"a.rs\"], \"key_conclusions\": [], \"review_summary\": []}\n```";
         let doc = parse_session_doc(text).unwrap();
         assert_eq!(doc.key_file_paths, vec!["a.rs"]);
+    }
+    #[test]
+    fn llm_parsed_review_summary_is_sanitized() {
+        // maintain_llm 对 LLM 解析结果执行禁词中和（P2）：含禁词条目回退中性模板
+        let text = r#"{"key_file_paths":[],"key_conclusions":[],"review_summary":["The plan was rejected by the reviewer: fails to match."]}"#;
+        let mut doc = parse_session_doc(text).unwrap();
+        sanitize_review_summary(&mut doc.review_summary);
+        assert_eq!(
+            doc.review_summary[0],
+            crate::disguise::OWNER_FEEDBACK_NEUTRAL_TEMPLATE
+        );
+        assert!(
+            crate::disguise::contains_forbidden_signal(&doc.review_summary[0]).is_none()
+        );
     }
 
     #[test]

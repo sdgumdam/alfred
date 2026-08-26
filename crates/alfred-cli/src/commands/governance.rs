@@ -41,7 +41,25 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
             &serde_json::json!({ "state": state_label(run.state()) }),
         )?;
         match run.state() {
-            alfred_core::governance::GovernanceState::Planning => planning_step(run, ctx)?,
+            alfred_core::governance::GovernanceState::Planning => {
+                // P3 修复：规划侧失败（converse 出错）→ 升级属主（不悄悄放行），
+                // 落盘后可恢复（decide retry/revise/abandon 续跑）。
+                if let Err(e) = planning_step(run, ctx) {
+                    audit(
+                        &ctx.run_dir,
+                        "planning_error_escalated",
+                        &serde_json::json!({ "error": format!("{e:#}") }),
+                    )?;
+                    run.apply(GovernanceEvent::PlanningError)?;
+                    persist_governance_run(&ctx.run_dir, run)?;
+                    println!(
+                        "[alfred] 规划失败已升级属主（state=Escalated，挂起）。\n\
+                         \x20 运行 `alfred decide --run-dir {} --decision retry|revise|abandon` 续跑。",
+                        ctx.run_dir.display()
+                    );
+                    return Ok(());
+                }
+            }
             alfred_core::governance::GovernanceState::PlanReviewing => {
                 plan_review_step(run, ctx)?
             }
@@ -128,7 +146,14 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
         time_limit_secs: run.options.review_time_limit_secs,
         ctl_enabled: run.options.ctl_enabled,
     };
-    let outcome = execute_plan_review(&opts, &ctx.reviewer_model, &run.request, &dagspec)?;
+    let outcome = execute_plan_review(
+        &opts,
+        &ctx.reviewer_model,
+        &run.request,
+        &dagspec,
+        Some(&run.session_doc),
+        run.owner_message.as_deref(),
+    )?;
     match outcome.verdict {
         Some(v) => {
             run.plan_verdicts.push(v.clone());

@@ -298,6 +298,19 @@ user = rec["messages"][-1]["content"]
 assert "属主本轮消息" in user, "replan record missing owner message"
 # 伪装消息确实喂给了 planner
 assert msg in user, "disguised message not in replan prompt"
+# P1/方案B 防回归：converse 实际输入无 review_summary 字段名、无禁词（含伪装消息与投影）
+for f in files:
+    r = json.load(open(f))
+    if r.get("role") != "converse":
+        continue
+    for m in r["messages"]:
+        content = m["content"]
+        assert "review_summary" not in content, f"converse leaked field name review_summary: {content}"
+        low = content.lower()
+        h = [w for w in forbidden if w in low]
+        assert not h, f"converse input contains forbidden signal {h}: {content}"
+    u = r["messages"][-1]["content"]
+    assert "owner_feedback" in u, f"converse projection missing owner_feedback: {u}"
 PY
 echo "PASS(case3): 打回伪装 → decide retry → 伪装消息进 planner（无结构化否决词）→ 重规划 → Completed"
 
@@ -388,6 +401,21 @@ user = rec["messages"][-1]["content"]
 # 第二次 converse 的 prompt 包含维护者写入的关键结论（会话文档三段）
 assert "技术选型" in user, "converse 未引用属主补充（key_conclusions）"
 assert any(s[:20] in user for s in doc["review_summary"]), "converse 未引用审查摘要（review_summary）"
+# P1/方案B 防回归：converse 实际输入无 review_summary 字段名、无禁词（投影改名+中性化）
+forbidden = ["reject", "rejected", "verdict", "review", "reviewer", "scorer", "score",
+             "grader", "eval", "unscored", "否决", "审查", "评审", "评分", "评估", "打分", "打回", "判定"]
+for f in files:
+    r = json.load(open(f))
+    if r.get("role") != "converse":
+        continue
+    for m in r["messages"]:
+        content = m["content"]
+        assert "review_summary" not in content, f"converse leaked field name review_summary: {content}"
+        low = content.lower()
+        h = [w for w in forbidden if w in low]
+        assert not h, f"converse input contains forbidden signal {h}: {content}"
+    u = r["messages"][-1]["content"]
+    assert "owner_feedback" in u, f"converse projection missing owner_feedback: {u}"
 PY
 echo "PASS(case4): 打回→属主补充→converse 引用会话文档关键结论（从 llm 调用记录断言）"
 

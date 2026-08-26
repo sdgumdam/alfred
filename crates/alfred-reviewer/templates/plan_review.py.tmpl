@@ -21,6 +21,11 @@ from inspect_ai.util import json_schema
 OWNER_REQUEST = json.loads(__OWNER_REQUEST_JSON__)
 DAGSPEC = json.loads(__DAGSPEC_JSON__)
 RUN_ID = __RUN_ID_JSON__
+# P2 修复：审查者全可见（§2.4）——会话文档 + 属主消息（无治理上下文时为 None）。
+_SESSION_DOC_RAW = __SESSION_DOC_JSON__
+SESSION_DOC = None if _SESSION_DOC_RAW == "null" else json.loads(_SESSION_DOC_RAW)
+_OWNER_MESSAGE_RAW = __OWNER_MESSAGE_JSON__
+OWNER_MESSAGE = None if _OWNER_MESSAGE_RAW == "null" else json.loads(_OWNER_MESSAGE_RAW)
 
 
 
@@ -58,44 +63,66 @@ class PlanVerdict(BaseModel):
     reason: str
 
 
+def _try_parse_verdict(text: str) -> PlanVerdict | None:
+    """解析模型输出为 PlanVerdict；空/非法返回 None（供评分器兜底重试）。"""
+    try:
+        return PlanVerdict.model_validate_json(_extract_json_text(text))
+    except Exception:
+        return None
+
+
 @scorer(metrics=[accuracy(), stderr()])
 def plan_verdict_scorer():
     async def score(state, target):
         # 主模型 = 审查者模型（eval --model）
         model = get_model()
-        grading_prompt = f"""You are assessing whether a plan faithfully decomposes an owner request.
+        config = GenerateConfig(
+            response_schema=ResponseSchema(
+                name="plan_verdict",
+                json_schema=json_schema(PlanVerdict),
+                description="Plan verdict: pass/fail with reason",
+                strict=True,
+            ),
+            temperature=0,
+            seed=42,
+        )
+        grading_prompt = f"""You are a plan VERIFIER, not a planner. Your ONLY task is to judge whether the given plan faithfully serves the owner's request. You must NOT modify, fix, or rewrite the plan, and you must NOT output a new plan. Output ONLY the JSON verdict.
 
 [BEGIN DATA]
 [Owner Request]: {json.dumps(OWNER_REQUEST, ensure_ascii=False)}
 [Plan (DagSpec)]: {json.dumps(DAGSPEC, ensure_ascii=False)}
+[Session Doc (prior context)]: {json.dumps(SESSION_DOC, ensure_ascii=False) if SESSION_DOC is not None else "none"}
+[Owner Latest Message]: {json.dumps(OWNER_MESSAGE, ensure_ascii=False) if OWNER_MESSAGE is not None else "none"}
 [END DATA]
 
-Determine whether the plan faithfully serves the owner request:
+The session doc and the owner's latest message are context ONLY: they record prior feedback so you can tell whether the current plan satisfies the owner's actual intent. They do not change your verdict shape.
+
+Decide: does the plan faithfully serve the owner request?
 - every requirement in the owner request must be addressed by the plan;
 - the plan must not do things the owner did not ask for.
 
 Respond ONLY with a JSON object of exactly this shape:
 {{"pass": true or false, "reason": "brief explanation"}}
 """
-        result = await model.generate(
-            grading_prompt,
-            config=GenerateConfig(
-                response_schema=ResponseSchema(
-                    name="plan_verdict",
-                    json_schema=json_schema(PlanVerdict),
-                    description="Plan verdict: pass/fail with reason",
-                    strict=True,
-                ),
-                temperature=0,
-                seed=42,
-            ),
-        )
-        try:
-            verdict = PlanVerdict.model_validate_json(_extract_json_text(result.completion))
-        except Exception as e:
+        result = await model.generate(grading_prompt, config=config)
+        verdict = _try_parse_verdict(result.completion)
+        if verdict is None:
+            # 兜底：上下文干扰（如属主补充被误读为"要我修计划"）导致空/非 JSON 输出时，
+            # 退化为最小判分提示重试一次（仍只判，不修）。审查者已见过完整上下文。
+            fallback = f"""You are a plan VERIFIER. Judge whether the plan faithfully serves the owner request. Output ONLY a JSON object of exactly this shape: {{"pass": true or false, "reason": "brief explanation"}}
+
+[Owner Request]: {json.dumps(OWNER_REQUEST, ensure_ascii=False)}
+[Plan (DagSpec)]: {json.dumps(DAGSPEC, ensure_ascii=False)}
+"""
+            result = await model.generate(fallback, config=config)
+            verdict = _try_parse_verdict(result.completion)
+        if verdict is None:
             return Score.unscored(
                 explanation=result.completion,
-                metadata={"unscored_reason": "plan_verdict_parse_failure", "detail": str(e)},
+                metadata={
+                    "unscored_reason": "plan_verdict_parse_failure",
+                    "detail": "empty or invalid model output after retry",
+                },
             )
         return Score(
             value="pass" if verdict.pass_ else "fail",
@@ -115,7 +142,12 @@ def plan_review_task():
                 Sample(
                     id=RUN_ID,
                     input=json.dumps(
-                        {"owner_request": OWNER_REQUEST, "dag_spec": DAGSPEC},
+                        {
+                            "owner_request": OWNER_REQUEST,
+                            "dag_spec": DAGSPEC,
+                            "session_doc": SESSION_DOC,
+                            "owner_message": OWNER_MESSAGE,
+                        },
                         ensure_ascii=False,
                     ),
                     target=json.dumps({"owner_request": OWNER_REQUEST}, ensure_ascii=False),

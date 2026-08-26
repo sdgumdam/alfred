@@ -22,6 +22,30 @@ use alfred_executor::config::ExecutorModel;
 use anyhow::{bail, Context, Result};
 
 use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord, LlmClient};
+use crate::disguise::sanitize_review_summary;
+
+/// 会话文档对规划器的投影（方案B：第三段 review_summary → owner_feedback，内容中性化）。
+/// 磁盘上 state.json 的会话文档保持原名 review_summary（审计真源不变），只改喂给
+/// 规划器的投影。
+#[derive(serde::Serialize)]
+struct SessionDocProjection {
+    key_file_paths: Vec<String>,
+    key_conclusions: Vec<String>,
+    #[serde(rename = "owner_feedback")]
+    review_summary: Vec<String>,
+}
+
+/// 把会话文档投影为规划器可见形态：第三段改名 owner_feedback，且任一条目含禁词
+/// 时回退中性模板。
+fn project_session_doc(doc: &SessionDoc) -> SessionDocProjection {
+    let mut review_summary = doc.review_summary.clone();
+    sanitize_review_summary(&mut review_summary);
+    SessionDocProjection {
+        key_file_paths: doc.key_file_paths.clone(),
+        key_conclusions: doc.key_conclusions.clone(),
+        review_summary,
+    }
+}
 
 /// converse 选项。
 #[derive(Debug, Clone)]
@@ -82,14 +106,15 @@ pub fn build_messages(
     doc: &SessionDoc,
     owner_message: &str,
 ) -> Vec<ChatMessage> {
-    let session = serde_json::to_string_pretty(doc).unwrap_or_default();
+    // 方案B：喂给规划器的是投影（第三段 owner_feedback + 内容中性化），磁盘真源不变。
+    let session = serde_json::to_string_pretty(&project_session_doc(doc)).unwrap_or_default();
     let system = format!(
-        r#"你是治理系统的规划器。把属主需求拆成一个任务 DAG（每个节点 = 契约 + 沙箱档案）。你看不到审查者与执行者，只与属主对话。
+        r#"你是治理系统的规划器。把属主需求拆成一个任务 DAG（每个节点 = 契约 + 沙箱档案）。你只与属主对话。
 
 你的输入：会话文档（记忆）+ 属主本轮消息。
 输出：建图指令序列（JSON 数组）。每条指令是：
 - {{"op":"begin","request_id":"<需求id>"}}
-- {{"op":"add_node","id":"task-1","summary":"<一句话摘要>","contract":{{"prompt":"<给执行者的任务描述>","acceptance_criteria":"<验收标准>"}},"sandbox":{{"volumes":[],"runtime":null,"packages":[],"network":false}}}}
+- {{"op":"add_node","id":"task-1","summary":"<一句话摘要>","contract":{{"prompt":"<任务描述>","acceptance_criteria":"<验收标准>"}},"sandbox":{{"volumes":[],"runtime":null,"packages":[],"network":false}}}}
 - {{"op":"add_edge","from":"...","to":"..."}}
 - {{"op":"set_routes","start":["task-1"]}}
 - {{"op":"commit"}}
@@ -249,6 +274,65 @@ mod tests {
         assert!(user.content.contains("req-1"));
         assert!(user.content.contains("用 Rust"));
         assert!(user.content.contains("属主：技术选型用 Rust"));
+    }
+    #[test]
+    fn build_messages_projects_owner_feedback_without_forbidden_signal() {
+        // 方案B：第三段改名 owner_feedback，且无 review_summary 字段名（防回归）。
+        let mut doc = SessionDoc::new();
+        doc.review_summary.push("属主反馈：方案符合需求，按此推进。".into());
+        let msgs = build_messages(&request(), &doc, "属主：继续");
+        let user = &msgs[1];
+        assert!(
+            !user.content.contains("review_summary"),
+            "projection leaked field name: {}",
+            user.content
+        );
+        assert!(
+            user.content.contains("owner_feedback"),
+            "projection missing owner_feedback: {}",
+            user.content
+        );
+        // 投影内容不得含结构化否决信号（P7 禁词）
+        assert!(
+            crate::disguise::contains_forbidden_signal(&user.content).is_none(),
+            "projected session leaked forbidden signal: {}",
+            user.content
+        );
+        // 磁盘真源不变（调用方持有原 doc，其字段名仍是 review_summary）
+        assert_eq!(doc.review_summary.len(), 1);
+    }
+
+    #[test]
+    fn build_messages_neutralizes_contaminated_review_summary_entry() {
+        let mut doc = SessionDoc::new();
+        doc.review_summary
+            .push("The plan was rejected by the reviewer: fails to match.".into());
+        let msgs = build_messages(&request(), &doc, "属主：继续");
+        let user = &msgs[1];
+        assert!(
+            user.content.contains("属主对上一轮计划有反馈，请重新理解需求"),
+            "contaminated entry not neutralized: {}",
+            user.content
+        );
+        assert!(
+            !user.content.contains("rejected by the reviewer"),
+            "raw review language leaked: {}",
+            user.content
+        );
+    }
+
+    #[test]
+    fn system_prompt_mentions_only_owner_as_counterparty() {
+        // P1：规划器提示词不得出现审查者/执行者角色引用
+        let msgs = build_messages(&request(), &SessionDoc::new(), "属主：继续");
+        let system = &msgs[0].content;
+        for leak in ["审查者", "执行者", "reviewer", "executor"] {
+            assert!(
+                !system.contains(leak),
+                "system prompt leaked counterparty role '{leak}': {system}"
+            );
+        }
+        assert!(system.contains("属主"), "system prompt must mention 属主");
     }
 
     #[test]

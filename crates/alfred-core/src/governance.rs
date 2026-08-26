@@ -61,6 +61,8 @@ impl GovernanceState {
 pub enum GovernanceEvent {
     /// 规划器产出 DagSpec。
     PlanProduced,
+    /// 规划侧失败（converse 出错）→ 升级属主（不悄悄放行）。
+    PlanningError,
     /// 计划审查通过（PlanVerdict.pass=true）。
     PlanReviewPassed,
     /// 计划审查打回（PlanVerdict.pass=false）。
@@ -151,6 +153,7 @@ fn transition(
     use GovernanceState::*;
     let next = match (from, event) {
         (Planning, PlanProduced) => PlanReviewing,
+        (Planning, PlanningError) => Escalated,
         (PlanReviewing, PlanReviewPassed) => Executing,
         (PlanReviewing, PlanReviewRejected) => PlanRejected,
         (PlanReviewing, PlanReviewError) => Escalated,
@@ -329,6 +332,12 @@ impl GovernanceRun {
     /// 应用状态机事件并更新时间戳。
     pub fn apply(&mut self, event: GovernanceEvent) -> Result<(), TransitionError> {
         self.state_machine.apply(event)?;
+        // P2 修复：进入 Planning（重规划周期开始）→ 重置 mechanical 重跑预算。
+        // 覆盖 PlanRejected+retry / PlanRejected+revise / Escalated+revise 三条
+        // 重规划路径；Escalated+retry（重入执行）在 decide 侧重置。
+        if self.state() == GovernanceState::Planning {
+            self.attempts_used = 0;
+        }
         self.updated_at = now_rfc3339();
         Ok(())
     }
@@ -511,5 +520,58 @@ mod tests {
         assert!(!run.mechanical_exhausted());
         run.attempts_used = 2;
         assert!(run.mechanical_exhausted());
+    }
+    #[test]
+    fn replanning_resets_mechanical_budget() {
+        // P2 修复：PlanRejected + OwnerRetry 重规划 → 进入 Planning → attempts 重置为 0
+        let mut run = GovernanceRun::new(
+            "run-1",
+            OwnerRequest::new("req-1", "t", "d", "a"),
+            GovernanceOptions::default(),
+        );
+        run.apply(GovernanceEvent::PlanProduced).unwrap();
+        run.apply(GovernanceEvent::PlanReviewRejected).unwrap();
+        run.attempts_used = 2; // 模拟已耗尽的预算
+        run.apply(GovernanceEvent::OwnerRetry).unwrap();
+        assert_eq!(run.state(), GovernanceState::Planning);
+        assert_eq!(run.attempts_used, 0, "重规划周期应重置 mechanical 预算");
+        assert!(!run.mechanical_exhausted());
+    }
+
+    #[test]
+    fn owner_revise_replans_and_resets_budget() {
+        // P2 修复：PlanRejected + OwnerRevise 与 Escalated + OwnerRevise → 重置 attempts
+        let mut run = GovernanceRun::new(
+            "run-2",
+            OwnerRequest::new("req-1", "t", "d", "a"),
+            GovernanceOptions::default(),
+        );
+        run.apply(GovernanceEvent::PlanProduced).unwrap();
+        run.apply(GovernanceEvent::PlanReviewRejected).unwrap();
+        run.attempts_used = 1;
+        run.apply(GovernanceEvent::OwnerRevise).unwrap();
+        assert_eq!(run.state(), GovernanceState::Planning);
+        assert_eq!(run.attempts_used, 0);
+
+        let mut run2 = GovernanceRun::new(
+            "run-3",
+            OwnerRequest::new("req-1", "t", "d", "a"),
+            GovernanceOptions::default(),
+        );
+        run2.apply(GovernanceEvent::PlanProduced).unwrap();
+        run2.apply(GovernanceEvent::PlanReviewError).unwrap();
+        run2.attempts_used = 1;
+        run2.apply(GovernanceEvent::OwnerRevise).unwrap();
+        assert_eq!(run2.state(), GovernanceState::Planning);
+        assert_eq!(run2.attempts_used, 0);
+    }
+
+    #[test]
+    fn planning_error_escalates() {
+        // P3 修复：规划侧失败（converse 出错）→ 升级属主，不悄悄放行
+        let mut sm = GovernanceStateMachine::new();
+        sm.apply(GovernanceEvent::PlanningError).unwrap();
+        assert_eq!(sm.state(), GovernanceState::Escalated);
+        assert!(sm.state().is_suspended());
     }
 }
