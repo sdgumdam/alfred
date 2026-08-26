@@ -5,12 +5,12 @@
 //! `alfred run`（初始）与 `alfred decide`（续跑）都调用它。
 //!
 //! 确定性：状态转移全部经 `GovernanceRun.apply()`（alfred-core 状态机），
-//! 每次转移落 audit.jsonl；机械失败重跑预算 N=2（§3.3）；审查本身出错
-//! （unscored / eval error）→ 升级属主（§六继承项，不悄悄放行）。
-
+//! 每次转移落 audit.jsonl + persist state.json（P3 崩溃恢复显式化）；机械失败
+//! 重跑预算 N=2（§3.3）；审查本身出错（unscored / eval error）→ 升级属主
+//! （§六继承项，不悄悄放行）。单节点骨架显式拒绝多节点 DAG（P2，不静默截断）。
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use alfred_core::governance::{GovernanceEvent, GovernanceRun};
 use alfred_core::util::now_rfc3339;
 use alfred_executor::config::ExecutorModel;
@@ -94,6 +94,9 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                 return Ok(());
             }
         }
+        // P3 修复：每次状态转移后 persist state.json（转移已写 audit，persist 廉价）。
+        // 进程在下一转移前崩溃也能从最新状态续跑（崩溃恢复显式化）。
+        persist_governance_run(&ctx.run_dir, run)?;
     }
 }
 
@@ -211,6 +214,15 @@ fn execution_step(
         .dagspec
         .clone()
         .context("governance state Executing without dagspec")?;
+    // P2 修复：单节点骨架显式拒绝多节点 DAG——不静默截断（无静默出口）。
+    // 正常流程在计划提交（converse validate_dagspec）即拦截；此处是旧 run 目录
+    // 已有历史多节点计划的防御纵深（宁可显式报错，不悄悄只跑第一个节点）。
+    if dagspec.nodes.len() != 1 {
+        bail!(
+            "dagspec has {} nodes; 多节点 DAG 本骨架不支持（单节点验证范围）",
+            dagspec.nodes.len()
+        );
+    }
     let node = dagspec
         .nodes
         .first()

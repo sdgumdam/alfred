@@ -193,7 +193,41 @@ fn load_config() -> Result<ConfigFile> {
     let path = config_path();
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read config {}", path.display()))?;
-    serde_yaml::from_str(&text).with_context(|| format!("parse config {}", path.display()))
+    let cfg: ConfigFile =
+        serde_yaml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+    validate_config(&cfg)?;
+    Ok(cfg)
+}
+
+/// 结构校验（§3.1 原文三种错误；第三种=模型引用未知 provider 在 load_role_model 报）：
+/// ① roles 引用的模型 id 不在 models 列表（且非 env 覆盖）→ 加载期报错点名；
+/// ② models 列表重复 id → 报错点名。
+fn validate_config(cfg: &ConfigFile) -> Result<()> {
+    // ② models 列表重复 id → 报错点名
+    let mut seen: HashMap<&str, ()> = HashMap::new();
+    for m in &cfg.models {
+        if seen.insert(m.id.as_str(), ()).is_some() {
+            bail!("config models list has duplicate id '{}'", m.id);
+        }
+    }
+    // ① roles 引用的模型 id 不在 models 列表（且非 env 覆盖）→ 报错点名
+    let role_models: [(&str, Option<&String>); 3] = [
+        ("executor", Some(&cfg.roles.executor)),
+        ("reviewer", cfg.roles.reviewer.as_ref()),
+        ("planner", cfg.roles.planner.as_ref()),
+    ];
+    for (role, model_id) in role_models {
+        let Some(model_id) = model_id else { continue };
+        if env_override_model_id(role).is_some() {
+            continue; // env 覆盖生效，config roles.<role> 引用不参与解析
+        }
+        if !cfg.models.iter().any(|m| m.id == *model_id) {
+            bail!(
+                "config roles.{role} references model '{model_id}' not in models list"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn role_model_id(cfg: &ConfigFile, role: &str) -> Result<String> {
@@ -398,6 +432,101 @@ roles:
         assert_eq!(plan.provider, "zhipucoding"); // 继承 executor 的 provider
 
         std::env::remove_var("ALFRED_PLANNER_MODEL");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_rejects_role_model_not_in_list() {
+        // P2 修复：roles 引用的模型 id 不在 models 列表（且非 env 覆盖）→ 加载期报错点名
+        let _guard = env_guard();
+        let dir = std::env::temp_dir().join("alfred-config-test-role-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = r#"
+providers:
+  zhipucoding:
+    base_url: "https://open.bigmodel.cn/api/coding/paas/v4"
+    api_key: "sk-test"
+models:
+  - id: glm-5.2
+    provider: zhipucoding
+roles:
+  executor: glm-999
+"#;
+        let p = write_config(&dir, cfg);
+        std::env::set_var("ALFRED_CONFIG", &p);
+        for k in ["LLM_EXECUTOR_MODEL", "ALFRED_EXECUTOR_MODEL"] {
+            std::env::remove_var(k);
+        }
+        let err = load_executor_model().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("roles.executor"), "报错应点名 role: {msg}");
+        assert!(msg.contains("glm-999"), "报错应点名 model id: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_rejects_duplicate_model_ids() {
+        // P2 修复：models 列表重复 id → 报错点名
+        let _guard = env_guard();
+        let dir = std::env::temp_dir().join("alfred-config-test-dup");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = r#"
+providers:
+  zhipucoding:
+    base_url: "https://open.bigmodel.cn/api/coding/paas/v4"
+    api_key: "sk-test"
+models:
+  - id: glm-5.2
+    provider: zhipucoding
+  - id: glm-5.2
+    provider: zhipucoding
+roles:
+  executor: glm-5.2
+"#;
+        let p = write_config(&dir, cfg);
+        std::env::set_var("ALFRED_CONFIG", &p);
+        for k in ["LLM_EXECUTOR_MODEL", "ALFRED_EXECUTOR_MODEL"] {
+            std::env::remove_var(k);
+        }
+        let err = load_executor_model().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate"), "报错应含 duplicate: {msg}");
+        assert!(msg.contains("glm-5.2"), "报错应点名重复 id: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_role_model_missing_ok_when_env_override() {
+        // env 覆盖存在时，config roles.<role> 引用不在列表不报错（沿用基础角色 provider）
+        let _guard = env_guard();
+        let dir = std::env::temp_dir().join("alfred-config-test-env-ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = r#"
+providers:
+  zhipucoding:
+    base_url: "https://open.bigmodel.cn/api/coding/paas/v4"
+    api_key: "sk-test"
+models:
+  - id: glm-5.2
+    provider: zhipucoding
+roles:
+  executor: glm-999
+  reviewer: glm-5.2
+"#;
+        let p = write_config(&dir, cfg);
+        std::env::set_var("ALFRED_CONFIG", &p);
+        // 清掉可能存在的 reviewer env 覆盖（e2e 会导出 ALFRED_REVIEWER_MODEL），
+        // 保证 reviewer 走 config roles.reviewer=glm-5.2。
+        for k in ["LLM_REVIEWER_MODEL", "ALFRED_REVIEWER_MODEL"] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("ALFRED_EXECUTOR_MODEL", "glm-5.2");
+        // executor env 覆盖 → 不报 roles.executor 缺失；reviewer 在列表
+        let exec = load_executor_model().unwrap();
+        assert_eq!(exec.model, "glm-5.2");
+        let rev = load_reviewer_model().unwrap();
+        assert_eq!(rev.model, "glm-5.2");
+        std::env::remove_var("ALFRED_EXECUTOR_MODEL");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

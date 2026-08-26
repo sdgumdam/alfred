@@ -156,7 +156,7 @@ pub fn instructions_to_dagspec(text: &str, request: &OwnerRequest) -> Result<Dag
     Ok(dagspec)
 }
 
-/// 校验 DagSpec 与请求对齐（request_id 匹配、节点非空）。
+/// 校验 DagSpec 与请求对齐（request_id 匹配、节点非空、单节点骨架范围）。
 fn validate_dagspec(dagspec: &DagSpec, request: &OwnerRequest) -> Result<()> {
     if dagspec.request_id != request.id {
         bail!(
@@ -167,6 +167,14 @@ fn validate_dagspec(dagspec: &DagSpec, request: &OwnerRequest) -> Result<()> {
     }
     if dagspec.nodes.is_empty() {
         bail!("dagspec has no nodes");
+    }
+    // P2 修复：单节点骨架显式拒绝多节点 DAG（清单骨架范围：单节点验证；静默
+    // 截断违反"无静默出口"）。在计划提交即报结构错误，执行侧不再截断。
+    if dagspec.nodes.len() > 1 {
+        bail!(
+            "dagspec has {} nodes; 多节点 DAG 本骨架不支持（单节点验证范围）",
+            dagspec.nodes.len()
+        );
     }
     Ok(())
 }
@@ -265,6 +273,28 @@ mod tests {
         assert!(instructions_to_dagspec(text, &request()).is_err());
     }
 
+    #[test]
+    fn instructions_reject_multi_node_dag() {
+        // P2 修复：单节点骨架显式拒绝多节点 DAG（不静默截断）。
+        let text = r#"[
+            {"op":"begin","request_id":"req-1"},
+            {"op":"add_node","id":"task-1","summary":"s1",
+             "contract":{"prompt":"p1","acceptance_criteria":"a1"},
+             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false}},
+            {"op":"add_node","id":"task-2","summary":"s2",
+             "contract":{"prompt":"p2","acceptance_criteria":"a2"},
+             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false}},
+            {"op":"add_edge","from":"task-1","to":"task-2"},
+            {"op":"set_routes","start":["task-1"]},
+            {"op":"commit"}
+        ]"#;
+        let err = instructions_to_dagspec(text, &request()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("多节点"), "expected 多节点 rejection: {msg}");
+        assert!(msg.contains("不支持"), "expected 不支持 in rejection: {msg}");
+        assert!(msg.contains("2 nodes"), "expected node count in rejection: {msg}");
+    }
+    
     #[test]
     fn build_messages_include_session_and_owner_message() {
         let mut doc = SessionDoc::new();

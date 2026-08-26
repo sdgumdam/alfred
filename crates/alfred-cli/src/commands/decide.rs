@@ -1,9 +1,8 @@
 //! `alfred decide` 子命令（R3：属主拍板后从挂起态续跑）。
 //!
-//! §3.2 环节 3/6：计划打回或执行升级时挂起，属主三选一（重跑 retry / 改需求
-//! 或改契约重新规划 revise / 放弃 abandon），决定传回编排器执行：
-//! - PlanRejected + retry → 伪装消息重规划（P7）；
-//! - PlanRejected / Escalated + revise → 属主补充新需求（maintain ②）→ 重规划；
+//! - Escalated + retry → 按升级来源路由（P1 修复：Execution → 重入执行；
+//!   PlanReview → 重审同一计划；Planning → 重新规划）；
+//! - 任一 + abandon → 终止。
 //! - Escalated + retry → 重入执行循环（重跑预算重置）；
 //! - 任一 + abandon → 终止。
 //!
@@ -160,11 +159,26 @@ pub fn decide(args: DecideArgs) -> Result<()> {
             println!("[alfred] 属主拍板：放弃（终止）。");
         }
         (GovernanceState::Escalated, OwnerDecision::Retry) => {
-            // 属主拍板重跑 → 重入执行循环（重跑预算重置为新周期）。
+            // P1 修复：按升级来源路由（GovernanceRun.apply 在升级时落来源）：
+            // Execution → 重入执行；PlanReview → 回 PlanReviewing 重审同一计划
+            // （不绕计划审查闸门）；Planning → 回 Planning 重新规划（PlanningError
+            // 升级后 dagspec=None，重入执行会崩——路由回 Planning 消除该崩溃）。
+            let source = run.escalation_source;
             run.attempts_used = 0;
             run.apply(alfred_core::governance::GovernanceEvent::OwnerRetry)?;
-            audit(run_dir, "decide_retry_exec", &serde_json::json!({}))?;
-            println!("[alfred] 属主拍板：重跑执行。");
+            let dest = state_label(run.state());
+            audit(
+                run_dir,
+                "decide_retry",
+                &serde_json::json!({
+                    "escalation_source": source.map(|s| format!("{s:?}")).unwrap_or_else(|| "none".to_string()),
+                    "destination": dest,
+                }),
+            )?;
+            println!(
+                "[alfred] 属主拍板：重跑（升级来源 {:?}）→ {}。",
+                source, dest
+            );
         }
         _ => unreachable!("suspended state matched above"),
     }

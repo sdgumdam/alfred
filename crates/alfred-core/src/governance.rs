@@ -93,6 +93,23 @@ pub enum GovernanceEvent {
     OwnerAbandon,
 }
 
+/// 升级来源（Escalated + OwnerRetry 的路由依据，P1 修复）。
+///
+/// 升级属主时记录来源；属主 decide retry 时按来源路由：
+/// - Execution  → 重入 Executing（R3 现行为）；
+/// - PlanReview → 回 PlanReviewing（重新审同一计划，不绕计划审查闸门）；
+/// - Planning   → 回 Planning（重新规划）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationSource {
+    /// 规划侧失败（converse 出错）升级。
+    Planning,
+    /// 计划审查本身出错（unscored / eval error）升级。
+    PlanReview,
+    /// 执行 / 执行审查失败升级。
+    Execution,
+}
+
 /// 非法转移错误（含来源状态与事件，显式报错）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionError {
@@ -137,17 +154,35 @@ impl GovernanceStateMachine {
     }
 
     /// 应用事件；非法转移返回 `TransitionError`（不改变状态）。
+    ///
+    /// 裸状态机不知道升级来源：`(Escalated, OwnerRetry)` 走缺省路由
+    /// （→ Executing，旧 run 兼容）。带来源的路由用 `apply_with_source`。
     pub fn apply(&mut self, event: GovernanceEvent) -> Result<(), TransitionError> {
-        let next = transition(self.state, event)?;
+        let next = transition(self.state, event, None)?;
+        self.state = next;
+        Ok(())
+    }
+
+    /// 应用事件（带升级来源）：`(Escalated, OwnerRetry)` 按来源路由。
+    pub fn apply_with_source(
+        &mut self,
+        event: GovernanceEvent,
+        escalation_source: Option<EscalationSource>,
+    ) -> Result<(), TransitionError> {
+        let next = transition(self.state, event, escalation_source)?;
         self.state = next;
         Ok(())
     }
 }
 
 /// 转移表（确定性、无静默出口）。非法组合返回 Err。
+///
+/// `escalation_source` 仅供 `(Escalated, OwnerRetry)` 一行按升级来源路由；
+/// 其余行不读它（传 None 即可）。
 fn transition(
     from: GovernanceState,
     event: GovernanceEvent,
+    escalation_source: Option<EscalationSource>,
 ) -> Result<GovernanceState, TransitionError> {
     use GovernanceEvent::*;
     use GovernanceState::*;
@@ -168,7 +203,13 @@ fn transition(
         (ExecReviewing, ExecReviewMechanicalEscalate) => Escalated,
         (ExecReviewing, ExecReviewSemanticEscalate) => Escalated,
         (ExecReviewing, ExecReviewError) => Escalated,
-        (Escalated, OwnerRetry) => Executing,
+        // P1 修复：Escalated + OwnerRetry 按升级来源路由。缺省/旧 run（无来源
+        // 字段）→ 重入执行（R3 现行为，向后兼容）。
+        (Escalated, OwnerRetry) => match escalation_source {
+            Some(EscalationSource::PlanReview) => PlanReviewing,
+            Some(EscalationSource::Planning) => Planning,
+            Some(EscalationSource::Execution) | None => Executing,
+        },
         (Escalated, OwnerRevise) => Planning,
         (Escalated, OwnerAbandon) => Abandoned,
         // 终态/挂起态对非法事件显式报错（无静默出口）。
@@ -296,6 +337,10 @@ pub struct GovernanceRun {
     /// 当前属主消息（初始为 None → converse 用 request；重规划/改需求时为 Some）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_message: Option<String>,
+    /// 最近一次升级的来源（P1 修复：Escalated + OwnerRetry 按来源路由）。
+    /// 旧 run 目录无此字段 → 反序列化缺省 None → 路由按 Execution（向后兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_source: Option<EscalationSource>,
     /// 运行选项（decide 续跑用）。
     pub options: GovernanceOptions,
     pub updated_at: String,
@@ -315,6 +360,7 @@ impl GovernanceRun {
             plan_verdicts: Vec::new(),
             exec_verdicts: Vec::new(),
             owner_message: None,
+            escalation_source: None,
             options,
             updated_at: now_rfc3339(),
         }
@@ -330,16 +376,37 @@ impl GovernanceRun {
     }
 
     /// 应用状态机事件并更新时间戳。
+    ///
+    /// 升级事件（PlanningError / PlanReviewError / Execution*Escalate /
+    /// ExecReviewError）先落升级来源，供 Escalated + OwnerRetry 按来源路由。
     pub fn apply(&mut self, event: GovernanceEvent) -> Result<(), TransitionError> {
-        self.state_machine.apply(event)?;
+        if let Some(source) = escalation_source_for(event) {
+            self.escalation_source = Some(source);
+        }
+        self.state_machine
+            .apply_with_source(event, self.escalation_source)?;
         // P2 修复：进入 Planning（重规划周期开始）→ 重置 mechanical 重跑预算。
-        // 覆盖 PlanRejected+retry / PlanRejected+revise / Escalated+revise 三条
-        // 重规划路径；Escalated+retry（重入执行）在 decide 侧重置。
+        // 覆盖 PlanRejected+retry / PlanRejected+revise / Escalated+revise / Escalated+retry(→Planning)
+        // 四条重规划路径；Escalated+retry（重入执行/重审计划）在 decide 侧重置 attempts。
         if self.state() == GovernanceState::Planning {
             self.attempts_used = 0;
         }
         self.updated_at = now_rfc3339();
         Ok(())
+    }
+}
+
+/// 升级事件 → 升级来源（GovernanceRun::apply 落记录，供 Escalated+OwnerRetry 路由）。
+fn escalation_source_for(event: GovernanceEvent) -> Option<EscalationSource> {
+    use GovernanceEvent::*;
+    match event {
+        PlanningError => Some(EscalationSource::Planning),
+        PlanReviewError => Some(EscalationSource::PlanReview),
+        ExecutionFailedEscalate
+        | ExecReviewMechanicalEscalate
+        | ExecReviewSemanticEscalate
+        | ExecReviewError => Some(EscalationSource::Execution),
+        _ => None,
     }
 }
 
@@ -414,15 +481,71 @@ mod tests {
     }
 
     #[test]
-    fn escalted_owner_retry_reenters_execution() {
-        let mut sm = GovernanceStateMachine::new();
-        sm.apply(GovernanceEvent::PlanProduced).unwrap();
-        sm.apply(GovernanceEvent::PlanReviewError).unwrap();
-        assert_eq!(sm.state(), GovernanceState::Escalated);
-        sm.apply(GovernanceEvent::OwnerRetry).unwrap();
-        assert_eq!(sm.state(), GovernanceState::Executing);
+    fn escalated_owner_retry_routes_by_source() {
+        // P1 修复：Escalated + OwnerRetry 按升级来源路由（三类来源各一）。
+        // Execution → 重入 Executing
+        let mut run = GovernanceRun::new(
+            "run-exec",
+            OwnerRequest::new("req-1", "t", "d", "a"),
+            GovernanceOptions::default(),
+        );
+        run.apply(GovernanceEvent::PlanProduced).unwrap();
+        run.apply(GovernanceEvent::PlanReviewPassed).unwrap();
+        run.apply(GovernanceEvent::ExecutionFailedEscalate).unwrap();
+        assert_eq!(run.state(), GovernanceState::Escalated);
+        assert_eq!(run.escalation_source, Some(EscalationSource::Execution));
+        run.apply(GovernanceEvent::OwnerRetry).unwrap();
+        assert_eq!(run.state(), GovernanceState::Executing);
+
+        // PlanReview → 回 PlanReviewing（重新审同一计划，不绕计划审查闸门）
+        let mut run = GovernanceRun::new(
+            "run-review",
+            OwnerRequest::new("req-1", "t", "d", "a"),
+            GovernanceOptions::default(),
+        );
+        run.apply(GovernanceEvent::PlanProduced).unwrap();
+        run.apply(GovernanceEvent::PlanReviewError).unwrap();
+        assert_eq!(run.state(), GovernanceState::Escalated);
+        assert_eq!(run.escalation_source, Some(EscalationSource::PlanReview));
+        run.apply(GovernanceEvent::OwnerRetry).unwrap();
+        assert_eq!(run.state(), GovernanceState::PlanReviewing);
+
+        // Planning → 回 Planning（重新规划；dagspec=None 不再崩执行）
+        let mut run = GovernanceRun::new(
+            "run-plan",
+            OwnerRequest::new("req-1", "t", "d", "a"),
+            GovernanceOptions::default(),
+        );
+        run.apply(GovernanceEvent::PlanningError).unwrap();
+        assert_eq!(run.state(), GovernanceState::Escalated);
+        assert_eq!(run.escalation_source, Some(EscalationSource::Planning));
+        assert!(run.dagspec.is_none(), "PlanningError 升级后 dagspec 应为 None");
+        run.apply(GovernanceEvent::OwnerRetry).unwrap();
+        assert_eq!(run.state(), GovernanceState::Planning);
+        assert!(run.dagspec.is_none(), "重规划前 dagspec 仍为 None，不触发执行崩溃");
     }
 
+    #[test]
+    fn escalated_retry_legacy_run_defaults_to_executing() {
+        // 旧 run 目录 state.json 无 escalation_source 字段 → 反序列化 None →
+        // Escalated + OwnerRetry 缺省路由 → Executing（向后兼容）。
+        let json = serde_json::json!({
+            "run_id": "legacy",
+            "request": OwnerRequest::new("req-1", "t", "d", "a"),
+            "state_machine": { "state": "escalated" },
+            "attempts_used": 0,
+            "mechanical_budget": 2,
+            "dagspec": null,
+            "session_doc": { "key_file_paths": [], "key_conclusions": [], "review_summary": [] },
+            "options": GovernanceOptions::default(),
+            "updated_at": "2026-08-26T00:00:00Z"
+        });
+        let run: GovernanceRun = serde_json::from_value(json).unwrap();
+        assert_eq!(run.escalation_source, None);
+        let mut run = run;
+        run.apply(GovernanceEvent::OwnerRetry).unwrap();
+        assert_eq!(run.state(), GovernanceState::Executing);
+    }
     #[test]
     fn escalted_owner_revise_replans() {
         let mut sm = GovernanceStateMachine::new();

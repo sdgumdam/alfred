@@ -104,6 +104,19 @@ def _extract_json_text(text: str) -> str:
     return text
 
 
+def _neutralize_data_markers(text: str) -> str:
+    """剥除/转义 [BEGIN DATA]/[END DATA] 标记（FinalAudit P3 修复，防御纵深）。
+
+    数据块边界只能由模板持有：artifact / 验收标准文本里若出现同名标记，会在
+    grader 提示词里伪造数据块边界（注入/中和绕过）。插入前把标记改写为无
+    冲突形式，保证 [BEGIN DATA]...[/END DATA] 结构不被内容夺权。
+    """
+    return (
+        text.replace("[BEGIN DATA]", "[BEGIN_DATA]")
+        .replace("[END DATA]", "[END_DATA]")
+    )
+
+
 class ExecVerdict(BaseModel):
     grade: Literal["C", "I", "P"]
     failure_class: FailureClass | None = None
@@ -125,8 +138,8 @@ def exec_verdict_scorer():
         grading_prompt = f"""You are assessing a submitted artifact against acceptance criteria.
 
 [BEGIN DATA]
-[Acceptance Criteria]: {target.text}
-[Artifact]: {artifact}
+[Acceptance Criteria]: {_neutralize_data_markers(target.text)}
+[Artifact]: {_neutralize_data_markers(artifact)}
 [END DATA]
 
 Determine whether the artifact satisfies the acceptance criteria.

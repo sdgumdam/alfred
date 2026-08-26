@@ -100,6 +100,9 @@ pub fn run(args: RunArgs) -> Result<()> {
     audit(&run_dir, "governance_started", &serde_json::json!({ "request_id": request.id }))?;
 
     run_governance_loop(&mut run, &ctx)?;
+    // P3 崩溃恢复显式化：run_governance_loop 每次状态转移后已 persist state.json
+    // （转移已写 audit，persist 廉价）；此处末尾 persist 是安全网，保证挂起/终态
+    // 落盘。孤儿容器对账是显式已知限制（见 .plans/R5报告.md 已知边界）。
     persist_governance_run(&run_dir, &run)?;
     audit(
         &run_dir,

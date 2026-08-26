@@ -106,6 +106,37 @@ mod tests {
     }
 
     #[test]
+    fn grader_neutralizes_data_markers_in_prompt() {
+        // FinalAudit P3 修复：artifact / 验收标准插入 [BEGIN DATA] 前须经
+        // _neutralize_data_markers 中和（防伪造数据块边界，防御纵深）。
+        let py = generate_task_py(&TaskGenParams {
+            compose_file: "/x".into(),
+            contract_prompt: "p".into(),
+            acceptance_criteria: "a".into(),
+            port_base: 13100,
+            pi_model: "inspect-bridge/inspect".into(),
+            workspace_dir: "/workspace".into(),
+            sandbox_user: "root".into(),
+            run_id: "r".into(),
+            settle_grace_seconds: 20.0,
+        })
+        .unwrap();
+        assert!(
+            py.contains("[Acceptance Criteria]: {_neutralize_data_markers(target.text)}"),
+            "acceptance criteria 须经中和：\n{}",
+            py
+        );
+        assert!(
+            py.contains("[Artifact]: {_neutralize_data_markers(artifact)}"),
+            "artifact 须经中和：\n{}",
+            py
+        );
+        // 中和函数本身存在，且替换逻辑把标记改写为无冲突形式
+        assert!(py.contains("def _neutralize_data_markers"));
+        assert!(py.contains(".replace(\"[BEGIN DATA]\", \"[BEGIN_DATA]\")"));
+        assert!(py.contains(".replace(\"[END DATA]\", \"[END_DATA]\")"));
+    }
+    #[test]
     fn prompt_with_quotes_and_newlines_survives() {
         let prompt = "Say \"hi\"\nand 'bye'\n\\backslash";
         let py = generate_task_py(&TaskGenParams {
