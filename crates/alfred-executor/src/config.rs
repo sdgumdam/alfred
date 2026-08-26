@@ -23,7 +23,8 @@ pub struct ExecutorModel {
     pub base_url: String,
     /// provider api_key（只经 env 注入 eval 进程，不进 argv、不进容器）。
     pub api_key: String,
-    /// max_tokens（reasoning 模型下限 1024，见 R0报告 审计修正 1）。
+    /// max_tokens（reasoning 模型思考耗 token：1024 实测会被思考吃光致正文空——
+/// 默认 4096，见 R3 验方实测与 R0 报告）。
     pub max_tokens: u32,
     /// 原始 inspect 模型 id（不经 openai-api/ 前缀包装），如 mockllm/model。
     pub raw_id: bool,
@@ -154,7 +155,7 @@ fn load_role_model(role: &str) -> Result<ExecutorModel> {
 
     let entry = cfg.models.iter().find(|m| m.id == model_id);
     let (provider_name, max_tokens) = match entry {
-        Some(e) => (e.provider.clone(), e.max_tokens.unwrap_or(1024).max(1024)),
+        Some(e) => (e.provider.clone(), e.max_tokens.unwrap_or(4096).max(4096)),
         None => {
             // env 覆盖的模型不在列表：沿用基础角色的 provider；基础角色缺失
             // 时退到 executor 的 provider（e2e 以 ALFRED_PLANNER_MODEL 指定
@@ -168,7 +169,7 @@ fn load_role_model(role: &str) -> Result<ExecutorModel> {
                         "model '{model_id}' not in models list and no base role model to inherit provider"
                     )
                 })?;
-            (base.provider.clone(), 1024)
+            (base.provider.clone(), 4096)
         }
     };
     let prov = cfg.providers.get(&provider_name).with_context(|| {
@@ -319,7 +320,7 @@ roles:
         // glm-4.7 在 models 列表里（sample_config 有），正常解析
         assert_eq!(rev.model, "glm-4.7");
         assert_eq!(rev.provider, "zhipucoding");
-        assert_eq!(rev.max_tokens, 1024); // 列表项未配 max_tokens → 默认下限
+        assert_eq!(rev.max_tokens, 4096); // 列表项未配 max_tokens → 默认下限（reasoning 模型思考耗 token，4096 实测安全）
 
         // 不在列表的模型 → 沿用基础角色 provider
         std::env::set_var("ALFRED_REVIEWER_MODEL", "glm-999");
