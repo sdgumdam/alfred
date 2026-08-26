@@ -62,7 +62,8 @@ SETTLE_GRACE_SECONDS = float(__SETTLE_GRACE_SECONDS__)
 #      config）。grader 模型经宿主 `--model-role grader=<reviewer>` 绑定，本
 #      文件不写任何 provider 专属字段。 ----
 FailureClass = Literal[
-    # 单 grader 结构可观测的失败分类（§3.3 原文定义）：
+# grader 可判：contract_ambiguity / fidelity_dispute（单 grader 投影可观测）；
+# contract_fault 需对照属主原意（grader 投影不可见），R3 全上下文判定接入前为死路径——已知限制
     # - contract_ambiguity: 契约本身写得有歧义
     # - fidelity_dispute: 产物与契约之间有争议，是否兑现说法不一
     # - contract_fault: 产物忠实于契约，但契约偏离了属主本意
