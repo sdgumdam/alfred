@@ -25,10 +25,12 @@ enum Commands {
     Run(commands::run::RunArgs),
     /// 计划审查：判 DagSpec 是否忠实于 OwnerRequest（PlanVerdict 落 run 目录）
     PlanReview(commands::plan_review::PlanReviewArgs),
-    /// 属主拍板（retry/revise/abandon）并从挂起态续跑
-    Decide(commands::decide::DecideArgs),
-    /// 只读查看治理环状态
-    Status(commands::status::StatusArgs),
+         /// 属主拍板（retry/revise/abandon）并从挂起态续跑
+     Decide(commands::decide::DecideArgs),
+     /// 决策面板 RPC：属主会话 pi 发三选项决策卡 → 终端拍板 → 调 decide 续跑
+     Panel(commands::panel::PanelArgs),
+     /// 只读查看治理环状态
+     Status(commands::status::StatusArgs),
 }
 
 fn main() -> Result<()> {
@@ -36,7 +38,8 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Run(args) => commands::run::run(args),
         Commands::PlanReview(args) => commands::plan_review::plan_review(args),
-        Commands::Decide(args) => commands::decide::decide(args),
-        Commands::Status(args) => commands::status::status(args),
+                 Commands::Decide(args) => commands::decide::decide(args),
+         Commands::Panel(args) => commands::panel::panel(args),
+         Commands::Status(args) => commands::status::status(args),
     }
 }

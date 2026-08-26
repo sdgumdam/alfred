@@ -205,7 +205,7 @@ pub fn decide(args: DecideArgs) -> Result<()> {
     Ok(())
 }
 
-fn choice_label(d: DecideChoice) -> &'static str {
+pub(crate) fn choice_label(d: DecideChoice) -> &'static str {
     match d {
         DecideChoice::Retry => "retry",
         DecideChoice::Revise => "revise",
