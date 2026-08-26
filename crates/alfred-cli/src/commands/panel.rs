@@ -259,9 +259,12 @@ pub fn panel(args: PanelArgs) -> Result<()> {
 
     // 主循环：处理决策卡 → 读属主选择 → 回 response；直到决策/落定/超时。
     let deadline = Instant::now() + Duration::from_secs(args.timeout as u64);
+    // 已送达真实响应（extension_ui_response {value}）后，决策已交到 pi 手里：
+    // 后续轮次不再因超时 bail（等 Decision 事件完成闭环，不丢已送达决策）。
+    let mut response_sent = false;
     let decision = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        // 超时终止仅适用「尚未送达真实响应」的等待期。
+        if deadline_exceeded(response_sent, deadline, Instant::now()) {
             let _ = child.kill();
             let _ = child.wait();
             bail!(
@@ -271,13 +274,52 @@ pub fn panel(args: PanelArgs) -> Result<()> {
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(PanelEvent::UiSelect { id, title, options }) => {
-                let value = render_and_pick(&title, &options)?;
-                let resp = json!({
-                    "type": "extension_ui_response",
-                    "id": id,
-                    "value": value,
-                });
-                write_pi(&stdin_writer, &session_log, &resp)?;
+                // 已送达真实响应后的多余决策卡：不重复打扰属主，直接取消并继续等首卡 Decision 闭环。
+                if response_sent {
+                    let resp = json!({
+                        "type": "extension_ui_response",
+                        "id": id,
+                        "cancelled": true,
+                    });
+                    write_pi(&stdin_writer, &session_log, &resp)?;
+                    continue;
+                }
+                // 倒计时提示（临近 deadline 每 5s 一次，stderr 不污染决策卡 stdout）。
+                let mut last_tick = u64::MAX;
+                let on_tick = |remaining: Duration| {
+                    let secs = remaining.as_secs();
+                    if secs <= 30 && secs % 5 == 0 && secs < last_tick {
+                        eprintln!("[alfred panel] 等待属主选择，剩余 {secs}s …");
+                        last_tick = secs;
+                    }
+                };
+                let value = render_and_pick(&title, &options, deadline, Instant::now, on_tick)?;
+                match value {
+                    Some(v) => {
+                        response_sent = true;
+                        let resp = json!({
+                            "type": "extension_ui_response",
+                            "id": id,
+                            "value": v,
+                        });
+                        write_pi(&stdin_writer, &session_log, &resp)?;
+                    }
+                    None => {
+                        // 属主未在期限内作答：取消决策卡（协议支持 cancelled:true）后终止。
+                        let resp = json!({
+                            "type": "extension_ui_response",
+                            "id": id,
+                            "cancelled": true,
+                        });
+                        write_pi(&stdin_writer, &session_log, &resp)?;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!(
+                            "panel 超时：{}s 内未收到属主选择（决策卡已取消）",
+                            args.timeout
+                        );
+                    }
+                }
             }
             Ok(PanelEvent::Decision(v)) => break v,
             Ok(PanelEvent::Settled) => {
@@ -388,8 +430,72 @@ fn build_context(run: &GovernanceRun, state: GovernanceState) -> String {
     lines.join("\n")
 }
 
+/// 面板读行的三种终态。
+#[derive(Debug, PartialEq)]
+enum LineRead {
+    /// 读到一行。
+    Line(String),
+    /// stdin EOF（无输入）。
+    Eof,
+    /// 超过 deadline 仍未读到。
+    Deadline,
+}
+
+/// 在 deadline 前读取一行 stdin。阻塞读放独立线程，主线程按剩余时间轮询，
+/// 到点返回 Deadline（取消决策卡）；stdin 阻塞读本身不直接单测，deadline
+/// 逻辑由 `await_line_with_deadline` 单测覆盖。
+fn read_line_until_deadline(
+    deadline: Instant,
+    now: impl FnMut() -> Instant,
+    on_tick: impl FnMut(Duration),
+) -> Result<LineRead> {
+    let (tx, rx) = mpsc::channel::<std::io::Result<Option<String>>>();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let res = match std::io::stdin().read_line(&mut line) {
+            Ok(0) => Ok(None), // EOF
+            Ok(_) => Ok(Some(line)),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(res);
+    });
+    await_line_with_deadline(&rx, deadline, now, Duration::from_millis(200), on_tick)
+}
+
+/// 从通道轮询读行结果，deadline 到 → `Deadline`（可单测：注入通道 + 时钟）。
+fn await_line_with_deadline(
+    rx: &Receiver<std::io::Result<Option<String>>>,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    poll: Duration,
+    mut on_tick: impl FnMut(Duration),
+) -> Result<LineRead> {
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Ok(LineRead::Deadline);
+        }
+        on_tick(remaining);
+        let wait = remaining.min(poll);
+        match rx.recv_timeout(wait) {
+            Ok(Ok(Some(line))) => return Ok(LineRead::Line(line)),
+            Ok(Ok(None)) => return Ok(LineRead::Eof),
+            Ok(Err(e)) => return Err(e).context("读 stdin"),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(LineRead::Eof),
+        }
+    }
+}
+
 /// 终端渲染三选项（数字选择）→ 精确返回所选选项串。
-fn render_and_pick(title: &str, options: &[String]) -> Result<String> {
+/// 期限内读到 → Ok(Some(value))；超时 → Ok(None)（调用方回 cancelled 决策卡）。
+fn render_and_pick(
+    title: &str,
+    options: &[String],
+    deadline: Instant,
+    now: impl FnMut() -> Instant,
+    on_tick: impl FnMut(Duration),
+) -> Result<Option<String>> {
     if options.is_empty() {
         bail!("决策卡 options 为空（pi 工具参数异常）");
     }
@@ -401,19 +507,30 @@ fn render_and_pick(title: &str, options: &[String]) -> Result<String> {
     }
     print!("请选择 (1-{}): ", options.len());
     std::io::stdout().flush()?;
-    let mut line = String::new();
-    let n = std::io::stdin().read_line(&mut line)?;
-    if n == 0 {
-        bail!("stdin EOF：未读到属主选择");
+    match read_line_until_deadline(deadline, now, on_tick)? {
+        LineRead::Line(line) => Ok(Some(parse_choice_line(&line, options)?)),
+        LineRead::Eof => bail!("stdin EOF：未读到属主选择"),
+        LineRead::Deadline => Ok(None),
     }
-    let idx: usize = line
-        .trim()
+}
+
+/// 解析一行输入为选项序号（1-based）→ 选项串（精确匹配）。
+fn parse_choice_line(line: &str, options: &[String]) -> Result<String> {
+    let trimmed = line.trim();
+    let idx: usize = trimmed
         .parse()
-        .map_err(|_| anyhow::anyhow!("无效输入（需 1-{} 的数字）：{}", options.len(), line.trim()))?;
+        .map_err(|_| anyhow::anyhow!("无效输入（需 1-{} 的数字）：{}", options.len(), trimmed))?;
     if idx == 0 || idx > options.len() {
         bail!("选择越界：{idx}（1-{}）", options.len());
     }
     Ok(options[idx - 1].clone())
+}
+
+/// 主循环超时终止判定：仅「未送达真实响应」且剩余时间耗尽才应终止。
+/// 已发送 extension_ui_response（response_sent）后决策已送达 pi，超时不 bail
+/// （等 Decision 事件完成闭环，已送达决策不丢）。
+fn deadline_exceeded(response_sent: bool, deadline: Instant, now: Instant) -> bool {
+    !response_sent && deadline.saturating_duration_since(now).is_zero()
 }
 
 /// 选项串 → 属主决策。
@@ -514,5 +631,100 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn opts() -> Vec<String> {
+        vec!["重跑".to_string(), "改契约".to_string(), "放弃".to_string()]
+    }
+
+    /// 选项行解析：精确匹配、越界/非法输入显式报错。
+    #[test]
+    fn parse_choice_line_valid_and_errors() {
+        let options = opts();
+        assert_eq!(parse_choice_line("1\n", &options).unwrap(), "重跑");
+        assert_eq!(parse_choice_line("3", &options).unwrap(), "放弃");
+        assert!(parse_choice_line("0\n", &options).is_err());
+        assert!(parse_choice_line("4", &options).is_err());
+        assert!(parse_choice_line("abc\n", &options).is_err());
+        assert!(parse_choice_line("", &options).is_err());
+    }
+
+    /// 超时路径：期限内无输入 → Deadline（取消决策卡），倒计时回调触发。
+    #[test]
+    fn await_line_with_deadline_times_out() {
+        let (_tx, rx) = mpsc::channel::<std::io::Result<Option<String>>>();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        // 第 1 次 now() = start（剩 10s）→ 轮询；第 2 次 = 已过 deadline → 超时。
+        let mut now = VecDeque::from([start, deadline + Duration::from_secs(1)]);
+        let mut ticks: Vec<Duration> = Vec::new();
+        let got = await_line_with_deadline(
+            &rx,
+            deadline,
+            move || now.pop_front().unwrap(),
+            Duration::from_millis(1),
+            |rem| ticks.push(rem),
+        )
+        .unwrap();
+        assert_eq!(got, LineRead::Deadline);
+        assert_eq!(ticks, vec![Duration::from_secs(10)]);
+    }
+
+    /// 期限内读到行 → Line（正常决策路径）。
+    #[test]
+    fn await_line_with_deadline_returns_line() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(Some("2".to_string()))).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let mut now = VecDeque::from([start, start]);
+        let got = await_line_with_deadline(
+            &rx,
+            deadline,
+            move || now.pop_front().unwrap(),
+            Duration::from_millis(1),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(got, LineRead::Line("2".to_string()));
+    }
+
+    /// stdin EOF → Eof。
+    #[test]
+    fn await_line_with_deadline_eof() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(None)).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let mut now = VecDeque::from([start, start]);
+        let got = await_line_with_deadline(
+            &rx,
+            deadline,
+            move || now.pop_front().unwrap(),
+            Duration::from_millis(1),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(got, LineRead::Eof);
+    }
+
+    /// 超时终止判定：已发送真实响应（response_sent）后不 bail——决策已送达不丢。
+    #[test]
+    fn deadline_exceeded_skips_bail_after_response_sent() {
+        let deadline = Instant::now();
+        let past = deadline + Duration::from_secs(1);
+        // 未发送响应 + 已过 deadline → 应终止。
+        assert!(deadline_exceeded(false, deadline, past));
+        // 已发送响应（决策已送达 pi）→ 即使已过 deadline 也不终止（等 Decision 闭环）。
+        assert!(!deadline_exceeded(true, deadline, past));
+        // 未发送但未过 deadline → 不终止。
+        let before = deadline - Duration::from_secs(1);
+        assert!(!deadline_exceeded(false, deadline, before));
     }
 }
