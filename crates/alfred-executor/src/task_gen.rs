@@ -11,6 +11,8 @@ pub struct TaskGenParams {
     pub compose_file: String,
     /// 契约 prompt（给执行者 pi 的任务描述）。
     pub contract_prompt: String,
+    /// 契约验收标准（给审查者 scorer 的判分依据——投影物理隔离）。
+    pub acceptance_criteria: String,
     /// 桥代理端口基数（每样本自增）。
     pub port_base: u32,
     /// pi 模型（provider/model 形态，如 "inspect-bridge/inspect"）。
@@ -33,6 +35,7 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
     let inject: &[(&str, String)] = &[
         ("__COMPOSE_FILE_JSON__", json(&params.compose_file)?),
         ("__CONTRACT_PROMPT_JSON__", json(&params.contract_prompt)?),
+        ("__ACCEPTANCE_CRITERIA_JSON__", json(&params.acceptance_criteria)?),
         ("__PORT_BASE__", params.port_base.to_string()),
         ("__PI_MODEL_JSON__", json(&params.pi_model)?),
         ("__WORKSPACE_DIR_JSON__", json(&params.workspace_dir)?),
@@ -54,6 +57,7 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
     for token in [
         "__COMPOSE_FILE_JSON__",
         "__CONTRACT_PROMPT_JSON__",
+        "__ACCEPTANCE_CRITERIA_JSON__",
         "__PI_MODEL_JSON__",
         "__WORKSPACE_DIR_JSON__",
         "__SANDBOX_USER_JSON__",
@@ -80,6 +84,7 @@ mod tests {
         let py = generate_task_py(&TaskGenParams {
             compose_file: "/run/executor.compose.yaml".into(),
             contract_prompt: "Create hello.txt with content Hello".into(),
+            acceptance_criteria: "hello.txt exists with content Hello".into(),
             port_base: 13100,
             pi_model: "inspect-bridge/inspect".into(),
             workspace_dir: "/workspace".into(),
@@ -93,9 +98,11 @@ mod tests {
         assert!(py.contains(r#"RUN_ID = "run-test-1""#));
         assert!(py.contains(r#"PORT_BASE = int(13100)"#));
         assert!(py.contains(r#"PI_MODEL = "inspect-bridge/inspect""#));
+        assert!(py.contains(r#"ACCEPTANCE_CRITERIA = "hello.txt exists with content Hello""#));
         // 不得残留 token
         assert!(!py.contains("__COMPOSE_FILE_JSON__"));
         assert!(!py.contains("__CONTRACT_PROMPT_JSON__"));
+        assert!(!py.contains("__ACCEPTANCE_CRITERIA_JSON__"));
     }
 
     #[test]
@@ -104,6 +111,7 @@ mod tests {
         let py = generate_task_py(&TaskGenParams {
             compose_file: "/x".into(),
             contract_prompt: prompt.into(),
+            acceptance_criteria: "criteria".into(),
             port_base: 13100,
             pi_model: "inspect-bridge/inspect".into(),
             workspace_dir: "/workspace".into(),
@@ -112,7 +120,7 @@ mod tests {
             settle_grace_seconds: 20.0,
         })
         .unwrap();
-        // 模板用 json.loads 还原，必须包含 JSON 转义后的字符串
-        assert!(py.contains("json.loads("));
+        // 字符串 token 注入的是 JSON 字面量（值语义一致），直接赋值即可
+        assert!(py.contains("CONTRACT_PROMPT ="));
     }
 }

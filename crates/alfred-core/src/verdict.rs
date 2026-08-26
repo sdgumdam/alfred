@@ -1,6 +1,7 @@
-//! 执行审查结论（施工清单 §3.3 ExecVerdict 五字段；限界上下文 §6.9 ReviewScore）。
+//! 审查结论实体（施工清单 §3.3 ExecVerdict；限界上下文 §6.9 ReviewScore）。
 //!
-//! R1 只定义实体（R2 的 Inspect scorer 才产出）；分流规则见 §3.3 表。
+//! R1 定义 ExecVerdict 实体（R2 的 Inspect scorer 才产出）；分流规则见
+//! §3.3 表。R2 增补 PlanVerdict（计划审查结论：计划是否忠实于属主需求）。
 
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +90,27 @@ impl ExecVerdict {
                 "ExecVerdict invariant violated: grade I/P requires failure_class".into(),
             ),
             _ => Ok(()),
+        }
+    }
+}
+
+/// 计划审查结论（R2）：计划是否忠实于属主需求。
+///
+/// pass=true：计划忠实于 OwnerRequest；pass=false：打回重规划（P7 在 R3
+/// 把 reason 转写为属主口吻喂回 planner）。由计划审查 scorer 产出，经
+/// eval log 结构化读取落盘。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanVerdict {
+    pub pass: bool,
+    pub reason: String,
+}
+
+impl PlanVerdict {
+    pub fn new(pass: bool, reason: impl Into<String>) -> Self {
+        Self {
+            pass,
+            reason: reason.into(),
         }
     }
 }

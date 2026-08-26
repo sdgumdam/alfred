@@ -2,7 +2,11 @@
 name = "alfred-reviewer"
 version.workspace = true
 edition.workspace = true
-description = "alfred 审查者（R2/R3 实现；R1 占位）"
+description = "alfred 审查者（R2）：执行审查 scorer 内嵌 executor eval；计划审查独立 eval（DagSpec vs OwnerRequest 忠实度）"
 
 [dependencies]
 alfred-core = { workspace = true }
+alfred-executor = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

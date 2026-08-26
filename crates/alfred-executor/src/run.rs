@@ -12,12 +12,13 @@ use alfred_core::assignment::TaskAssignment;
 use alfred_core::contract::SandboxProfile;
 use alfred_core::request::OwnerRequest;
 use alfred_core::util::{now_rfc3339, short_id};
+use alfred_core::verdict::ExecVerdict;
 use serde::Serialize;
 
 use crate::artifact::{collect_artifact, snapshot_workspace};
 use crate::compose_gen::{canonicalize_workspace, generate_compose, CONTAINER_WORKSPACE_DIR};
 use crate::config::ExecutorModel;
-use crate::driver::{archive_eval_log, poll_until_done, spawn_eval, PollOutcome};
+use crate::driver::{archive_eval_log, extract_exec_verdict, parse_dump, poll_until_done, spawn_eval, PollOutcome};
 use crate::task_gen::{generate_task_py, TaskGenParams};
 
 /// 单次运行选项。
@@ -73,6 +74,10 @@ pub struct RunOutcome {
     pub finished_at: String,
     /// 失败原因（eval status error / timed_out / crashed 各自填）；成功为 None。
     pub error: Option<String>,
+    /// 执行审查结论（R2：scorer 判 C/I/P）。unscored 时为 None。
+    pub verdict: Option<ExecVerdict>,
+    /// 执行审查 unscored 原因（verdict_parse_failure 等）；成功判分为 None。
+    pub verdict_unscored_reason: Option<String>,
 }
 
 /// run 目录缺省基座（`ALFRED_STATE_DIR` 或 `~/.local/state/alfred/runs`）。
@@ -86,8 +91,16 @@ pub fn default_run_dir() -> PathBuf {
     base.join(short_id("run"))
 }
 
-/// 执行一次运行（同步阻塞直到 eval 结束）。
-pub fn execute_run(opts: &RunOptions, model: &ExecutorModel, request: &OwnerRequest) -> Result<RunOutcome> {
+///
+/// `grader` 为执行审查 scorer 的判分模型（config roles.reviewer）；R2 起
+/// 执行 eval 内嵌 ExecVerdict scorer，grader 经 `--model-role` 绑定并注入
+/// 其 provider key。
+pub fn execute_run(
+    opts: &RunOptions,
+    model: &ExecutorModel,
+    grader: Option<&ExecutorModel>,
+    request: &OwnerRequest,
+) -> Result<RunOutcome> {
     // 沙箱档案校验：R1 只支持默认档案（无挂卷 / 无 runtime / 无依赖 / 联网拒绝）。
     // 非默认档案此前被静默忽略——按审计约束改为显式拒绝，防止"申请的约束没生效"。
     if opts.assignment.sandbox != SandboxProfile::default() {
@@ -123,6 +136,7 @@ pub fn execute_run(opts: &RunOptions, model: &ExecutorModel, request: &OwnerRequ
     let py = generate_task_py(&TaskGenParams {
         compose_file: compose_path.to_string_lossy().into_owned(),
         contract_prompt: opts.assignment.contract.prompt.clone(),
+        acceptance_criteria: opts.assignment.contract.acceptance_criteria.clone(),
         port_base: opts.port_base,
         pi_model: "inspect-bridge/inspect".to_string(),
         workspace_dir: CONTAINER_WORKSPACE_DIR.to_string(),
@@ -135,7 +149,7 @@ pub fn execute_run(opts: &RunOptions, model: &ExecutorModel, request: &OwnerRequ
     append_audit(run_dir, "run_started", &serde_json::json!({ "run_id": run_id, "task_id": opts.assignment.task_id }))?;
 
     // 4) spawn detached eval
-    let launch = spawn_eval(&task_py, model, &evals_dir, opts.time_limit_secs)?;
+    let launch = spawn_eval(&task_py, model, grader, &evals_dir, opts.time_limit_secs)?;
     append_audit(
         run_dir,
         "eval_launched",
@@ -164,6 +178,8 @@ pub fn execute_run(opts: &RunOptions, model: &ExecutorModel, request: &OwnerRequ
                 started_at: started_at.clone(),
                 finished_at: now_rfc3339(),
                 error: Some(msg.clone()),
+                verdict: None,
+                verdict_unscored_reason: Some("eval_timed_out".into()),
             };
             write_state(run_dir, request, &rec)?;
             bail!(msg);
@@ -185,20 +201,39 @@ pub fn execute_run(opts: &RunOptions, model: &ExecutorModel, request: &OwnerRequ
                 started_at: started_at.clone(),
                 finished_at: now_rfc3339(),
                 error: Some(msg.clone()),
+                verdict: None,
+                verdict_unscored_reason: Some("eval_crashed".into()),
             };
             write_state(run_dir, request, &rec)?;
             bail!(msg);
         }
     };
 
-    // 6) 归档证据（detach 输出 + .eval 原文件 + dump.json）——P9
-    // detach 输出复制失败不阻断（观测面）；eval log 归档失败记 audit 警告，
-    // 不推翻已成功的产物采集（产物是主交付，log 是证据）
-    if let Err(e) = std::fs::copy(
-        &launch.output_file,
-        evals_dir.join(format!("detach-{}.out", launch.run_id)),
-    ) {
-        eprintln!("[alfred] warn: copy detach output failed: {e:#}");
+    // R2: 从 dump 结构化读取执行审查结论（verdict / unscored_reason）
+    let mut verdict: Option<ExecVerdict> = None;
+    let mut verdict_unscored_reason: Option<String> = None;
+    match archive_eval_log(&outcome.location, &evals_dir) {
+        Ok(dump) => {
+            append_audit(
+                run_dir,
+                "eval_log_archived",
+                &serde_json::json!({ "dump": dump }),
+            )?;
+            if let Ok(text) = std::fs::read_to_string(&dump) {
+                if let Ok(v) = parse_dump(&text) {
+                    let review = extract_exec_verdict(&v);
+                    verdict = review.verdict;
+                    verdict_unscored_reason = review.unscored_reason;
+                    if let Some(detail) = review.detail {
+                        eprintln!("[alfred] warn: exec verdict detail: {detail}");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[alfred] warn: archive eval log failed: {e:#}");
+            append_audit(run_dir, "eval_log_archive_failed", &serde_json::json!({ "error": format!("{e:#}") }))?;
+        }
     }
     match archive_eval_log(&outcome.location, &evals_dir) {
         Ok(dump) => {
@@ -240,6 +275,8 @@ pub fn execute_run(opts: &RunOptions, model: &ExecutorModel, request: &OwnerRequ
         started_at,
         finished_at,
         error: eval_error,
+        verdict,
+        verdict_unscored_reason,
     };
     write_state(run_dir, request, &rec)?;
     append_audit(run_dir, "run_finished", &serde_json::json!({ "status": outcome.status, "error": rec.error }))?;
@@ -313,6 +350,7 @@ mod tests {
             base_url: "http://x".into(),
             api_key: "k".into(),
             max_tokens: 1024,
+            raw_id: false,
         };
         let request = OwnerRequest {
             id: "req-x".into(),
@@ -321,7 +359,7 @@ mod tests {
             acceptance_criteria: "a".into(),
             created_at: "2026-08-25T00:00:00Z".into(),
         };
-        let err = execute_run(&opts, &model, &request).unwrap_err();
+        let err = execute_run(&opts, &model, None, &request).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("R1 不支持非默认沙箱档案"),

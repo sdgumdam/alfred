@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use alfred_core::assignment::TaskAssignment;
 use alfred_core::contract::Contract;
 use alfred_core::request::OwnerRequest;
-use alfred_executor::config::load_executor_model;
+use alfred_executor::config::{load_executor_model, load_reviewer_model};
 use alfred_executor::run::{default_run_dir, execute_run, RunOptions};
 use clap::Args;
 
@@ -54,6 +54,14 @@ pub fn run(args: RunArgs) -> Result<()> {
     let assignment = TaskAssignment::new(format!("task-{}", request.id), contract);
 
     let model = load_executor_model()?;
+    let reviewer = load_reviewer_model()?;
+    // 异构审查降级警告：reviewer 与 executor 同 provider 时异构性打折扣
+    if reviewer.provider == model.provider {
+        eprintln!(
+            "[alfred] warn: reviewer 与 executor 同 provider '{}'——异构审查降级（共用同一模型通道）",
+            reviewer.provider
+        );
+    }
     let run_dir = args.run_dir.clone().unwrap_or_else(default_run_dir);
 
     let opts = RunOptions {
@@ -70,11 +78,18 @@ pub fn run(args: RunArgs) -> Result<()> {
     println!("  request : {}", args.request.display());
     println!("  prompt  : {}", truncate(&request.description, 120));
 
-    let outcome = execute_run(&opts, &model, &request)?;
+    let outcome = execute_run(&opts, &model, Some(&reviewer), &request)?;
 
     println!();
     println!("eval status      : {}", outcome.eval_status);
     println!("eval location    : {}", outcome.eval_location.as_deref().unwrap_or("(none)"));
+    match &outcome.verdict {
+        Some(v) => println!("exec verdict     : {} (failure_class={:?})", verdict_grade_label(v.value), v.failure_class),
+        None => println!("exec verdict     : unscored ({})", outcome.verdict_unscored_reason.as_deref().unwrap_or("none")),
+    }
+    if let Some(r) = outcome.verdict.as_ref() {
+        println!("  rationale      : {}", truncate(&r.explanation, 200));
+    }
     match &outcome.artifact {
         Some(art) => {
             println!("artifact changes : {} ({} files)", art.changes.len(), art.files.len());
@@ -104,5 +119,14 @@ fn change_kind_label(kind: alfred_core::artifact::ChangeKind) -> &'static str {
         Created => "created",
         Modified => "modified",
         Deleted => "deleted",
+    }
+}
+
+fn verdict_grade_label(g: alfred_core::verdict::VerdictGrade) -> &'static str {
+    use alfred_core::verdict::VerdictGrade::*;
+    match g {
+        C => "C",
+        I => "I",
+        P => "P",
     }
 }

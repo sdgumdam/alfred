@@ -6,6 +6,7 @@
 pub mod artifact;
 pub mod assignment;
 pub mod contract;
+pub mod dagspec;
 pub mod request;
 pub mod util;
 pub mod verdict;
@@ -13,5 +14,6 @@ pub mod verdict;
 pub use artifact::{Artifact, ChangeKind, FileChange, FileEntry};
 pub use assignment::TaskAssignment;
 pub use contract::{Contract, SandboxProfile, VolumeMount};
+pub use dagspec::{DagSpec, PlanNode};
 pub use request::OwnerRequest;
-pub use verdict::{Confidence, ExecVerdict, FailureClass, VerdictGrade};
+pub use verdict::{Confidence, ExecVerdict, FailureClass, PlanVerdict, VerdictGrade};

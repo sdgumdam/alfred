@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "alfred-core",
  "alfred-executor",
+ "alfred-reviewer",
  "anyhow",
  "clap",
  "serde",
@@ -49,6 +50,10 @@ name = "alfred-reviewer"
 version = "0.1.0"
 dependencies = [
  "alfred-core",
+ "alfred-executor",
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

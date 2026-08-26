@@ -1,10 +1,15 @@
-//! alfred-reviewer：审查者（R2/R3 实现；R1 阶段为占位 crate）。
+//! alfred-reviewer：审查者（R2 实现）。
 //!
-//! 职责见施工清单 §3.1：Inspect AI 打分模块，异构多模型独立判分。
-//! 计划审查（DagSpec vs OwnerRequest 忠实度）与执行审查（Contract 验收
-//! 标准判 Artifact）都走 `inspect eval`；R2 起实现 ExecVerdict scorer。
+//! 职责（施工清单 §3.1 / 实施计划 P3）：
+//! 1. 执行审查 scorer 内嵌 executor 的 task 模板（投影物理隔离：executor 只拿
+//!    contract.prompt，scorer 只拿 contract.acceptance_criteria）——物理位置在
+//!    alfred-executor/templates/pi_task.py.tmpl。
+//! 2. 计划审查独立 eval：Sample = OwnerRequest + DagSpec，scorer 判忠实度 →
+//!    PlanVerdict{pass, reason}。
+//! 3. Rust 驱动复用 alfred-executor::driver（spawn / poll / archive）。
 
-/// R1 占位。R2 起此 crate 承载 ExecVerdict / PlanVerdict scorer。
-pub fn _placeholder() -> &'static str {
-    "alfred-reviewer: R2"
-}
+pub mod plan_review;
+pub mod task_gen;
+
+pub use plan_review::{execute_plan_review, extract_plan_verdict, PlanReviewOptions, PlanReviewOutcome};
+pub use task_gen::generate_plan_review_py;

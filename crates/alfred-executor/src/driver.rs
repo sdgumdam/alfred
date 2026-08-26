@@ -11,6 +11,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use alfred_core::verdict::{Confidence, ExecVerdict, FailureClass, VerdictGrade};
 use serde_json::Value;
 
 use crate::config::ExecutorModel;
@@ -53,11 +54,13 @@ pub enum PollOutcome {
     Crashed,
 }
 
-/// 启动 detached eval，解析 launch 记录。
-///
-/// 只注入 executor 一个 provider 凭据（经 env：`{PROVIDER}_API_KEY` +
-/// `ALFRED_EXEC_API_KEY`，不进 argv），子进程 env 做 env_clear + 白名单
+/// 只注入 executor/reviewer 两个 provider 凭据（经 env：`{PROVIDER}_API_KEY`
+/// + `ALFRED_EXEC_API_KEY`，不进 argv），子进程 env 做 env_clear + 白名单
 /// 清洗（R0 审计约束 1：防执行者经桥点名其他 provider）。
+///
+/// `grader` 为执行审查 scorer 的判分模型（config roles.reviewer）：经
+/// `--model-role grader=<id>` 绑定，且其 provider key 一并注入 eval 进程。
+/// 计划审查 eval（scorer 判忠实度）不传 grader——主模型即审查者。
 ///
 /// inspect eval 的任务文件必须是相对路径（绝对路径会触发
 /// `root_dir.glob(glob)` 的 NotImplementedError）——把 cwd 设为任务文件
@@ -66,6 +69,7 @@ pub enum PollOutcome {
 pub fn spawn_eval(
     task_py: &Path,
     model: &ExecutorModel,
+    grader: Option<&ExecutorModel>,
     log_dir: &Path,
     time_limit_secs: u32,
 ) -> Result<LaunchRecord> {
@@ -85,10 +89,12 @@ pub fn spawn_eval(
         .current_dir(&task_dir)
         .arg("--detach")
         .arg("--model")
-        .arg(model.inspect_model_id())
-        .arg("--model-base-url")
-        .arg(&model.base_url)
-        .arg("--max-tokens")
+        .arg(model.inspect_model_id());
+    // 内建模型（mockllm 等）无 base_url——不传 --model-base-url
+    if !model.base_url.is_empty() {
+        cmd.arg("--model-base-url").arg(&model.base_url);
+    }
+    cmd.arg("--max-tokens")
         .arg(model.max_tokens.to_string())
         .arg("--time-limit")
         .arg(time_limit_secs.to_string())
@@ -97,13 +103,19 @@ pub fn spawn_eval(
         .arg("--log-level")
         .arg("info");
 
+    // 执行审查：grader 角色绑定审查者模型（scorer 里 get_model(role="grader")）
+    if let Some(g) = grader {
+        cmd.arg("--model-role")
+            .arg(format!("grader={}", g.inspect_model_id()));
+    }
+
     // env 清洗：env_clear + 白名单注入——继承的凭据形态变量（KEY/TOKEN/
     // SECRET/PASSWORD 或 LLM provider 前缀）从根上不进入 eval 进程（R0 审计
-    // 约束 1：eval 进程只应能解析 executor 一个 provider）。executor key 改经
-    // env 注入（{PROVIDER}_API_KEY 供 Inspect openai-api provider 读取，
+    // 约束 1：eval 进程只应能解析 executor/reviewer 两个 provider）。executor
+    // key 改经 env 注入（{PROVIDER}_API_KEY 供 Inspect openai-api provider 读取，
     // ALFRED_EXEC_API_KEY 为规范名），不再走 `-M api_key=` argv——ps 不可见。
     cmd.env_clear();
-    cmd.envs(eval_child_env(model));
+    cmd.envs(eval_child_env(model, grader));
 
     let output = cmd
         .output()
@@ -321,6 +333,119 @@ pub fn archive_eval_log(location: &str, dest_dir: &Path) -> Result<PathBuf> {
     Ok(dump_path)
 }
 
+/// 解析 `inspect log dump` JSON 文本。
+///
+/// inspect 对 unscored score 的 `value` 写非标准 `NaN`（JSON 规范外），
+/// serde_json 默认拒绝——先归一化为 null 再解析。
+pub fn parse_dump(text: &str) -> Result<Value> {
+    let sanitized = text.replace("NaN", "null").replace("Infinity", "null").replace("-Infinity", "null");
+    serde_json::from_str(&sanitized).context("parse inspect log dump JSON")
+}
+
+/// 从 `inspect log dump` JSON 读某个 scorer 的首个 sample score（原始值）。
+///
+/// 返回 `samples[0].scores[<scorer_name>]`，形如
+/// `{"value": "C", "answer": ..., "explanation": ..., "metadata": {...}}`；
+/// scorer 缺失或无样本时返回 None。执行/计划审查都是单样本任务。
+pub fn sample_score<'a>(dump: &'a Value, scorer_name: &str) -> Option<&'a Value> {
+    let samples = dump.get("samples")?.as_array()?;
+    let first = samples.first()?;
+    let scores = first.get("scores")?.as_object()?;
+    scores.get(scorer_name)
+}
+
+/// 执行审查结论（从 eval dump 的 `exec_verdict_scorer` 分数解析）。
+///
+/// 结构化读取：`value` 为等级（C/I/P），`metadata.failure_class` /
+/// `metadata.rationale` 为分流依据；`value` 为 null 即 unscored（解析失败
+/// 或打分器未产出），unscored 原因在 `metadata.unscored_reason`。
+///
+/// 注意：scorer 产出 `{grade, failure_class, rationale}`（限界上下文 §6.9
+/// 的子集），Rust 侧映射为 alfred-core ExecVerdict 时 confidence 取 High
+/// （temperature=0 确定性判分），evidence 空——对齐表未覆盖，记录到 R2 交付。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecReviewOutcome {
+    /// 解析出的审查结论（unscored / 未知等级时为 None）。
+    pub verdict: Option<ExecVerdict>,
+    /// unscored 原因（verdict_parse_failure / scorer 缺失 / 未知等级等）。
+    pub unscored_reason: Option<String>,
+    /// 解析失败细节（pydantic 错误等）。
+    pub detail: Option<String>,
+}
+
+/// 从 dump JSON 提取执行审查结论。
+pub fn extract_exec_verdict(dump: &Value) -> ExecReviewOutcome {
+    let score = match sample_score(dump, "exec_verdict_scorer") {
+        Some(s) => s,
+        None => {
+            return ExecReviewOutcome {
+                verdict: None,
+                unscored_reason: Some("exec_verdict_scorer_missing".into()),
+                detail: None,
+            }
+        }
+    };
+    let meta = score
+        .get("metadata")
+        .and_then(|m| m.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let value = score.get("value").and_then(|v| v.as_str());
+    let Some(grade_str) = value else {
+        // unscored：value 为 null
+        return ExecReviewOutcome {
+            verdict: None,
+            unscored_reason: meta
+                .get("unscored_reason")
+                .and_then(|u| u.as_str())
+                .map(String::from)
+                .or_else(|| Some("unscored".into())),
+            detail: meta
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .map(String::from),
+        };
+    };
+    let grade = match grade_str {
+        "C" => VerdictGrade::C,
+        "I" => VerdictGrade::I,
+        "P" => VerdictGrade::P,
+        other => {
+            return ExecReviewOutcome {
+                verdict: None,
+                unscored_reason: Some("unknown_grade".into()),
+                detail: Some(other.to_string()),
+            }
+        }
+    };
+    let failure_class = meta
+        .get("failure_class")
+        .and_then(|f| f.as_str())
+        .and_then(|s| serde_json::from_str::<FailureClass>(&format!("\"{s}\"")).ok());
+    let rationale = meta
+        .get("rationale")
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let explanation = score
+        .get("explanation")
+        .and_then(|e| e.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| rationale.clone());
+    match ExecVerdict::new(grade, failure_class, Confidence::High, vec![], explanation) {
+        Ok(v) => ExecReviewOutcome {
+            verdict: Some(v),
+            unscored_reason: None,
+            detail: None,
+        },
+        Err(e) => ExecReviewOutcome {
+            verdict: None,
+            unscored_reason: Some("verdict_invariant_violation".into()),
+            detail: Some(e),
+        },
+    }
+}
+
 /// eval 子进程 env 白名单（`env_clear` 后注入）。
 ///
 /// - 固定项：`PYTHONDONTWRITEBYTECODE=1`（任务 import 时不写 __pycache__）。
@@ -345,19 +470,38 @@ fn whitelisted_env() -> Vec<(String, String)> {
     envs
 }
 
-/// 组装 eval 子进程 env（`env_clear` 语义）：白名单 + executor 凭据。
+/// 组装 eval 子进程 env（`env_clear` 语义）：白名单 + executor/reviewer 凭据。
 ///
 /// Inspect `openai-api/<provider>/<model>` 从 `{PROVIDER}_API_KEY` env 读 key
 /// （不设 `api_key` 模型选项时）；`ALFRED_EXEC_API_KEY` 为规范别名（探针/排障
-/// 用）。两者均不进 argv——`ps` 不可见。
-fn eval_child_env(model: &ExecutorModel) -> Vec<(String, String)> {
+/// 用）。两者均不进 argv——`ps` 不可见。reviewer（grader）若与 executor 不同
+/// provider，其 key 一并注入；raw 内建模型（mockllm）无 key 不注入。
+fn eval_child_env(model: &ExecutorModel, grader: Option<&ExecutorModel>) -> Vec<(String, String)> {
     let mut envs = whitelisted_env();
-    envs.push((
-        format!("{}_API_KEY", model.provider.to_ascii_uppercase().replace('-', "_")),
-        model.api_key.clone(),
-    ));
-    envs.push(("ALFRED_EXEC_API_KEY".to_string(), model.api_key.clone()));
+    push_provider_key(&mut envs, model, true);
+    if let Some(g) = grader {
+        push_provider_key(&mut envs, g, false);
+        // grader 无显式 base_url（model-role 配置不接受 base_url 字段）——
+        // 经 INSPECT_EVAL_MODEL_BASE_URL env 兜底（inspect model_base_url 末级回退）。
+        // 主模型（executor）已有 --model-base-url，不受影响。
+        if !g.raw_id && !g.base_url.is_empty() {
+            envs.push(("INSPECT_EVAL_MODEL_BASE_URL".to_string(), g.base_url.clone()));
+        }
+    }
     envs
+}
+
+fn push_provider_key(envs: &mut Vec<(String, String)>, m: &ExecutorModel, is_main: bool) {
+    if m.raw_id || m.api_key.is_empty() {
+        return;
+    }
+    envs.push((
+        format!("{}_API_KEY", m.provider.to_ascii_uppercase().replace('-', "_")),
+        m.api_key.clone(),
+    ));
+    if is_main {
+        envs.push(("ALFRED_EXEC_API_KEY".to_string(), m.api_key.clone()));
+    }
 }
 
 /// 进程是否存活（`/bin/kill -0 <pid>`）。
@@ -405,8 +549,9 @@ mod tests {
             base_url: "http://x".into(),
             api_key: "sk-test-secret-123".into(),
             max_tokens: 1024,
+            raw_id: false,
         };
-        let envs = eval_child_env(&model);
+        let envs = eval_child_env(&model, None);
         let map: HashMap<String, String> = envs.into_iter().collect();
         // key 经 env（Inspect openai-api provider 读取的派生名 + 规范别名）
         assert_eq!(
@@ -422,6 +567,105 @@ mod tests {
             map.get("PYTHONDONTWRITEBYTECODE").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn eval_child_env_injects_grader_provider_key_too() {
+        let exec = ExecutorModel {
+            provider: "zhipucoding".into(),
+            model: "glm-5.2".into(),
+            base_url: "http://x".into(),
+            api_key: "sk-exec".into(),
+            max_tokens: 1024,
+            raw_id: false,
+        };
+        let grader = ExecutorModel {
+            provider: "anthropic".into(),
+            model: "claude-x".into(),
+            base_url: "http://y".into(),
+            api_key: "sk-grader".into(),
+            max_tokens: 1024,
+            raw_id: false,
+        };
+        let envs = eval_child_env(&exec, Some(&grader));
+        let map: HashMap<String, String> = envs.into_iter().collect();
+        assert_eq!(map.get("ZHIPUCODING_API_KEY").map(String::as_str), Some("sk-exec"));
+        assert_eq!(map.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-grader"));
+        // ALFRED_EXEC_API_KEY 只由主模型写
+        assert_eq!(map.get("ALFRED_EXEC_API_KEY").map(String::as_str), Some("sk-exec"));
+    }
+
+    #[test]
+    fn eval_child_env_skips_raw_mock_model() {
+        let exec = ExecutorModel {
+            provider: "zhipucoding".into(),
+            model: "glm-5.2".into(),
+            base_url: "http://x".into(),
+            api_key: "sk-exec".into(),
+            max_tokens: 1024,
+            raw_id: false,
+        };
+        let mock = ExecutorModel {
+            provider: "mockllm".into(),
+            model: "mockllm/model".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            max_tokens: 1024,
+            raw_id: true,
+        };
+        let envs = eval_child_env(&exec, Some(&mock));
+        let map: HashMap<String, String> = envs.into_iter().collect();
+        // mockllm 无 key 不注入
+        assert!(!map.contains_key("MOCKLLM_API_KEY"));
+        assert_eq!(map.get("ZHIPUCODING_API_KEY").map(String::as_str), Some("sk-exec"));
+    }
+
+    #[test]
+    fn extract_exec_verdict_parses_grade_and_failure_class() {
+        let dump: Value = serde_json::from_str(r#"{
+            "samples": [{
+                "scores": {
+                    "exec_verdict_scorer": {
+                        "value": "I",
+                        "answer": "artifact",
+                        "explanation": "file content mismatch",
+                        "metadata": {
+                            "grade": "I",
+                            "failure_class": "fidelity_dispute",
+                            "rationale": "file content mismatch"
+                        }
+                    }
+                }
+            }]
+        }"#).unwrap();
+        let out = extract_exec_verdict(&dump);
+        let v = out.verdict.unwrap();
+        assert_eq!(v.value, VerdictGrade::I);
+        assert_eq!(v.failure_class, Some(FailureClass::FidelityDispute));
+        assert!(v.explanation.contains("file content mismatch"));
+        assert_eq!(out.unscored_reason, None);
+    }
+
+    #[test]
+    fn extract_exec_verdict_marks_unscored() {
+        let dump: Value = serde_json::from_str(r#"{
+            "samples": [{
+                "scores": {
+                    "exec_verdict_scorer": {
+                        "value": null,
+                        "explanation": "NOT JSON",
+                        "metadata": {
+                            "unscored_reason": "verdict_parse_failure",
+                            "detail": "Invalid JSON"
+                        }
+                    }
+                }
+            }]
+        }"#).unwrap();
+                let out = extract_exec_verdict(&dump);
+        assert!(out.verdict.is_none());
+        assert_eq!(out.unscored_reason.as_deref(), Some("verdict_parse_failure"));
+        assert_eq!(out.detail.as_deref(), Some("Invalid JSON"));
     }
 
     #[test]

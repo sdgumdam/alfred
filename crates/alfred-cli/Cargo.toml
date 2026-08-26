@@ -2,7 +2,7 @@
 name = "alfred-cli"
 version.workspace = true
 edition.workspace = true
-description = "alfred 命令行入口（R1：run 雏形）"
+description = "alfred 命令行入口（R1：run 雏形；R2：plan-review）"
 
 [[bin]]
 name = "alfred"
@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 alfred-core = { workspace = true }
 alfred-executor = { workspace = true }
+alfred-reviewer = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
