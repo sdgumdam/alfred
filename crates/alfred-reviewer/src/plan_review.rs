@@ -116,20 +116,10 @@ pub fn execute_plan_review(
         PollOutcome::Done(done) => done,
         PollOutcome::TimedOut => {
             let msg = format!("plan review eval timed out after {poll_timeout}s");
-            append_audit(run_dir, "plan_review_timed_out", &serde_json::json!({ "error": msg }))?;
-            let rec = PlanReviewOutcome {
-                run_id,
-                request_id: request.id.clone(),
-                reviewer_model: model.inspect_model_id(),
-                eval_status: "timed_out".into(),
-                eval_location: None,
-                verdict: None,
-                unscored_reason: Some("eval_timed_out".into()),
-                started_at,
-                finished_at: now_rfc3339(),
-                error: Some(msg.clone()),
-            };
-            write_state(run_dir, request, dagspec, &rec)?;
+            fail_review(
+                run_dir, request, dagspec, model, &run_id, &started_at,
+                "timed_out", None, "plan_review_timed_out", "eval_timed_out", &msg,
+            )?;
             bail!(msg);
         }
         PollOutcome::Crashed => {
@@ -137,43 +127,60 @@ pub fn execute_plan_review(
                 "plan review eval process died without done record (output: {})",
                 launch.output_file.display()
             );
-            append_audit(run_dir, "plan_review_crashed", &serde_json::json!({ "error": msg }))?;
-            let rec = PlanReviewOutcome {
-                run_id,
-                request_id: request.id.clone(),
-                reviewer_model: model.inspect_model_id(),
-                eval_status: "crashed".into(),
-                eval_location: None,
-                verdict: None,
-                unscored_reason: Some("eval_crashed".into()),
-                started_at,
-                finished_at: now_rfc3339(),
-                error: Some(msg.clone()),
-            };
-            write_state(run_dir, request, dagspec, &rec)?;
+            fail_review(
+                run_dir, request, dagspec, model, &run_id, &started_at,
+                "crashed", None, "plan_review_crashed", "eval_crashed", &msg,
+            )?;
             bail!(msg);
         }
     };
 
-    // 归档 eval log + 从 dump 读 PlanVerdict
-    let mut verdict: Option<PlanVerdict> = None;
-    let mut unscored_reason: Option<String> = None;
-    match archive_eval_log(&outcome.location, &evals_dir) {
+    // 归档 eval log + 从 dump 读 PlanVerdict。
+    // R2Audit2 修复：归档/读取/解析任一失败都不再被 if-let 静默吞掉——落
+    // audit 事件 + state.json 填 error + 以 Err 上报（§6：审查出错必须升级，
+    // 不允许"出错就悄悄放行"）。
+    let dump = match archive_eval_log(&outcome.location, &evals_dir) {
         Ok(dump) => {
             append_audit(run_dir, "plan_review_eval_archived", &serde_json::json!({ "dump": dump }))?;
-            if let Ok(text) = std::fs::read_to_string(&dump) {
-                if let Ok(v) = parse_dump(&text) {
-                    let out = extract_plan_verdict(&v);
-                    verdict = out.verdict;
-                    unscored_reason = out.unscored_reason;
-                }
-            }
+            dump
         }
         Err(e) => {
-            eprintln!("[alfred] warn: archive plan review eval log failed: {e:#}");
-            append_audit(run_dir, "plan_review_archive_failed", &serde_json::json!({ "error": format!("{e:#}") }))?;
+            let msg = format!("archive plan review eval log failed: {e:#}");
+            fail_review(
+                run_dir, request, dagspec, model, &run_id, &started_at,
+                &outcome.status, Some(&outcome.location),
+                "plan_review_archive_failed", "eval_log_archive_failed", &msg,
+            )?;
+            bail!(msg);
         }
-    }
+    };
+    let text = match std::fs::read_to_string(&dump) {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("read plan review eval log dump {} failed: {e}", dump.display());
+            fail_review(
+                run_dir, request, dagspec, model, &run_id, &started_at,
+                &outcome.status, Some(&outcome.location),
+                "plan_review_log_read_failed", "eval_log_read_failed", &msg,
+            )?;
+            bail!(msg);
+        }
+    };
+    let v = match parse_dump(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("parse plan review eval log dump {} failed: {e:#}", dump.display());
+            fail_review(
+                run_dir, request, dagspec, model, &run_id, &started_at,
+                &outcome.status, Some(&outcome.location),
+                "plan_review_log_parse_failed", "eval_log_parse_failed", &msg,
+            )?;
+            bail!(msg);
+        }
+    };
+    let out = extract_plan_verdict(&v);
+    let verdict = out.verdict;
+    let unscored_reason = out.unscored_reason;
 
     let eval_error = (outcome.status != "success").then(|| {
         format!(
@@ -204,6 +211,43 @@ pub fn execute_plan_review(
         bail!("{err}");
     }
     Ok(rec)
+}
+
+/// 失败路径统一构造 PlanReviewOutcome + 落 audit + 落盘 state.json/verdict.json
+/// （不悄悄放行）。
+///
+/// R2Audit2 修复：eval 异常（timed_out/crashed）与 verdict 提取失败
+/// （archive/read/parse）共用——不再用 if-let 静默吞错误。填 error 后以
+/// Err 上报给调用方（§6：审查出错必须升级属主，不允许"出错就悄悄放行"）。
+#[allow(clippy::too_many_arguments)]
+fn fail_review(
+    run_dir: &Path,
+    request: &OwnerRequest,
+    dagspec: &DagSpec,
+    model: &ExecutorModel,
+    run_id: &str,
+    started_at: &str,
+    eval_status: &str,
+    eval_location: Option<&str>,
+    event: &str,
+    unscored_reason: &str,
+    msg: &str,
+) -> Result<()> {
+    append_audit(run_dir, event, &serde_json::json!({ "run_id": run_id, "error": msg }))?;
+    let rec = PlanReviewOutcome {
+        run_id: run_id.to_string(),
+        request_id: request.id.clone(),
+        reviewer_model: model.inspect_model_id(),
+        eval_status: eval_status.to_string(),
+        eval_location: eval_location.map(String::from),
+        verdict: None,
+        unscored_reason: Some(unscored_reason.to_string()),
+        started_at: started_at.to_string(),
+        finished_at: now_rfc3339(),
+        error: Some(msg.to_string()),
+    };
+    write_state(run_dir, request, dagspec, &rec)?;
+    Ok(())
 }
 
 /// 从 dump JSON 提取计划审查结论。

@@ -22,6 +22,9 @@ pub enum VerdictGrade {
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
     /// 机械性失败：环境、工具故障，不是契约或逻辑问题。
+    ///
+    /// 单 grader 结构不可观测——不由 grader 判；由编排器按执行状态判定
+    /// （eval error/timeout → mechanical，R3 接续）。grading prompt 不列。
     Mechanical,
     /// 契约本身写得有歧义。
     ContractAmbiguity,
@@ -30,6 +33,9 @@ pub enum FailureClass {
     /// 产物忠实于契约，但契约偏离了属主本意。
     ContractFault,
     /// 多个审查者意见分歧、没有多数结论。
+    ///
+    /// 单 grader 结构不可观测——留多 grader 未来（多 grader 独立判分后
+    /// 无多数结论才判）。grading prompt 不列。
     Disagreement,
 }
 

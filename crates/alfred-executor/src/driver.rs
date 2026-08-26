@@ -336,12 +336,59 @@ pub fn archive_eval_log(location: &str, dest_dir: &Path) -> Result<PathBuf> {
 /// 解析 `inspect log dump` JSON 文本。
 ///
 /// inspect 对 unscored score 的 `value` 写非标准 `NaN`（JSON 规范外），
-/// serde_json 默认拒绝——先归一化为 null 再解析。
+/// serde_json 默认拒绝——先归一化为 null 再解析。R2Audit2 修复：朴素
+/// `replace` 会篡改 rationale 里合法出现的 "NaN"/"Infinity" 字样——改为
+/// token-aware 替换（只在 JSON 字符串字面量之外的位置替换非标准浮点 token）。
 pub fn parse_dump(text: &str) -> Result<Value> {
-    let sanitized = text.replace("NaN", "null").replace("Infinity", "null").replace("-Infinity", "null");
-    serde_json::from_str(&sanitized).context("parse inspect log dump JSON")
+    serde_json::from_str(&sanitize_nonstandard_floats(text)).context("parse inspect log dump JSON")
 }
 
+/// 把 JSON 字符串字面量之外的非标准浮点 token（`NaN`/`Infinity`/`-Infinity`）
+/// 归一化为 `null`。字符串内的同名文本原样保留（token-aware，不误伤
+/// rationale 里合法出现的 "NaN" 等字样）。
+fn sanitize_nonstandard_floats(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // 字符串字面量：整体透传（含转义序列），不做任何替换
+            let start = i;
+            i += 1;
+            let mut escaped = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && !escaped {
+                    escaped = true;
+                    i += 1;
+                    continue;
+                }
+                if bytes[i] == b'"' && !escaped {
+                    i += 1;
+                    break;
+                }
+                escaped = false;
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        // 字符串外：按 token 前缀匹配替换（先 -Infinity，再 Infinity/NaN）
+        if text[i..].starts_with("-Infinity") {
+            out.push_str("null");
+            i += "-Infinity".len();
+        } else if text[i..].starts_with("Infinity") {
+            out.push_str("null");
+            i += "Infinity".len();
+        } else if text[i..].starts_with("NaN") {
+            out.push_str("null");
+            i += "NaN".len();
+        } else {
+            out.push_str(&text[i..i + 1]);
+            i += 1;
+        }
+    }
+    out
+}
 /// 从 `inspect log dump` JSON 读某个 scorer 的首个 sample score（原始值）。
 ///
 /// 返回 `samples[0].scores[<scorer_name>]`，形如
@@ -666,6 +713,81 @@ mod tests {
         assert!(out.verdict.is_none());
         assert_eq!(out.unscored_reason.as_deref(), Some("verdict_parse_failure"));
         assert_eq!(out.detail.as_deref(), Some("Invalid JSON"));
+    }
+
+    #[test]
+    fn extract_exec_verdict_parses_partial_grade() {
+        // R2Audit2 修复：P 档（部分兑现）构造用例——grade P 必须有 failure_class
+        let dump: Value = serde_json::from_str(r#"{
+            "samples": [{
+                "scores": {
+                    "exec_verdict_scorer": {
+                        "value": "P",
+                        "answer": "artifact",
+                        "explanation": "one of two files created",
+                        "metadata": {
+                            "grade": "P",
+                            "failure_class": "contract_fault",
+                            "rationale": "hello.txt created but world.txt missing"
+                        }
+                    }
+                }
+            }]
+        }"#).unwrap();
+        let out = extract_exec_verdict(&dump);
+        let v = out.verdict.unwrap();
+        assert_eq!(v.value, VerdictGrade::P);
+        assert_eq!(v.failure_class, Some(FailureClass::ContractFault));
+        assert!(v.explanation.contains("one of two files created"));
+        assert_eq!(out.unscored_reason, None);
+    }
+
+    #[test]
+    fn extract_exec_verdict_rejects_grade_p_without_failure_class() {
+        // P 档不变量：value=P 必须带 failure_class——缺失即构造失败（unscored）
+        let dump: Value = serde_json::from_str(r#"{
+            "samples": [{
+                "scores": {
+                    "exec_verdict_scorer": {
+                        "value": "P",
+                        "metadata": {"grade": "P", "failure_class": null, "rationale": "partial"}
+                    }
+                }
+            }]
+        }"#).unwrap();
+        let out = extract_exec_verdict(&dump);
+        assert!(out.verdict.is_none());
+        assert_eq!(out.unscored_reason.as_deref(), Some("verdict_invariant_violation"));
+    }
+
+    #[test]
+    fn parse_dump_normalizes_nonstandard_floats_token_aware() {
+        // 字符串外的 NaN/Infinity/-Infinity → null；字符串内同名文本原样保留
+        let dump = r#"{"a": NaN, "b": Infinity, "c": -Infinity, "rationale": "got NaN and -Infinity"}"#;
+        let v = parse_dump(dump).unwrap();
+        assert!(v["a"].is_null());
+        assert!(v["b"].is_null());
+        assert!(v["c"].is_null());
+        assert_eq!(v["rationale"].as_str(), Some("got NaN and -Infinity"));
+    }
+
+    #[test]
+    fn parse_dump_preserves_escaped_quotes_in_strings() {
+        // 转义引号不中断字符串跟踪；字符串内 "Infinity" 原样保留
+        let s = r#"{"a": "say \"Infinity\" now", "b": Infinity}"#;
+        let v = parse_dump(s).unwrap();
+        assert_eq!(v["a"].as_str(), Some("say \"Infinity\" now"));
+        assert!(v["b"].is_null());
+    }
+
+    #[test]
+    fn parse_dump_rejects_invalid_json() {
+        // dump 损坏用例：非 JSON 输入必须 Err（R2Audit2：不再被 if-let 静默吞）
+        let err = parse_dump(r#"{ not json at all"#).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("parse inspect log dump JSON"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

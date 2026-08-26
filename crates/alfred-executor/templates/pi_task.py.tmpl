@@ -10,7 +10,7 @@ points at the bridge proxy with a dummy `sk-none` key.
 R2 adds the ExecVerdict scorer (执行审查) into the same eval. 投影物理隔离：
 - executor (pi) 只拿 Sample.input = CONTRACT_PROMPT（契约任务描述）；
 - scorer 只拿 Sample.target = ACCEPTANCE_CRITERIA（契约验收标准）判 Artifact；
-两份资料在模板结构上分离，进程层面隔离（钉死项 §3.1 原文）。
+两份资料在模板结构上分离，模型上下文级隔离（pi 只见 prompt / grader 只见验收标准+产物摘要）（钉死项 §3.1 原文）。
 """
 
 import json
@@ -62,11 +62,16 @@ SETTLE_GRACE_SECONDS = float(__SETTLE_GRACE_SECONDS__)
 #      config）。grader 模型经宿主 `--model-role grader=<reviewer>` 绑定，本
 #      文件不写任何 provider 专属字段。 ----
 FailureClass = Literal[
-    "mechanical",
+    # 单 grader 结构可观测的失败分类（§3.3 原文定义）：
+    # - contract_ambiguity: 契约本身写得有歧义
+    # - fidelity_dispute: 产物与契约之间有争议，是否兑现说法不一
+    # - contract_fault: 产物忠实于契约，但契约偏离了属主本意
+    # mechanical（机械性失败：环境/工具故障）不是 grader 能判的——由编排器按
+    # 执行状态判定（eval error/timeout → mechanical，R3 接续）；disagreement
+    # （多审查者分歧）留多 grader 未来。二者不进 grader 的判分类别。
     "contract_ambiguity",
     "fidelity_dispute",
     "contract_fault",
-    "disagreement",
 ]
 
 def _extract_json_text(text: str) -> str:
@@ -99,15 +104,15 @@ def _extract_json_text(text: str) -> str:
 
 
 class ExecVerdict(BaseModel):
-    grade: Literal["C", "I"]
+    grade: Literal["C", "I", "P"]
     failure_class: FailureClass | None = None
     rationale: str
 
     def validate_invariant(self):
         if self.grade == "C" and self.failure_class is not None:
             raise ValueError("grade C must have failure_class = None")
-        if self.grade == "I" and self.failure_class is None:
-            raise ValueError("grade I requires failure_class")
+        if self.grade in ("I", "P") and self.failure_class is None:
+            raise ValueError("grade I/P requires failure_class")
 
 
 @scorer(metrics=[accuracy(), stderr()])
@@ -125,11 +130,19 @@ def exec_verdict_scorer():
 
 Determine whether the artifact satisfies the acceptance criteria.
 Respond ONLY with a JSON object of exactly this shape:
-{{"grade": "C" or "I", "failure_class": "mechanical"|"contract_ambiguity"|"fidelity_dispute"|"contract_fault"|"disagreement"|null, "rationale": "brief reason"}}
+{{"grade": "C" or "P" or "I", "failure_class": "contract_ambiguity"|"fidelity_dispute"|"contract_fault"|null, "rationale": "brief reason"}}
 
-Rules:
-- grade "C" means the artifact satisfies the acceptance criteria; failure_class MUST be null.
-- grade "I" means it does not satisfy the criteria; failure_class MUST be one of the enumerated values.
+Grade definitions (§3.3):
+- "C" (通过): the artifact fully satisfies the acceptance criteria; failure_class MUST be null.
+- "P" (部分通过): the artifact PARTIALLY satisfies the acceptance criteria — a real partial delivery exists (some acceptance points met) but the contract is not fully fulfilled; failure_class MUST be one of the enumerated values.
+- "I" (不通过): the artifact does not satisfy the acceptance criteria (no substantive delivery or fully off-target); failure_class MUST be one of the enumerated values.
+
+Failure classes (§3.3):
+- "contract_ambiguity": the contract itself is ambiguous — fulfillment cannot be judged because the acceptance criteria are unclear.
+- "fidelity_dispute": there is a genuine dispute between the artifact and the contract — reasonable people disagree on whether it is fulfilled.
+- "contract_fault": the artifact faithfully matches the contract, but the contract deviates from the owner's actual intent.
+
+Do NOT judge mechanical failures (environment/tool errors) — the orchestrator detects those from execution status (eval error/timeout). Do NOT judge grader disagreement — that is reserved for a multi-grader setup.
 """
         result = await model.generate(
             grading_prompt,
@@ -137,7 +150,7 @@ Rules:
                 response_schema=ResponseSchema(
                     name="exec_verdict",
                     json_schema=json_schema(ExecVerdict),
-                    description="Exec verdict: grade C/I, optional failure_class, rationale",
+                    description="Exec verdict: grade C/P/I, optional failure_class, rationale",
                     strict=True,
                 ),
                 temperature=0,

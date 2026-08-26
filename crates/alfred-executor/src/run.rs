@@ -167,21 +167,10 @@ pub fn execute_run(
                 poll_timeout,
                 launch.output_file.display()
             );
-            append_audit(run_dir, "eval_timed_out", &serde_json::json!({ "run_id": run_id, "error": msg }))?;
-            let rec = RunOutcome {
-                run_id: run_id.clone(),
-                task_id: opts.assignment.task_id.clone(),
-                executor_model: model.inspect_model_id(),
-                eval_status: "timed_out".to_string(),
-                eval_location: None,
-                artifact: None,
-                started_at: started_at.clone(),
-                finished_at: now_rfc3339(),
-                error: Some(msg.clone()),
-                verdict: None,
-                verdict_unscored_reason: Some("eval_timed_out".into()),
-            };
-            write_state(run_dir, request, &rec)?;
+            fail_run(
+                run_dir, request, opts, model, &run_id, &started_at,
+                "timed_out", None, "eval_timed_out", "eval_timed_out", &msg,
+            )?;
             bail!(msg);
         }
         PollOutcome::Crashed => {
@@ -190,63 +179,66 @@ pub fn execute_run(
                 "eval process died without a done record (output: {})",
                 launch.output_file.display()
             );
-            append_audit(run_dir, "eval_crashed", &serde_json::json!({ "run_id": run_id, "error": msg }))?;
-            let rec = RunOutcome {
-                run_id: run_id.clone(),
-                task_id: opts.assignment.task_id.clone(),
-                executor_model: model.inspect_model_id(),
-                eval_status: "crashed".to_string(),
-                eval_location: None,
-                artifact: None,
-                started_at: started_at.clone(),
-                finished_at: now_rfc3339(),
-                error: Some(msg.clone()),
-                verdict: None,
-                verdict_unscored_reason: Some("eval_crashed".into()),
-            };
-            write_state(run_dir, request, &rec)?;
+            fail_run(
+                run_dir, request, opts, model, &run_id, &started_at,
+                "crashed", None, "eval_crashed", "eval_crashed", &msg,
+            )?;
             bail!(msg);
         }
     };
 
-    // R2: 从 dump 结构化读取执行审查结论（verdict / unscored_reason）
-    let mut verdict: Option<ExecVerdict> = None;
-    let mut verdict_unscored_reason: Option<String> = None;
-    match archive_eval_log(&outcome.location, &evals_dir) {
+    // R2: 从 dump 结构化读取执行审查结论（verdict / unscored_reason）。
+    // R2Audit2 修复：归档/读取/解析任一失败都不再被 if-let 静默吞掉——落
+    // audit 事件 + state.json 填 error + 以 Err 上报（§6：审查出错必须升级，
+    // 不允许"出错就悄悄放行"）。第二个重复的 archive 块一并删除。
+    let dump = match archive_eval_log(&outcome.location, &evals_dir) {
         Ok(dump) => {
             append_audit(
                 run_dir,
                 "eval_log_archived",
                 &serde_json::json!({ "dump": dump }),
             )?;
-            if let Ok(text) = std::fs::read_to_string(&dump) {
-                if let Ok(v) = parse_dump(&text) {
-                    let review = extract_exec_verdict(&v);
-                    verdict = review.verdict;
-                    verdict_unscored_reason = review.unscored_reason;
-                    if let Some(detail) = review.detail {
-                        eprintln!("[alfred] warn: exec verdict detail: {detail}");
-                    }
-                }
-            }
+            dump
         }
         Err(e) => {
-            eprintln!("[alfred] warn: archive eval log failed: {e:#}");
-            append_audit(run_dir, "eval_log_archive_failed", &serde_json::json!({ "error": format!("{e:#}") }))?;
-        }
-    }
-    match archive_eval_log(&outcome.location, &evals_dir) {
-        Ok(dump) => {
-            append_audit(
-                run_dir,
-                "eval_log_archived",
-                &serde_json::json!({ "dump": dump }),
+            let msg = format!("archive eval log failed: {e:#}");
+            fail_run(
+                run_dir, request, opts, model, &run_id, &started_at,
+                &outcome.status, Some(&outcome.location),
+                "eval_log_archive_failed", "eval_log_archive_failed", &msg,
             )?;
+            bail!(msg);
         }
+    };
+    let text = match std::fs::read_to_string(&dump) {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("[alfred] warn: archive eval log failed: {e:#}");
-            append_audit(run_dir, "eval_log_archive_failed", &serde_json::json!({ "error": format!("{e:#}") }))?;
+            let msg = format!("read eval log dump {} failed: {e}", dump.display());
+            fail_run(
+                run_dir, request, opts, model, &run_id, &started_at,
+                &outcome.status, Some(&outcome.location),
+                "eval_log_read_failed", "eval_log_read_failed", &msg,
+            )?;
+            bail!(msg);
         }
+    };
+    let v = match parse_dump(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("parse eval log dump {} failed: {e:#}", dump.display());
+            fail_run(
+                run_dir, request, opts, model, &run_id, &started_at,
+                &outcome.status, Some(&outcome.location),
+                "eval_log_parse_failed", "eval_log_parse_failed", &msg,
+            )?;
+            bail!(msg);
+        }
+    };
+    let review = extract_exec_verdict(&v);
+    let verdict = review.verdict;
+    let verdict_unscored_reason = review.unscored_reason;
+    if let Some(detail) = review.detail {
+        eprintln!("[alfred] warn: exec verdict detail: {detail}");
     }
 
     // 7) 产物采集（执行后快照 → diff）
@@ -287,6 +279,43 @@ pub fn execute_run(
     }
 
     Ok(rec)
+}
+
+/// 失败路径统一构造 RunOutcome + 落 audit + 落盘 state.json（不悄悄放行）。
+///
+/// R2Audit2 修复：eval 异常（timed_out/crashed）与 verdict 提取失败
+/// （archive/read/parse）共用——不再用 if-let 静默吞错误。填 error 后以
+/// Err 上报给调用方（§6：审查出错必须升级属主，不允许"出错就悄悄放行"）。
+#[allow(clippy::too_many_arguments)]
+fn fail_run(
+    run_dir: &Path,
+    request: &OwnerRequest,
+    opts: &RunOptions,
+    model: &ExecutorModel,
+    run_id: &str,
+    started_at: &str,
+    eval_status: &str,
+    eval_location: Option<&str>,
+    event: &str,
+    unscored_reason: &str,
+    msg: &str,
+) -> Result<()> {
+    append_audit(run_dir, event, &serde_json::json!({ "run_id": run_id, "error": msg }))?;
+    let rec = RunOutcome {
+        run_id: run_id.to_string(),
+        task_id: opts.assignment.task_id.clone(),
+        executor_model: model.inspect_model_id(),
+        eval_status: eval_status.to_string(),
+        eval_location: eval_location.map(String::from),
+        artifact: None,
+        started_at: started_at.to_string(),
+        finished_at: now_rfc3339(),
+        error: Some(msg.to_string()),
+        verdict: None,
+        verdict_unscored_reason: Some(unscored_reason.to_string()),
+    };
+    write_state(run_dir, request, &rec)?;
+    Ok(())
 }
 
 #[derive(Serialize)]
