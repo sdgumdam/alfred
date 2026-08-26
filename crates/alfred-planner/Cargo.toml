@@ -2,7 +2,12 @@
 name = "alfred-planner"
 version.workspace = true
 edition.workspace = true
-description = "alfred 规划器（R2 实现；R1 占位）"
+description = "alfred 规划器（R3）：converse（会话文档+属主消息→建图指令序列→DagSpec）+ maintain（两时机）+ 打回伪装转写"
 
 [dependencies]
 alfred-core = { workspace = true }
+alfred-executor = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+ureq = { version = "2", default-features = true }

@@ -77,6 +77,11 @@ pub fn spawn_eval(
         .parent()
         .context("task.py has no parent dir")?
         .to_path_buf();
+    // log_dir 必须绝对：detach 子进程 cwd=任务目录，相对 log-dir 会被
+    // 二次拼接（实测：exec-N/<相对路径> 双拼导致 compose/evals 找不到）。
+    let log_dir = &log_dir
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(log_dir));
     let task_name = task_py
         .file_name()
         .and_then(|s| s.to_str())

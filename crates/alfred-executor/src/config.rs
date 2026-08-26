@@ -66,6 +66,8 @@ struct Roles {
     executor: String,
     #[serde(default)]
     reviewer: Option<String>,
+    #[serde(default)]
+    planner: Option<String>,
 }
 
 /// config.yml 路径：`ALFRED_CONFIG` 覆盖，否则 `~/.config/alfred/config.yml`。
@@ -88,6 +90,11 @@ pub fn load_executor_model() -> Result<ExecutorModel> {
 /// 加载审查者模型配置（roles.reviewer）。
 pub fn load_reviewer_model() -> Result<ExecutorModel> {
     load_role_model("reviewer")
+}
+
+/// 加载规划器模型配置（roles.planner）。R3 起规划器由宿主 Rust 直调 LLM。
+pub fn load_planner_model() -> Result<ExecutorModel> {
+    load_role_model("planner")
 }
 
 /// 角色模型 id 的 env 覆盖：`LLM_<ROLE>_MODEL`（P11 约定）优先，
@@ -125,11 +132,21 @@ fn raw_builtin_model(model_id: &str) -> Option<ExecutorModel> {
 /// - env 覆盖的模型 id 不在 models 列表时，沿用基础角色模型的 provider
 ///   （如 glm-5.2 → zhipucoding），max_tokens 取默认下限 1024——让 e2e
 ///   能以 `ALFRED_REVIEWER_MODEL=glm-4.7` 指定便宜模型，无需改 config。
-/// - `LLM_BASE_URL` / `LLM_API_KEY`（P11）覆盖 provider 的 endpoint/key。
 fn load_role_model(role: &str) -> Result<ExecutorModel> {
     let cfg = load_config()?;
-    let base_id = role_model_id(&cfg, role)?;
-    let model_id = env_override_model_id(role).unwrap_or_else(|| base_id.clone());
+    // env 覆盖优先；无 env 覆盖时才要求 config roles.<role> 存在。
+    let base_id = role_model_id(&cfg, role).ok();
+    let model_id = match env_override_model_id(role) {
+        Some(m) => m,
+        None => match &base_id {
+            Some(b) => b.clone(),
+            None => bail!(
+                "config roles.{role} not set and no ALFRED_{}/LLM_{}_MODEL override",
+                role.to_ascii_uppercase(),
+                role.to_ascii_uppercase()
+            ),
+        },
+    };
 
     if let Some(raw) = raw_builtin_model(&model_id) {
         return Ok(raw);
@@ -139,14 +156,16 @@ fn load_role_model(role: &str) -> Result<ExecutorModel> {
     let (provider_name, max_tokens) = match entry {
         Some(e) => (e.provider.clone(), e.max_tokens.unwrap_or(1024).max(1024)),
         None => {
-            // env 覆盖的模型不在列表：沿用基础角色的 provider
-            let base = cfg
-                .models
-                .iter()
-                .find(|m| m.id == base_id)
+            // env 覆盖的模型不在列表：沿用基础角色的 provider；基础角色缺失
+            // 时退到 executor 的 provider（e2e 以 ALFRED_PLANNER_MODEL 指定
+            // 便宜模型、config 无 roles.planner 时的兜底）。
+            let base = base_id
+                .as_ref()
+                .and_then(|id| cfg.models.iter().find(|m| m.id == *id))
+                .or_else(|| cfg.models.iter().find(|m| m.id == cfg.roles.executor))
                 .with_context(|| {
                     format!(
-                        "model '{model_id}' not in models list and base role model '{base_id}' missing"
+                        "model '{model_id}' not in models list and no base role model to inherit provider"
                     )
                 })?;
             (base.provider.clone(), 1024)
@@ -184,6 +203,11 @@ fn role_model_id(cfg: &ConfigFile, role: &str) -> Result<String> {
             .reviewer
             .clone()
             .context("config roles.reviewer not set"),
+        "planner" => cfg
+            .roles
+            .planner
+            .clone()
+            .context("config roles.planner not set"),
         other => bail!("unknown role '{other}'"),
     }
 }
@@ -218,6 +242,7 @@ models:
 roles:
   executor: glm-5.2
   reviewer: glm-5.2
+  planner: glm-4.7
 "#
         .to_string()
     }
@@ -322,6 +347,56 @@ roles:
         assert_eq!(rev.base_url, "");
 
         std::env::remove_var("LLM_REVIEWER_MODEL");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_planner_model_from_config() {
+        let _guard = env_guard();
+        for k in ["LLM_PLANNER_MODEL", "ALFRED_PLANNER_MODEL"] {
+            std::env::remove_var(k);
+        }
+        let dir = std::env::temp_dir().join("alfred-config-test-planner");
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = write_config(&dir, &sample_config());
+        std::env::set_var("ALFRED_CONFIG", &p);
+
+        let plan = load_planner_model().unwrap();
+        assert_eq!(plan.model, "glm-4.7");
+        assert_eq!(plan.provider, "zhipucoding");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn planner_env_override_without_roles_planner_falls_back_to_executor_provider() {
+        let _guard = env_guard();
+        let dir = std::env::temp_dir().join("alfred-config-test-planner-env");
+        let _ = std::fs::remove_dir_all(&dir);
+        // 无 roles.planner 的 config（只有 executor/reviewer）
+        let cfg = r#"
+providers:
+  zhipucoding:
+    base_url: "https://open.bigmodel.cn/api/coding/paas/v4"
+    api_key: "sk-test"
+models:
+  - id: glm-5.2
+    provider: zhipucoding
+  - id: glm-4.7
+    provider: zhipucoding
+roles:
+  executor: glm-5.2
+  reviewer: glm-5.2
+"#;
+        let p = write_config(&dir, cfg);
+        std::env::set_var("ALFRED_CONFIG", &p);
+        std::env::set_var("ALFRED_PLANNER_MODEL", "glm-4.7");
+
+        let plan = load_planner_model().unwrap();
+        assert_eq!(plan.model, "glm-4.7");
+        assert_eq!(plan.provider, "zhipucoding"); // 继承 executor 的 provider
+
+        std::env::remove_var("ALFRED_PLANNER_MODEL");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

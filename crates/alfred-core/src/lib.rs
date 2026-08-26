@@ -5,15 +5,24 @@
 
 pub mod artifact;
 pub mod assignment;
+pub mod builder;
 pub mod contract;
 pub mod dagspec;
+pub mod governance;
 pub mod request;
+pub mod session;
 pub mod util;
 pub mod verdict;
 
 pub use artifact::{Artifact, ChangeKind, FileChange, FileEntry};
 pub use assignment::TaskAssignment;
+pub use builder::{BuildInstruction, GraphBuilder};
 pub use contract::{Contract, SandboxProfile, VolumeMount};
 pub use dagspec::{DagSpec, PlanNode};
+pub use governance::{
+    route, GovernanceEvent, GovernanceOptions, GovernanceRun, GovernanceState,
+    GovernanceStateMachine, OwnerDecision, RoutingDecision, TransitionError,
+};
 pub use request::OwnerRequest;
+pub use session::SessionDoc;
 pub use verdict::{Confidence, ExecVerdict, FailureClass, PlanVerdict, VerdictGrade};

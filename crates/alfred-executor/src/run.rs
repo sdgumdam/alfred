@@ -131,10 +131,15 @@ pub fn execute_run(
     let compose_path = run_dir.join("executor.compose.yaml");
     let compose = generate_compose(&workspace_host, &opts.image)?;
     std::fs::write(&compose_path, compose)?;
+    // 注入 task.py 的 compose 路径必须绝对：inspect 相对自身解析根再拼
+    // 相对路径会双拼（实测 exec-N/<相对路径> 找不到 compose）。
+    let compose_abs = compose_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", compose_path.display()))?;
 
     let task_py = run_dir.join("task.py");
     let py = generate_task_py(&TaskGenParams {
-        compose_file: compose_path.to_string_lossy().into_owned(),
+        compose_file: compose_abs.to_string_lossy().into_owned(),
         contract_prompt: opts.assignment.contract.prompt.clone(),
         acceptance_criteria: opts.assignment.contract.acceptance_criteria.clone(),
         port_base: opts.port_base,

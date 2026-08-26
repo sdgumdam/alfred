@@ -24,4 +24,5 @@ clap = { version = "4", features = ["derive"] }
 
 alfred-core = { path = "crates/alfred-core" }
 alfred-executor = { path = "crates/alfred-executor" }
+alfred-planner = { path = "crates/alfred-planner" }
 alfred-reviewer = { path = "crates/alfred-reviewer" }

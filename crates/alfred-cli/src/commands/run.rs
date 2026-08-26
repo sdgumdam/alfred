@@ -1,20 +1,21 @@
-//! `alfred run` 子命令（R1 雏形）。
+//! `alfred run` 子命令（R3 治理环完整化）。
 //!
-//! 读取 OwnerRequest JSON → 构造单节点 TaskAssignment → alfred-executor
-//! 驱动真容器 pi → 采集产物 → 打印摘要。
-//!
-//! R1 中本命令是规划器的占位替身：真实规划器（R2）会从 OwnerRequest 拆出
-//! 多节点 DagSpec；本命令直接把 request.description 当契约 prompt。
+//! request → converse 规划 → 计划审查 → 通过 → 执行 → 执行审查 → 分级路由
+//! （mechanical 重跑预算 N=2 / 耗尽升级）→ 挂起态。state.json 存状态机，
+//! `alfred decide` 可从挂起态续跑。
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use alfred_core::assignment::TaskAssignment;
-use alfred_core::contract::Contract;
+use alfred_core::governance::{GovernanceOptions, GovernanceRun};
 use alfred_core::request::OwnerRequest;
-use alfred_executor::config::{load_executor_model, load_reviewer_model};
-use alfred_executor::run::{default_run_dir, execute_run, RunOptions};
+use alfred_executor::config::{load_executor_model, load_planner_model, load_reviewer_model};
 use clap::Args;
+
+use super::governance::{
+    audit, default_governance_dir, persist_governance_run, run_governance_loop, state_label,
+    GovernanceContext,
+};
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
@@ -26,9 +27,13 @@ pub struct RunArgs {
     #[arg(long)]
     pub run_dir: Option<PathBuf>,
 
-    /// 单样本时间上限（秒）。
+    /// 执行 eval 单样本时间上限（秒）。
     #[arg(long, default_value_t = 600)]
     pub time_limit: u32,
+
+    /// 计划审查 eval 单样本时间上限（秒）。
+    #[arg(long, default_value_t = 300)]
+    pub review_time_limit: u32,
 
     /// 沙箱镜像。
     #[arg(long, default_value = "alfred-executor:latest")]
@@ -45,61 +50,73 @@ pub fn run(args: RunArgs) -> Result<()> {
     let request: OwnerRequest = serde_json::from_str(&text)
         .with_context(|| format!("parse OwnerRequest {}", args.request.display()))?;
 
-    // R1 替身规划：request → 单节点契约
-    let contract = Contract {
-        prompt: request.description.clone(),
-        acceptance_criteria: request.acceptance_criteria.clone(),
-        reviewer_models: vec![], // E5：R2 起由系统从 config roles.reviewer 注入
-    };
-    let assignment = TaskAssignment::new(format!("task-{}", request.id), contract);
-
-    let model = load_executor_model()?;
+    let planner = load_planner_model()?;
+    let executor = load_executor_model()?;
     let reviewer = load_reviewer_model()?;
-    // 异构审查降级警告：reviewer 与 executor 同 provider 时异构性打折扣
-    if reviewer.provider == model.provider {
+    if reviewer.provider == executor.provider {
         eprintln!(
             "[alfred] warn: reviewer 与 executor 同 provider '{}'——异构审查降级（共用同一模型通道）",
             reviewer.provider
         );
     }
-    let run_dir = args.run_dir.clone().unwrap_or_else(default_run_dir);
 
-    let opts = RunOptions {
-        run_dir: run_dir.clone(),
+    let run_dir = args.run_dir.clone().unwrap_or_else(default_governance_dir);
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("create run dir {}", run_dir.display()))?;
+    std::fs::write(
+        run_dir.join("request.json"),
+        serde_json::to_string_pretty(&request).context("serialize OwnerRequest")?,
+    )
+    .context("write request.json")?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("run")
+        .to_string();
+
+    let options = GovernanceOptions {
         image: args.image.clone(),
-        assignment,
-        time_limit_secs: args.time_limit,
+        exec_time_limit_secs: args.time_limit,
+        review_time_limit_secs: args.review_time_limit,
+        port_base: 13100,
+        settle_grace_seconds: 20.0,
         ctl_enabled: !args.no_ctl,
-        ..RunOptions::default()
+    };
+    let mut run = GovernanceRun::new(run_id, request.clone(), options);
+    let ctx = GovernanceContext {
+        run_dir: run_dir.clone(),
+        planner_model: planner.clone(),
+        executor_model: executor.clone(),
+        reviewer_model: reviewer.clone(),
     };
 
-    println!("alfred run: task via inspect sandbox -> pi (executor model: {})", model.inspect_model_id());
-    println!("  run_dir : {}", run_dir.display());
-    println!("  request : {}", args.request.display());
-    println!("  prompt  : {}", truncate(&request.description, 120));
+    println!(
+        "[alfred] 治理环启动（planner={} executor={} reviewer={}）",
+        planner.inspect_model_id(),
+        executor.inspect_model_id(),
+        reviewer.inspect_model_id()
+    );
+    println!("[alfred] run_dir  : {}", run_dir.display());
+    audit(&run_dir, "governance_started", &serde_json::json!({ "request_id": request.id }))?;
 
-    let outcome = execute_run(&opts, &model, Some(&reviewer), &request)?;
+    run_governance_loop(&mut run, &ctx)?;
+    persist_governance_run(&run_dir, &run)?;
+    audit(
+        &run_dir,
+        "governance_paused",
+        &serde_json::json!({ "state": state_label(run.state()) }),
+    )?;
 
     println!();
-    println!("eval status      : {}", outcome.eval_status);
-    println!("eval location    : {}", outcome.eval_location.as_deref().unwrap_or("(none)"));
-    match &outcome.verdict {
-        Some(v) => println!("exec verdict     : {} (failure_class={:?})", verdict_grade_label(v.value), v.failure_class),
-        None => println!("exec verdict     : unscored ({})", outcome.verdict_unscored_reason.as_deref().unwrap_or("none")),
+    println!("[alfred] 当前状态 : {}（attempts={}/{}）", state_label(run.state()), run.attempts_used, run.mechanical_budget);
+    if let Some(v) = run.plan_verdicts.last() {
+        println!("[alfred] 最近计划审查 : {} ({})", if v.pass { "PASS" } else { "FAIL" }, truncate(&v.reason, 160));
     }
-    if let Some(r) = outcome.verdict.as_ref() {
-        println!("  rationale      : {}", truncate(&r.explanation, 200));
+    if let Some(v) = run.exec_verdicts.last() {
+        println!("[alfred] 最近执行审查 : {:?} (failure_class={:?})", v.value, v.failure_class);
+        println!("  rationale     : {}", truncate(&v.explanation, 200));
     }
-    match &outcome.artifact {
-        Some(art) => {
-            println!("artifact changes : {} ({} files)", art.changes.len(), art.files.len());
-            for c in &art.changes {
-                println!("  - [{}] {}", change_kind_label(c.kind), c.path);
-            }
-        }
-        None => println!("artifact         : (none)"),
-    }
-    println!("state.json       : {}/state.json", run_dir.display());
+    println!("[alfred] state.json : {}/state.json", run_dir.display());
     Ok(())
 }
 
@@ -110,23 +127,5 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max).collect();
         out.push('…');
         out
-    }
-}
-
-fn change_kind_label(kind: alfred_core::artifact::ChangeKind) -> &'static str {
-    use alfred_core::artifact::ChangeKind::*;
-    match kind {
-        Created => "created",
-        Modified => "modified",
-        Deleted => "deleted",
-    }
-}
-
-fn verdict_grade_label(g: alfred_core::verdict::VerdictGrade) -> &'static str {
-    use alfred_core::verdict::VerdictGrade::*;
-    match g {
-        C => "C",
-        I => "I",
-        P => "P",
     }
 }

@@ -7,11 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::Contract;
+use crate::contract::{Contract, SandboxProfile};
 
 /// 计划节点：一个任务节点 = 契约 + 一句话摘要。
 ///
 /// `contract` 与 TaskAssignment.contract 同构；执行侧复用同一实体。
+/// R3 增补 `sandbox`（§2.5：每个要跑 agent 的节点在图里除了契约之外，
+/// 还要附带一份沙箱档案——契约管"做什么"，档案管"在什么约束下做"）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PlanNode {
@@ -21,6 +23,9 @@ pub struct PlanNode {
     pub summary: String,
     /// 行为契约。
     pub contract: Contract,
+    /// 沙箱档案（§2.5；缺省 = 联网拒绝、无额外挂卷——execute_run 只支持默认档案）。
+    #[serde(default)]
+    pub sandbox: SandboxProfile,
 }
 
 impl PlanNode {
@@ -29,6 +34,7 @@ impl PlanNode {
             id: id.into(),
             summary: summary.into(),
             contract,
+            sandbox: SandboxProfile::default(),
         }
     }
 }
