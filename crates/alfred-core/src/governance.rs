@@ -289,6 +289,9 @@ pub struct GovernanceOptions {
     pub exec_time_limit_secs: u32,
     /// 计划审查 eval 单样本时间上限（秒）。
     pub review_time_limit_secs: u32,
+    /// 规划（planner 容器）eval 单样本时间上限（秒）。R6b 起 planner 容器化。
+    #[serde(default = "default_planner_time_limit")]
+    pub planner_time_limit_secs: u32,
     /// 桥代理端口基数。
     pub port_base: u32,
     /// settled 后宽限（秒）。
@@ -297,12 +300,18 @@ pub struct GovernanceOptions {
     pub ctl_enabled: bool,
 }
 
+/// `planner_time_limit_secs` 缺省值（旧 state.json 无此字段时反序列化兜底）。
+fn default_planner_time_limit() -> u32 {
+    600
+}
+
 impl Default for GovernanceOptions {
     fn default() -> Self {
         Self {
             image: "alfred-executor:latest".to_string(),
             exec_time_limit_secs: 600,
             review_time_limit_secs: 300,
+            planner_time_limit_secs: 600,
             port_base: 13100,
             settle_grace_seconds: 20.0,
             ctl_enabled: true,

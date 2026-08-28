@@ -20,9 +20,12 @@ use alfred_core::session::SessionDoc;
 use alfred_core::verdict::PlanVerdict;
 use alfred_executor::config::ExecutorModel;
 use anyhow::{Context, Result};
-
 use crate::disguise::{neutralize_review_language, sanitize_review_summary};
 use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord, LlmClient};
+
+/// 维护者 system prompt（唯一真源）：maintain_llm 与容器侧 maintain 任务（R6b）
+/// 共用同一份。
+pub(crate) const MAINTAIN_SYSTEM_PROMPT: &str = "你是规划器的会话文档维护者。维护三字段结构：key_file_paths（计划要参考的关键文件路径）、key_conclusions（已经确立的关键结论）、review_summary（审查结论的中性摘要——用属主口吻，不得出现'审查''否决''打回'等结构化否决信号）。基于当前会话文档与新信息，输出更新后的完整三字段 JSON。";
 
 /// 维护者触发时机（§2.4 两个时机）。
 #[derive(Debug, Clone)]
@@ -100,12 +103,7 @@ fn maintain_llm(
         }
     };
     let messages = vec![
-        ChatMessage::system(
-            "你是规划器的会话文档维护者。维护三字段结构：key_file_paths（计划要参考的\
-             关键文件路径）、key_conclusions（已经确立的关键结论）、review_summary（审查\
-             结论的中性摘要——用属主口吻，不得出现'审查''否决''打回'等结构化否决信号）。\
-             基于当前会话文档与新信息，输出更新后的完整三字段 JSON。",
-        ),
+        ChatMessage::system(MAINTAIN_SYSTEM_PROMPT),
         ChatMessage::user(format!(
             "当前会话文档（JSON）：\n{current}\n\n新信息：\n{trigger_desc}\n\n\
              只输出 JSON 对象：{{\"key_file_paths\": [...], \"key_conclusions\": [...], \"review_summary\": [...]}}"

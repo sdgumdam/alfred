@@ -28,7 +28,7 @@ use crate::disguise::sanitize_review_summary;
 /// 磁盘上 state.json 的会话文档保持原名 review_summary（审计真源不变），只改喂给
 /// 规划器的投影。
 #[derive(serde::Serialize)]
-struct SessionDocProjection {
+pub(crate) struct SessionDocProjection {
     key_file_paths: Vec<String>,
     key_conclusions: Vec<String>,
     #[serde(rename = "owner_feedback")]
@@ -37,7 +37,7 @@ struct SessionDocProjection {
 
 /// 把会话文档投影为规划器可见形态：第三段改名 owner_feedback，且任一条目含禁词
 /// 时回退中性模板。
-fn project_session_doc(doc: &SessionDoc) -> SessionDocProjection {
+pub(crate) fn project_session_doc(doc: &SessionDoc) -> SessionDocProjection {
     let mut review_summary = doc.review_summary.clone();
     sanitize_review_summary(&mut review_summary);
     SessionDocProjection {
@@ -46,6 +46,25 @@ fn project_session_doc(doc: &SessionDoc) -> SessionDocProjection {
         review_summary,
     }
 }
+
+/// 规划器建图 schema 提示词（唯一真源）：converse 的 system prompt 与容器侧
+/// planner 任务（R6b）共用同一份。容器内 pi 按这份规则产建图指令序列。
+pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划器。把属主需求拆成一个任务 DAG（每个节点 = 契约 + 沙箱档案）。你只与属主对话。
+
+你的输入：会话文档（记忆）+ 属主本轮消息。
+输出：建图指令序列（JSON 数组）。每条指令是：
+- {"op":"begin","request_id":"<需求id>"}
+- {"op":"add_node","id":"task-1","summary":"<一句话摘要>","contract":{"prompt":"<任务描述>","acceptance_criteria":"<验收标准>"},"sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false}}
+- {"op":"add_edge","from":"...","to":"..."}
+- {"op":"set_routes","start":["task-1"]}
+- {"op":"commit"}
+
+规则：
+- begin 必须最先，commit 必须最后，且至少一个节点。
+- 每个节点的 contract.prompt 与 acceptance_criteria 必须非空。
+- 默认用缺省沙箱（volumes 空、runtime null、packages 空、network false）；除非任务确实需要，才声明额外权限。
+- 计划必须忠实反映属主需求，不要做属主没要求的事。
+- 只输出 JSON 数组，不要任何多余文字。"#;
 
 /// converse 选项。
 #[derive(Debug, Clone)]
@@ -108,24 +127,7 @@ pub fn build_messages(
 ) -> Vec<ChatMessage> {
     // 方案B：喂给规划器的是投影（第三段 owner_feedback + 内容中性化），磁盘真源不变。
     let session = serde_json::to_string_pretty(&project_session_doc(doc)).unwrap_or_default();
-    let system = format!(
-        r#"你是治理系统的规划器。把属主需求拆成一个任务 DAG（每个节点 = 契约 + 沙箱档案）。你只与属主对话。
-
-你的输入：会话文档（记忆）+ 属主本轮消息。
-输出：建图指令序列（JSON 数组）。每条指令是：
-- {{"op":"begin","request_id":"<需求id>"}}
-- {{"op":"add_node","id":"task-1","summary":"<一句话摘要>","contract":{{"prompt":"<任务描述>","acceptance_criteria":"<验收标准>"}},"sandbox":{{"volumes":[],"runtime":null,"packages":[],"network":false}}}}
-- {{"op":"add_edge","from":"...","to":"..."}}
-- {{"op":"set_routes","start":["task-1"]}}
-- {{"op":"commit"}}
-
-规则：
-- begin 必须最先，commit 必须最后，且至少一个节点。
-- 每个节点的 contract.prompt 与 acceptance_criteria 必须非空。
-- 默认用缺省沙箱（volumes 空、runtime null、packages 空、network false）；除非任务确实需要，才声明额外权限。
-- 计划必须忠实反映属主需求，不要做属主没要求的事。
-- 只输出 JSON 数组，不要任何多余文字。"#
-    );
+    let system = CONVERSE_SYSTEM_PROMPT.to_string();
     let user = format!(
         "需求 id：{}\n\n会话文档（记忆）：\n{session}\n\n属主本轮消息：\n{owner_message}",
         request.id
@@ -216,7 +218,6 @@ pub fn strip_fences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alfred_core::contract::Contract;
     use alfred_core::util::now_rfc3339;
 
     fn request() -> OwnerRequest {

@@ -15,6 +15,8 @@ pub mod converse;
 pub mod disguise;
 pub mod llm;
 pub mod maintain;
+pub mod container;
+pub mod task_gen;
 
 pub use converse::{build_messages, converse, instructions_to_dagspec, ConverseOptions, ConverseOutcome};
 pub use disguise::{contains_forbidden_signal, disguise_rejection, neutralize_review_language, FORBIDDEN_SIGNALS};

@@ -38,6 +38,10 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 300)]
     pub review_time_limit: u32,
 
+    /// 规划（planner 容器）eval 单样本时间上限（秒）。
+    #[arg(long, default_value_t = 600)]
+    pub planner_time_limit: u32,
+
     /// 沙箱镜像。
     #[arg(long, default_value = "alfred-executor:latest")]
     pub image: String,
@@ -93,6 +97,7 @@ pub fn run(args: RunArgs) -> Result<()> {
         image: args.image.clone(),
         exec_time_limit_secs: args.time_limit,
         review_time_limit_secs: args.review_time_limit,
+        planner_time_limit_secs: args.planner_time_limit,
         port_base: 13100,
         settle_grace_seconds: 20.0,
         ctl_enabled: !args.no_ctl,
