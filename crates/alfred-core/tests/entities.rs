@@ -49,6 +49,52 @@ fn sandbox_profile_defaults_network_off() {
     assert!(p.volumes.is_empty());
     assert!(p.packages.is_empty());
     assert_eq!(p.runtime, None);
+    assert!(
+        p.workspace_subdirs.is_empty(),
+        "workspace_subdirs 空 = 不挂 ws (M5)"
+    );
+}
+
+#[test]
+fn sandbox_profile_workspace_subdirs_round_trip() {
+    // R6a：workspace_subdirs 缺省为空（向后兼容旧 DagSpec），有值可序列化回环
+    let json = r#"{"volumes":[],"runtime":null,"packages":[],"network":false}"#;
+    let p: SandboxProfile = serde_json::from_str(json).unwrap();
+    assert!(p.workspace_subdirs.is_empty());
+
+    let p2 = SandboxProfile {
+        workspace_subdirs: vec!["src".into(), "tests".into()],
+        ..SandboxProfile::default()
+    };
+    let back: SandboxProfile = serde_json::from_str(&serde_json::to_string(&p2).unwrap()).unwrap();
+    assert_eq!(back, p2);
+    assert_eq!(back.workspace_subdirs, vec!["src", "tests"]);
+}
+
+#[test]
+fn dagspec_with_workspace_subdirs_parses() {
+    // R6a：DagSpec 的节点 sandbox 带 workspace_subdirs 可解析（限界上下文 §6.3.1 钉死）
+    let json = r#"{
+        "request_id": "req-1",
+        "nodes": [{
+            "id": "task-1",
+            "summary": "create hello.txt",
+            "contract": { "prompt": "p", "acceptance_criteria": "a" },
+            "sandbox": {
+                "volumes": [],
+                "runtime": null,
+                "packages": [],
+                "network": false,
+                "workspace_subdirs": ["src", "tests"]
+            }
+        }]
+    }"#;
+    let dag: alfred_core::DagSpec = serde_json::from_str(json).unwrap();
+    assert_eq!(dag.nodes[0].sandbox.workspace_subdirs, vec!["src", "tests"]);
+    // 序列化回环（deny_unknown_fields 下结构仍稳定）
+    let back: alfred_core::DagSpec =
+        serde_json::from_str(&serde_json::to_string(&dag).unwrap()).unwrap();
+    assert_eq!(back, dag);
 }
 
 #[test]

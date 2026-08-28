@@ -7,17 +7,23 @@ pub mod artifact;
 pub mod assignment;
 pub mod builder;
 pub mod contract;
+pub mod conversation;
 pub mod dagspec;
 pub mod governance;
 pub mod request;
 pub mod session;
 pub mod util;
 pub mod verdict;
+pub mod visibility;
 
 pub use artifact::{Artifact, ChangeKind, FileChange, FileEntry};
 pub use assignment::TaskAssignment;
 pub use builder::{BuildInstruction, GraphBuilder};
 pub use contract::{Contract, SandboxProfile, VolumeMount};
+pub use conversation::{
+    append_to_disk, load_conversation, save_conversation, ConversationLog, ConversationRole,
+    ConversationSource, ConversationTurn, CONVERSATION_FILE,
+};
 pub use dagspec::{DagSpec, PlanNode};
 pub use governance::{
     route, GovernanceEvent, GovernanceOptions, GovernanceRun, GovernanceState,
@@ -26,3 +32,7 @@ pub use governance::{
 pub use request::OwnerRequest;
 pub use session::SessionDoc;
 pub use verdict::{Confidence, ExecVerdict, FailureClass, PlanVerdict, VerdictGrade};
+pub use visibility::{
+    AgentRole, ContractVisibility, ToolPolicy, ToolSurface, VisibilitySpec, WorkspaceMount,
+    WritePolicy,
+};

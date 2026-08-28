@@ -22,7 +22,9 @@
 //
 // 加载：`pi -e <path>/agt-policy.ts`（沙箱容器内，配合 /workspace/.agt/ 挂载）。
 // 策略：`AGT_POLICY_PATH`（缺省 /workspace/.agt/policy.json）。
-// 审计：`AGT_AUDIT_PATH`（缺省 /workspace/.agt/audit.jsonl，宿主可见）。
+// 审计：`AGT_AUDIT_PATH`（缺省 /workspace/.agt/audit/audit.jsonl，宿主可见）。
+//   R6a：审计输出子目录 /workspace/.agt/audit 单独 rw 挂载（策略目录 ro），
+//   故默认审计路径落在审计子目录下——agent 可写审计但不可改策略。
 // 默认不启用；启用与否属主拍板（见 .plans/AGT评估.md 拍板项）。
 //
 // 导出：default = pi 扩展工厂；evaluateToolCall/parsePolicy/... = 纯求值核心
@@ -296,7 +298,7 @@ export function appendAudit(path: string, entry: AuditEntry): void {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_POLICY_PATH = "/workspace/.agt/policy.json";
-const DEFAULT_AUDIT_PATH = "/workspace/.agt/audit.jsonl";
+const DEFAULT_AUDIT_PATH = "/workspace/.agt/audit/audit.jsonl";
 
 export default function (pi: ExtensionAPI) {
   let policy: Policy | null = null;

@@ -28,6 +28,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use alfred_core::conversation::{
+    append_to_disk, ConversationRole, ConversationSource,
+};
 use alfred_core::governance::{GovernanceRun, GovernanceState};
 use alfred_core::util::now_rfc3339;
 use alfred_executor::config::load_executor_model;
@@ -364,6 +367,17 @@ pub fn panel(args: PanelArgs) -> Result<()> {
         .context("serialize panel-decision.json")?,
     )
     .context("write panel-decision.json")?;
+
+    // R6a：对话记录——升级拍板时的属主决策是 panel.decision 轮（§二.8）。
+    append_to_disk(
+        run_dir,
+        &run.run_id,
+        ConversationRole::Owner,
+        format!("{}（{}）", decision, choice_label(choice)),
+        ConversationSource::PanelDecision,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("append panel.decision to conversation.json")?;
 
     if args.no_decide {
         println!(

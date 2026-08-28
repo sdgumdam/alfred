@@ -37,6 +37,11 @@ pub struct SandboxProfile {
     /// 是否允许联网。**默认拒绝**（施工清单 §2.5 / P2）。
     #[serde(default)]
     pub network: bool,
+    /// 契约声明的工作区子目录（相对持久 ws 的**相对路径**；R6a/M5 显式声明制）。
+    /// executor 只挂这些子目录（空 = 不挂 ws），且必须相对、不含 `..`——
+    /// 绝对/越界路径在 compose 生成时被拒绝（防静默换基 rw 挂载）。
+    #[serde(default)]
+    pub workspace_subdirs: Vec<String>,
 }
 
 impl Default for SandboxProfile {
@@ -46,6 +51,7 @@ impl Default for SandboxProfile {
             runtime: None,
             packages: Vec::new(),
             network: false,
+            workspace_subdirs: Vec::new(),
         }
     }
 }

@@ -11,6 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use alfred_core::conversation::{
+    append_to_disk, ConversationRole, ConversationSource,
+};
 use alfred_core::governance::{GovernanceEvent, GovernanceRun};
 use alfred_core::util::now_rfc3339;
 use alfred_executor::config::ExecutorModel;
@@ -111,6 +114,18 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()>
         model: ctx.planner_model.clone(),
     };
     let outcome = converse(&opts, &run.request, &run.session_doc, &owner_message)?;
+    // R6a：对话记录——converse 落定后 append（reviewer 挂载输入数据源，§二.8）。
+    // M4-a：conversation.json 只承载语义轮次——落 planner 的语义回复（计划摘要），
+    // 不落原始建图指令 JSON（中间指令属实现细节，已在 llm-calls/ 审计）。
+    append_to_disk(
+        &ctx.run_dir,
+        &run.run_id,
+        ConversationRole::Planner,
+        format_plan_reply(&outcome.dagspec),
+        ConversationSource::ConverseReply,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("append converse.reply to conversation.json")?;
     let mut dagspec = outcome.dagspec;
     // E5：reviewer_models 由系统从 config roles.reviewer 注入（规划器不感知审查者）。
     for node in &mut dagspec.nodes {
@@ -395,6 +410,19 @@ fn write_dagspec(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
     std::fs::write(run_dir.join("dagspec.json"), text).context("write dagspec.json")
 }
 
+/// 把 converse 产出的 DagSpec 格式化为语义回复（对话记录 converse.reply 轮的 content）。
+///
+/// M4-a：conversation.json 只承载 owner↔planner 语义轮次——落计划摘要，不落
+/// 原始建图指令 JSON（中间指令属实现细节，已在 llm-calls/ 审计，避免冗余）。
+fn format_plan_reply(dagspec: &alfred_core::DagSpec) -> String {
+    let nodes: Vec<String> = dagspec
+        .nodes
+        .iter()
+        .map(|n| format!("{}: {}", n.id, n.summary))
+        .collect();
+    format!("计划（{} 节点）：{}", dagspec.nodes.len(), nodes.join("；"))
+}
+
 /// 读治理环 state.json。
 pub fn load_governance_run(run_dir: &Path) -> Result<GovernanceRun> {
     let path = run_dir.join("state.json");
@@ -451,4 +479,51 @@ pub fn default_governance_dir() -> PathBuf {
             PathBuf::from(home).join(".local/state/alfred/runs")
         });
     base.join(alfred_core::util::short_id("run"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_plan_reply_is_semantic_not_instruction_json() {
+        // M4-a：converse.reply 落语义回复（计划摘要），不落原始建图指令 JSON
+        let node = alfred_core::dagspec::PlanNode::new(
+            "task-1",
+            "create hello.txt",
+            alfred_core::contract::Contract {
+                prompt: "p".into(),
+                acceptance_criteria: "a".into(),
+                reviewer_models: vec![],
+            },
+        );
+        let dag = alfred_core::DagSpec::new("req-1", vec![node]);
+        let reply = format_plan_reply(&dag);
+        assert!(reply.contains("task-1"), "got: {reply}");
+        assert!(reply.contains("create hello.txt"), "got: {reply}");
+        assert!(reply.contains("计划"), "got: {reply}");
+        // 不落中间建图指令 / 原始响应文本
+        assert!(!reply.contains("add_node"), "got: {reply}");
+        assert!(!reply.contains("build instruction"), "got: {reply}");
+    }
+
+    #[test]
+    fn format_plan_reply_joins_multiple_nodes() {
+        let mk = |id: &str| {
+            alfred_core::dagspec::PlanNode::new(
+                id,
+                "summary",
+                alfred_core::contract::Contract {
+                    prompt: "p".into(),
+                    acceptance_criteria: "a".into(),
+                    reviewer_models: vec![],
+                },
+            )
+        };
+        let dag = alfred_core::DagSpec::new("req-1", vec![mk("a"), mk("b")]);
+        let reply = format_plan_reply(&dag);
+        assert!(reply.contains("2 节点"), "got: {reply}");
+        assert!(reply.contains("a: summary"), "got: {reply}");
+        assert!(reply.contains("b: summary"), "got: {reply}");
+    }
 }

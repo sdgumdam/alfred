@@ -12,6 +12,9 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use alfred_core::conversation::{
+    append_to_disk, ConversationRole, ConversationSource,
+};
 use alfred_core::governance::{GovernanceState, OwnerDecision};
 use alfred_executor::config::{load_executor_model, load_planner_model, load_reviewer_model};
 use alfred_planner::disguise::disguise_rejection;
@@ -118,6 +121,17 @@ pub fn decide(args: DecideArgs) -> Result<()> {
                 "decide_retry_plan",
                 &serde_json::json!({ "disguised_message": disguised }),
             )?;
+            // R6a：对话记录——打回伪装消息是 owner.message 轮（审查者判忠实度的
+            // 对照基准，§二.4/§二.8）。
+            append_to_disk(
+                run_dir,
+                &run.run_id,
+                ConversationRole::Owner,
+                disguised.clone(),
+                ConversationSource::OwnerMessage,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("append disguised owner.message to conversation.json")?;
             println!("[alfred] 属主拍板：重跑（计划打回）→ 伪装消息重规划。");
             println!("[alfred] 伪装消息: {}", truncate(&disguised, 200));
         }
@@ -150,6 +164,16 @@ pub fn decide(args: DecideArgs) -> Result<()> {
                 "decide_revise",
                 &serde_json::json!({ "message": msg }),
             )?;
+            // R6a：对话记录——属主补充新需求是 owner.message 轮（§二.8）。
+            append_to_disk(
+                run_dir,
+                &run.run_id,
+                ConversationRole::Owner,
+                msg.clone(),
+                ConversationSource::OwnerMessage,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("append owner.message to conversation.json")?;
             println!("[alfred] 属主拍板：改需求重新规划。");
         }
         (GovernanceState::PlanRejected, OwnerDecision::Abandon)
@@ -175,6 +199,17 @@ pub fn decide(args: DecideArgs) -> Result<()> {
                     "destination": dest,
                 }),
             )?;
+            // R6a：对话记录——升级拍板的属主决策是 panel.decision 轮（§二.8），
+            // 与 PlanRejected 分支一致（decide CLI 拍板也落对话，供审查者全可见）。
+            append_to_disk(
+                run_dir,
+                &run.run_id,
+                ConversationRole::Owner,
+                format!("重跑（{}）", choice_label(args.decision)),
+                ConversationSource::PanelDecision,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("append panel.decision to conversation.json")?;
             println!(
                 "[alfred] 属主拍板：重跑（升级来源 {:?}）→ {}。",
                 source, dest

@@ -7,6 +7,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use alfred_core::conversation::{
+    append_to_disk, ConversationRole, ConversationSource,
+};
 use alfred_core::governance::{GovernanceOptions, GovernanceRun};
 use alfred_core::request::OwnerRequest;
 use alfred_executor::config::{load_executor_model, load_planner_model, load_reviewer_model};
@@ -73,6 +76,18 @@ pub fn run(args: RunArgs) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("run")
         .to_string();
+
+    // R6a：对话记录（reviewer 挂载输入数据源，§二.8）——初始需求提交轮。
+    // 内容 = 属主本轮消息（与 converse 首轮喂给规划器的形态一致）。
+    append_to_disk(
+        &run_dir,
+        &run_id,
+        ConversationRole::Owner,
+        alfred_planner::format_request_message(&request),
+        ConversationSource::RequestSubmit,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("append request.submit to conversation.json")?;
 
     let options = GovernanceOptions {
         image: args.image.clone(),
