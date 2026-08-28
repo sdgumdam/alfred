@@ -54,7 +54,7 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 你的输入：会话文档（记忆）+ 属主本轮消息。
 输出：建图指令序列（JSON 数组）。每条指令是：
 - {"op":"begin","request_id":"<需求id>"}
-- {"op":"add_node","id":"task-1","summary":"<一句话摘要>","contract":{"prompt":"<任务描述>","acceptance_criteria":"<验收标准>"},"sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false}}
+- {"op":"add_node","id":"task-1","summary":"<一句话摘要>","contract":{"prompt":"<任务描述>","acceptance_criteria":"<验收标准>"},"sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["src"]}}
 - {"op":"add_edge","from":"...","to":"..."}
 - {"op":"set_routes","start":["task-1"]}
 - {"op":"commit"}
@@ -62,7 +62,8 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 规则：
 - begin 必须最先，commit 必须最后，且至少一个节点。
 - 每个节点的 contract.prompt 与 acceptance_criteria 必须非空。
-- 默认用缺省沙箱（volumes 空、runtime null、packages 空、network false）；除非任务确实需要，才声明额外权限。
+- 每个节点必须声明非空 workspace_subdirs（sandbox.workspace_subdirs，工作区子目录列表，如 ["src"]）：声明的是该节点可见/可写的工作区范围（节点只能看到这些子目录），这是强制约束；空/缺省声明 = 计划不合格。挂载语义：首个子目录挂为该节点工作区根 /workspace，其余子目录挂为 /workspace/<子目录>。
+- 默认用缺省沙箱（volumes 空、runtime null、packages 空、network false），workspace_subdirs 按上条必须非空；除非任务确实需要，才声明额外权限。
 - 计划必须忠实反映属主需求，不要做属主没要求的事。
 - 只输出 JSON 数组，不要任何多余文字。"#;
 
@@ -258,7 +259,7 @@ mod tests {
             {"op":"begin","request_id":"req-1"},
             {"op":"add_node","id":"task-1","summary":"create hello.txt",
              "contract":{"prompt":"create hello.txt with Hello","acceptance_criteria":"hello.txt exists with Hello"},
-             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false}},
+             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["src"]}},
             {"op":"commit"}
         ]"#;
         let dag = instructions_to_dagspec(text, &request()).unwrap();
@@ -266,6 +267,8 @@ mod tests {
         assert_eq!(dag.nodes[0].id, "task-1");
         assert_eq!(dag.nodes[0].contract.prompt, "create hello.txt with Hello");
         assert!(!dag.nodes[0].sandbox.network);
+        // R6e(补C)：add_node 指令带 workspace_subdirs → dagspec 节点声明保留
+        assert_eq!(dag.nodes[0].sandbox.workspace_subdirs, vec!["src"]);
     }
 
     #[test]
@@ -297,10 +300,10 @@ mod tests {
             {"op":"begin","request_id":"req-1"},
             {"op":"add_node","id":"task-1","summary":"s1",
              "contract":{"prompt":"p1","acceptance_criteria":"a1"},
-             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false}},
+             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["src"]}},
             {"op":"add_node","id":"task-2","summary":"s2",
              "contract":{"prompt":"p2","acceptance_criteria":"a2"},
-             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false}},
+             "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["tests"]}},
             {"op":"add_edge","from":"task-1","to":"task-2"},
             {"op":"set_routes","start":["task-1"]},
             {"op":"commit"}
@@ -380,6 +383,31 @@ mod tests {
             );
         }
         assert!(system.contains("属主"), "system prompt must mention 属主");
+    }
+
+    #[test]
+    fn system_prompt_mandates_workspace_subdirs() {
+        // R6e(补C)：规划器提示词必须强制每个节点声明非空 workspace_subdirs——
+        // 真规划器按此产出声明，才能通过计划审查结构闸门（补A）。示例 JSON 也要带声明。
+        let msgs = build_messages(&request(), &SessionDoc::new(), "属主：继续");
+        let system = &msgs[0].content;
+        assert!(
+            system.contains("每个节点必须声明非空 workspace_subdirs"),
+            "system prompt must mandate non-empty workspace_subdirs: {system}"
+        );
+        assert!(
+            system.contains("强制约束"),
+            "system prompt must state mandatory constraint: {system}"
+        );
+        assert!(
+            system.contains("workspace_subdirs"),
+            "system prompt must mention workspace_subdirs: {system}"
+        );
+        // add_node 示例本身带 workspace_subdirs 声明（执行者可见子集）
+        assert!(
+            system.contains("\"workspace_subdirs\":[\"src\"]"),
+            "add_node example must declare workspace_subdirs: {system}"
+        );
     }
 
     #[test]
