@@ -1,0 +1,28 @@
+{
+  "apiVersion": "governance.toolkit/v1",
+  "name": "alfred-planner-deny-write",
+  "default_action": "allow",
+  "deny_on_policy_error": true,
+  "rules": [
+    {
+      "name": "workspace-write-deny",
+      "description": "结构性拒绝写工作区（planner 无 workspace edit 权限，不产出任何 workspace 内容；产出经 /outputs 挂载）",
+      "condition": "tool_name in ['write', 'edit', 'rename', 'delete', 'mkdir', 'move', 'copy', 'create'] and path_escapes_workspace == 'false'",
+      "action": "deny"
+    },
+    {
+      "name": "no-sudo",
+      "description": "沙箱内禁用 sudo",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [{ "source": "\\bsudo\\b", "flags": "i" }],
+      "action": "deny"
+    },
+    {
+      "name": "no-recursive-delete",
+      "description": "阻断递归删除（rm -rf 等）——防止清空工作区",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [{ "source": "\\brm\\b[\\s\\S]*-(?:r[fF]|[fF]r)\\b", "flags": "i" }],
+      "action": "deny"
+    }
+  ]
+}
