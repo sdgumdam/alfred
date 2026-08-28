@@ -248,15 +248,16 @@ printf "1\n" | ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithf
 cargo run --quiet -p alfred-cli -- panel \
   --run-dir "$CASE2_DIR" \
   --timeout "$PANEL_TL"
-assert_state "$CASE2_DIR" "completed"
+assert_state "$CASE2_DIR" "escalated"
+# R6d：离线 panel retry 走到执行审查时离线回退 → 升级挂起（escalated）——执行
+# eval 只出产物无审查结论，不悄悄放行。执行是否到达取决于离线计划审查模型速度
+# （plan_review.py.tmpl 45s scorer 限）；若执行已跑（产物落 ws/src），内容须正确。
 HELLO2="$CASE2_DIR/ws/src/hello.txt"
-if [[ ! -f "$HELLO2" ]] || [[ "$(cat "$HELLO2")" != "Hello" ]]; then
-  echo "FAIL(case2): run 级 ws/src hello.txt missing/wrong" >&2
-  ls "$CASE2_DIR"/ws/ 2>/dev/null >&2
-  exit 1
+if [[ -f "$HELLO2" ]]; then
+  [[ "$(cat "$HELLO2")" == "Hello" ]] || { echo "FAIL(case2): hello.txt content wrong" >&2; exit 1; }
 fi
 assert_panel_session "$CASE2_DIR" "重跑"
-echo "PASS(case2): 打回续跑闭环 → panel retry → 真重跑 → Completed"
+echo "PASS(case2): 打回续跑闭环 → panel retry → 重规划 → 执行审查离线回退升级"
 
 echo ""
 echo "============================================="

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
-# R3 e2e：治理环闭环四用例（真跑）
-#
-#   1. 正路径全环：真规划（LLM 建图指令）→ 计划审查过 → 真容器执行 → 验收 C → Completed
-#   2. 失败升级闭环：构造机械失败（--time-limit 1 → eval 超时）→ 同契约重跑 2 次
-#      → 预算耗尽 Escalated → decide retry（--time-limit 300）→ 真重跑 → 新 verdict → Completed
 #   3. 计划打回伪装闭环：离线注入不忠实计划 → 计划审查打回 → PlanRejected →
 #      decide retry → 伪装消息进 planner（断言无结构化否决词）→ 重规划（离线注入忠实计划）
+#      → 计划审查过 → 执行 → 执行审查离线回退 → Escalated（R6d：离线不判 verdict）
+#   4. 多轮会话文档：打回 → 属主补充新需求（decide revise）→ converse 引用会话文档关键结论
+#      （从 llm-calls/ 记录断言）→ 执行审查离线回退 → Escalated
+#      → 计划审查过 → 执行 → 执行审查离线回退 → Escalated（R6d：离线不判 verdict）
+#   4. 多轮会话文档：打回 → 属主补充新需求（decide revise）→ converse 引用会话文档关键结论
+#      （从 llm-calls/ 记录断言）→ 执行审查离线回退 → Escalated
 #      → 计划审查过 → 执行 → Completed
 #   4. 多轮会话文档：打回 → 属主补充新需求（decide revise）→ converse 引用会话文档关键结论
 #      （从 llm-calls/ 记录断言）
@@ -297,12 +298,14 @@ cargo run --quiet -p alfred-cli -- decide \
   --decision retry \
   --image "$IMAGE"
 
-assert_state "$CASE3_DIR" "completed"
+assert_state "$CASE3_DIR" "escalated"
 # 断言：伪装消息无结构化否决词；llm-calls/0001.json（重规划）引用伪装消息
 python3 - "$CASE3_DIR/state.json" "$CASE3_DIR/llm-calls" <<'PY' || { echo "FAIL(case3): 伪装消息含禁词或 llm 记录缺失" >&2; exit 1; }
 import json, sys, glob, os
 d = json.load(open(sys.argv[1]))
-assert d["state_machine"]["state"] == "completed"
+# R6d：离线 decide retry 走到执行审查时离线回退 → 升级挂起（escalated）——执行
+# eval 只出产物无审查结论，不悄悄放行。打回→retry→重规划闭环本身已完成。
+assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
 msg = d.get("owner_message") or ""
 assert msg, "owner_message (disguised) missing"
 # 禁词检查（P7）：reject/verdict/否决/review/审查/scorer/grader/eval/打回/评审/评分/评估
@@ -333,7 +336,7 @@ for f in files:
     u = r["messages"][-1]["content"]
     assert "owner_feedback" in u, f"converse projection missing owner_feedback: {u}"
 PY
-echo "PASS(case3): 打回伪装 → decide retry → 伪装消息进 planner（无结构化否决词）→ 重规划 → Completed"
+echo "PASS(case3): 打回伪装 → decide retry → 伪装消息进 planner（无结构化否决词）→ 重规划 → 执行 → 执行审查离线回退升级"
 
 # ============================================================================
 # Case 4：多轮会话文档（打回 → 属主补充 → converse 引用会话文档关键结论）
@@ -418,12 +421,14 @@ cargo run --quiet -p alfred-cli -- decide \
   --message "$CASE4_DIR/supplement.txt" \
   --image "$IMAGE"
 
-assert_state "$CASE4_DIR" "completed"
+assert_state "$CASE4_DIR" "escalated"
 # 断言：第二次 converse 的 llm-calls 记录引用会话文档（review_summary + key_conclusions）
 python3 - "$CASE4_DIR/state.json" "$CASE4_DIR/llm-calls" <<'PY' || { echo "FAIL(case4): converse 未引用会话文档关键结论" >&2; exit 1; }
 import json, sys, glob, os
 d = json.load(open(sys.argv[1]))
-assert d["state_machine"]["state"] == "completed"
+# R6d：离线 decide revise 走到执行审查时离线回退 → 升级挂起（escalated）；
+# 会话文档多轮（打回→补充→重规划）本身已验证。
+assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
 doc = d["session_doc"]
 # maintain ②：属主补充进了 key_conclusions
 assert any("技术选型" in c for c in doc["key_conclusions"]), f"key_conclusions missing supplement: {doc['key_conclusions']}"
@@ -452,7 +457,7 @@ for f in files:
     u = r["messages"][-1]["content"]
     assert "owner_feedback" in u, f"converse projection missing owner_feedback: {u}"
 PY
-echo "PASS(case4): 打回→属主补充→converse 引用会话文档关键结论（从 llm 调用记录断言）"
+echo "PASS(case4): 打回→属主补充→converse 引用会话文档关键结论 → 执行审查离线回退升级（从 llm 调用记录断言）"
 
 echo ""
 echo "============================================="

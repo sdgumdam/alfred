@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# R2 e2e：审查侧四用例（真跑）
-#
-#   1. 执行审查正路径：alfred run（pi 真容器 + 内嵌 ExecVerdict scorer 判 C）
-#   1b. 执行审查部分兑现：alfred run（prompt 只建 hello.txt，验收要 hello+world
-#       → grader 判 P + fidelity_dispute → §3.3 升级挂起 escalated）
+#   1. 执行审查正路径：alfred run（pi 真容器 + reviewer 容器判 C）
+#   1b. 执行审查离线回退：alfred run（ALFRED_OFFLINE=1 → 执行审查不跑容器、
+#       无 verdict → §3.3 升级挂起 escalated；部分兑现 P 档由 reviewer 容器在线判）
 #   2. 注定不忠实计划：alfred plan-review（需求 A 计划做 B → pass=false 打回）
 #   3. 解析失败 → unscored：alfred plan-review（reviewer=mockllm → 解析失败）
 #
@@ -142,7 +140,7 @@ cat > "$CASE1B_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r2] case1b: alfred run (offline 忠实计划 → 执行部分兑现 → grader 判 P → §3.3 升级挂起) ..."
+echo "[r2] case1b: alfred run (offline 忠实计划 → 执行部分兑现 → 执行审查离线回退 → §3.3 升级挂起) ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1B_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli -- run \
   --request "$CASE1B_DIR/request.json" \
@@ -150,20 +148,19 @@ cargo run --quiet -p alfred-cli -- run \
   --time-limit "${R2_TIME_LIMIT:-900}" \
   --image "$IMAGE"
 
-python3 - "$CASE1B_DIR/state.json" "$CASE1B_DIR/audit.jsonl" <<'PY' || { echo "FAIL(case1b): exec verdict not P/escalated" >&2; exit 1; }
+python3 - "$CASE1B_DIR/state.json" "$CASE1B_DIR/audit.jsonl" <<'PY' || { echo "FAIL(case1b): offline exec review 未升级挂起" >&2; exit 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))
-# 部分兑现 P + fidelity_dispute → §3.3 升级属主（挂起 escalated），不静默放行
+# R6d：离线（ALFRED_OFFLINE=1）执行审查不跑 reviewer 容器——执行 eval 只出产物
+# 无审查结论 → 升级属主（§六继承项，不悄悄放行），exec_verdicts 恒为空。
+# （部分兑现 P 档由 reviewer 容器在线判定，见 r6d.sh Tier3 / R6f 交付文档。）
 assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
 vs = d["exec_verdicts"]
-assert len(vs) >= 1, "no exec verdict"
-v = vs[-1]
-assert v["value"] == "P", f"expected P, got {v['value']} ({v})"
-assert v.get("failure_class") is not None, f"P must have failure_class, got {v}"
+assert len(vs) == 0, f"R6d offline exec review must produce no verdict, got {vs}"
 events = [json.loads(l)["event"] for l in open(sys.argv[2])]
 assert any("escalat" in e for e in events), f"no escalation event in audit: {events}"
 PY
-echo "PASS(case1b): 部分兑现 → P + fidelity_dispute → §3.3 升级挂起 escalated"
+echo "PASS(case1b): 离线执行审查无 verdict → 升级挂起 escalated（R6d 语义）"
 
 # ============================================================================
 # Case 2：注定不忠实计划（需求 A 计划做 B → pass=false 打回）
