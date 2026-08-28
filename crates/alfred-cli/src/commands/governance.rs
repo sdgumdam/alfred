@@ -21,6 +21,7 @@ use alfred_executor::run::{execute_run, RunOptions};
 use alfred_planner::converse::{converse, ConverseOptions};
 use alfred_planner::maintain::{maintain, MaintainOptions, MaintainTrigger};
 use alfred_reviewer::plan_review::{execute_plan_review, PlanReviewOptions};
+use alfred_reviewer::ReviewerContainerOptions;
 use serde_json::Value;
 
 /// 治理环驱动上下文（模型配置 + run 目录）。
@@ -164,9 +165,12 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
         .context("governance state PlanReviewing without dagspec")?;
     let review_dir = ctx.run_dir.join("plan-review");
     let opts = PlanReviewOptions {
-        run_dir: review_dir,
+        run_dir: review_dir.clone(),
         time_limit_secs: run.options.review_time_limit_secs,
         ctl_enabled: run.options.ctl_enabled,
+        // R6c：reviewer 容器路径（ws 全量 ro + 对话记录）；离线回归
+        // （ALFRED_OFFLINE=1）由 execute_plan_review 内部回退旧 eval 直判。
+        container: Some(ReviewerContainerOptions::from_governance(review_dir, &run.options)),
     };
     let outcome = execute_plan_review(
         &opts,

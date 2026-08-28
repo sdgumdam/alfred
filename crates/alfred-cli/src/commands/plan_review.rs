@@ -63,6 +63,8 @@ pub fn plan_review(args: PlanReviewArgs) -> Result<()> {
         run_dir: run_dir.clone(),
         time_limit_secs: args.time_limit,
         ctl_enabled: !args.no_ctl,
+        // R6c：独立 plan-review 走旧 eval 直判路径（无治理上下文/无容器）
+        container: None,
     };
 
     println!("alfred plan-review: DagSpec vs OwnerRequest 忠实度 (reviewer model: {})", reviewer.inspect_model_id());

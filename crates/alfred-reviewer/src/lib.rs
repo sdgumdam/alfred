@@ -9,14 +9,22 @@
 //! 3. Rust 驱动复用 alfred-executor::driver（spawn / poll / archive）。
 //!
 //! R6c：新增 reviewer 容器驱动（container.rs）——计划审查/执行审查都走独立
-//!   容器 Agent（ws 全量 ro + 对话记录 + 契约全字段，AGT 拦写层）。
+//!   容器 Agent（ws 全量 ro + 对话记录 + 契约全字段，AGT 拦写层）；verdict.rs
+//!   承载 verdict.json 输出契约（宿主读容器产出做 Pydantic 等价校验）；
+//!   exec_review.rs 为执行审查独立容器驱动。
 
 pub mod container;
+pub mod exec_review;
 pub mod plan_review;
 pub mod task_gen;
+pub mod verdict;
 
 pub use container::{
     run_exec_review_in_container, run_plan_review_in_container, ReviewerContainerOptions,
 };
+pub use exec_review::{default_exec_review_dir, execute_exec_review, ExecReviewOptions, ExecReviewOutcome};
 pub use plan_review::{execute_plan_review, extract_plan_verdict, PlanReviewOptions, PlanReviewOutcome};
 pub use task_gen::generate_plan_review_py;
+pub use verdict::{
+    parse_exec_verdict_json, parse_plan_verdict_json, ExecVerdictDoc, PlanVerdictDoc,
+};

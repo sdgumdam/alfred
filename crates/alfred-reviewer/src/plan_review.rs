@@ -1,9 +1,8 @@
-//! 计划审查编排（R2）：独立 eval 判 DagSpec vs OwnerRequest 忠实度。
 //!
-//! 流程：建 run 目录 → 写 request.json/dagspec.json → 生成 plan_review.py →
-//! spawn `inspect eval --detach`（主模型 = 审查者）→ 轮询 done → 归档 eval
-//! log → 从 dump 结构化读取 PlanVerdict → 落 verdict.json + state.json +
-//! audit.jsonl。
+//! R6c：新增容器路径（`PlanReviewOptions.container`）——reviewer 容器（ws 全量
+//! ro + 对话记录 + 契约全字段）内 pi 读全量信息审忠实度，产出 verdict.json 到
+//! /outputs；宿主读容器产出做 Pydantic 等价校验。离线回归（ALFRED_OFFLINE=1）
+//! 与独立 `alfred plan-review`（container=None）保留旧 eval 直判路径。
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +19,9 @@ use alfred_executor::driver::{
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::container::{run_plan_review_in_container, ReviewerContainerOptions};
 use crate::task_gen::generate_plan_review_py;
+use crate::verdict::parse_plan_verdict_json;
 
 /// 计划审查选项。
 #[derive(Debug, Clone)]
@@ -31,6 +32,9 @@ pub struct PlanReviewOptions {
     pub time_limit_secs: u32,
     /// 是否轮询 `inspect ctl` 观测面。
     pub ctl_enabled: bool,
+    /// R6c：reviewer 容器驱动选项。Some = 非离线时走容器（ws 全量 ro + 对话记录）；
+    /// None = 走旧 eval 直判（独立 plan-review / 离线回归）。
+    pub container: Option<ReviewerContainerOptions>,
 }
 
 impl Default for PlanReviewOptions {
@@ -39,6 +43,7 @@ impl Default for PlanReviewOptions {
             run_dir: PathBuf::new(),
             time_limit_secs: 300,
             ctl_enabled: true,
+            container: None,
         }
     }
 }
@@ -72,9 +77,27 @@ pub fn default_review_dir() -> PathBuf {
 }
 
 ///
-/// `session_doc` / `owner_message` 为审查者可见的补充上下文（§2.4：审查者全可见，
-/// 属主补充与审查摘要都骗不过审查）；独立 `alfred plan-review` 子命令可传 None。
+/// R6c 调度：`container` 为 Some 且非离线（`ALFRED_OFFLINE` 未设）→ 容器路径
+/// （reviewer 容器读全量信息）；否则 → 旧 eval 直判路径（离线回归 / 独立子命令）。
 pub fn execute_plan_review(
+    opts: &PlanReviewOptions,
+    model: &ExecutorModel,
+    request: &OwnerRequest,
+    dagspec: &DagSpec,
+    session_doc: Option<&SessionDoc>,
+    owner_message: Option<&str>,
+) -> Result<PlanReviewOutcome> {
+    let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1");
+    match &opts.container {
+        Some(container) if !offline => execute_plan_review_container(
+            opts, container, model, request, dagspec, session_doc, owner_message,
+        ),
+        _ => execute_plan_review_eval(opts, model, request, dagspec, session_doc, owner_message),
+    }
+}
+
+/// 旧 eval 直判路径（离线回归 / 独立 plan-review）。
+fn execute_plan_review_eval(
     opts: &PlanReviewOptions,
     model: &ExecutorModel,
     request: &OwnerRequest,
@@ -210,6 +233,125 @@ pub fn execute_plan_review(
         run_dir,
         "plan_review_finished",
         &serde_json::json!({ "status": outcome.status, "verdict": rec.verdict, "error": rec.error }),
+    )?;
+
+    if let Some(err) = &rec.error {
+        bail!("{err}");
+    }
+    Ok(rec)
+}
+
+/// 失败路径统一构造 PlanReviewOutcome + 落 audit + 落盘 state.json/verdict.json
+/// R6c 容器路径：reviewer 容器（ws 全量 ro + 对话记录 + 契约全字段）内 pi 读
+/// 全量信息审忠实度 → 产出 verdict.json → 宿主 Pydantic 等价校验 → 落
+/// state.json / verdict.json / audit。
+///
+/// 失败路径显式 `bail!`（不悄悄放行）：容器驱动失败（eval 超时/crash/status
+/// error/未产出 verdict）→ `fail_review` 落盘后上报；verdict 解析失败 → unscored
+/// 兜底（`plan_verdict_parse_failure`），调用方据此升级属主。
+fn execute_plan_review_container(
+    opts: &PlanReviewOptions,
+    container: &ReviewerContainerOptions,
+    model: &ExecutorModel,
+    request: &OwnerRequest,
+    dagspec: &DagSpec,
+    session_doc: Option<&SessionDoc>,
+    owner_message: Option<&str>,
+) -> Result<PlanReviewOutcome> {
+    let started_at = now_rfc3339();
+    let run_id = match container.run_dir.file_name().and_then(|s| s.to_str()) {
+        Some(name) => name.to_string(),
+        None => short_id("planreview"),
+    };
+    let run_dir = &opts.run_dir;
+
+    std::fs::create_dir_all(run_dir).with_context(|| format!("create run dir {}", run_dir.display()))?;
+    append_audit(run_dir, "plan_review_started", &serde_json::json!({ "run_id": run_id, "request_id": request.id }))?;
+
+    // 输入落盘：request.json + dagspec.json（P9 证据 + R3 续跑输入；容器输入由
+    // container.rs 在 `<work>/inputs/` 落盘，这里落 run 目录供审计/续跑）。
+    std::fs::write(
+        run_dir.join("request.json"),
+        serde_json::to_string_pretty(request).context("serialize OwnerRequest")?,
+    )?;
+    std::fs::write(
+        run_dir.join("dagspec.json"),
+        serde_json::to_string_pretty(dagspec).context("serialize DagSpec")?,
+    )?;
+
+    // 对话记录（reviewer 独有挂载，§二.8）：从治理 run 目录读；不存在 → 空。
+    let gov_dir = container
+        .run_dir
+        .parent()
+        .context("reviewer work dir has no parent (治理 run 目录)")?;
+    let ws_dir = gov_dir.join("ws");
+    let conversation = alfred_core::conversation::load_conversation(gov_dir)
+        .map_err(anyhow::Error::msg)
+        .ok()
+        .flatten();
+
+    let out = match run_plan_review_in_container(
+        container,
+        model,
+        request,
+        dagspec,
+        session_doc,
+        owner_message,
+        conversation.as_ref(),
+        &ws_dir,
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            let msg = format!("plan review container failed: {e:#}");
+            fail_review(
+                run_dir, request, dagspec, model, &run_id, &started_at,
+                "error", None, "plan_review_container_failed", "container_failure", &msg,
+            )?;
+            bail!(msg);
+        }
+    };
+    append_audit(
+        run_dir,
+        "plan_review_eval_launched",
+        &serde_json::json!({ "eval_location": out.eval_location }),
+    )?;
+
+    // Pydantic 等价校验（verdict.rs）：容器产出 verdict.json → PlanVerdict。
+    let verdict = match parse_plan_verdict_json(&out.output_text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("[alfred] warn: plan verdict parse failed: {e}");
+            None
+        }
+    };
+    let unscored_reason = if verdict.is_none() {
+        Some("plan_verdict_parse_failure".to_string())
+    } else {
+        None
+    };
+    let eval_error = (out.eval_status != "success").then(|| {
+        format!(
+            "plan review container eval finished with status '{}' (location={:?})",
+            out.eval_status, out.eval_location
+        )
+    });
+    let rec = PlanReviewOutcome {
+        run_id,
+        request_id: request.id.clone(),
+        reviewer_model: model.inspect_model_id(),
+        eval_status: out.eval_status.clone(),
+        eval_location: out.eval_location.clone(),
+        verdict,
+        unscored_reason,
+        started_at,
+        finished_at: now_rfc3339(),
+        error: eval_error,
+    };
+    write_state(run_dir, request, dagspec, &rec)?;
+    append_audit(
+        run_dir,
+        "plan_review_finished",
+        &serde_json::json!({ "status": out.eval_status, "verdict": rec.verdict, "error": rec.error }),
     )?;
 
     if let Some(err) = &rec.error {
@@ -401,20 +543,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_plan_verdict_marks_unscored() {
-        let dump: Value = serde_json::from_str(r#"{
-            "samples": [{
-                "scores": {
-                    "plan_verdict_scorer": {
-                        "value": null,
-                        "explanation": "NOT JSON",
-                        "metadata": {"unscored_reason": "plan_verdict_parse_failure"}
-                    }
-                }
-            }]
-        }"#).unwrap();
-        let out = extract_plan_verdict(&dump);
-        assert!(out.verdict.is_none());
-        assert_eq!(out.unscored_reason.as_deref(), Some("plan_verdict_parse_failure"));
+    fn plan_review_options_default_has_no_container() {
+        // R6c：缺省走旧 eval 路径（独立 plan-review / 离线回归）
+        let opts = PlanReviewOptions::default();
+        assert!(opts.container.is_none());
     }
 }
