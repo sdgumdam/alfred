@@ -153,6 +153,10 @@ pub fn decide(args: DecideArgs) -> Result<()> {
                 &MaintainOptions {
                     run_dir: run_dir.clone(),
                     model: planner_model.clone(),
+                    container: alfred_planner::container::PlannerContainerOptions::from_governance(
+                        run_dir.clone(),
+                        &run.options,
+                    ),
                 },
                 &run.session_doc,
                 MaintainTrigger::OwnerMessage { message: msg.clone() },

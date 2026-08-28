@@ -21,7 +21,7 @@ use alfred_core::session::SessionDoc;
 use alfred_executor::config::ExecutorModel;
 use anyhow::{bail, Context, Result};
 
-use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord, LlmClient};
+use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord};
 use crate::disguise::sanitize_review_summary;
 
 /// 会话文档对规划器的投影（方案B：第三段 review_summary → owner_feedback，内容中性化）。
@@ -71,6 +71,18 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 pub struct ConverseOptions {
     pub run_dir: PathBuf,
     pub model: ExecutorModel,
+    /// R6b：planner 容器驱动选项（起容器跑 converse；桥代发 LLM）。
+    pub container: crate::container::PlannerContainerOptions,
+}
+
+impl ConverseOptions {
+    pub fn new(run_dir: PathBuf, model: ExecutorModel) -> Self {
+        Self {
+            run_dir,
+            model,
+            container: crate::container::PlannerContainerOptions::default(),
+        }
+    }
 }
 
 /// converse 结果。
@@ -89,24 +101,28 @@ pub fn converse(
     owner_message: &str,
 ) -> Result<ConverseOutcome> {
     let messages = build_messages(request, doc, owner_message);
-    let (dagspec, response, offline) = if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1") {
-        let plan = read_offline_plan()?;
-        validate_dagspec(&plan, request)?;
-        let resp = serde_json::to_string_pretty(&plan).context("serialize offline plan")?;
-        (plan, resp, true)
-    } else {
-        let client = LlmClient::new(opts.model.clone());
-        // 建图指令序列可能很长：给足 max_tokens，避免中途截断。
-        let response = client.chat_with_max_tokens(&messages, 8192)?;
-        let dagspec = instructions_to_dagspec(&response, request)?;
-        (dagspec, response, false)
-    };
+    let (dagspec, response, offline, transport) =
+        if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1") {
+            // 离线模式保留：不经容器（现状直通）。
+            let plan = read_offline_plan()?;
+            validate_dagspec(&plan, request)?;
+            let resp = serde_json::to_string_pretty(&plan).context("serialize offline plan")?;
+            (plan, resp, true, "offline")
+        } else {
+            // R6b：容器内 pi 读输入跑 converse（桥代发 LLM），宿主读 /outputs 产出。
+            let out = crate::container::run_converse_in_container(
+                &opts.container, &opts.model, request, doc, owner_message,
+            )?;
+            let dagspec = instructions_to_dagspec(&out.output_text, request)?;
+            (dagspec, out.output_text, false, "container_bridge")
+        };
 
     let record = LlmCallRecord {
         ts: alfred_core::util::now_rfc3339(),
         role: "converse".into(),
         model: opts.model.inspect_model_id(),
         offline,
+        transport: transport.to_string(),
         messages,
         response,
         ok: true,
@@ -391,10 +407,10 @@ mod tests {
             max_tokens: 1024,
             raw_id: false,
         };
-        let opts = ConverseOptions {
-            run_dir: std::env::temp_dir().join("alfred-converse-offline-test"),
+        let opts = ConverseOptions::new(
+            std::env::temp_dir().join("alfred-converse-offline-test"),
             model,
-        };
+        );
         let err = converse(&opts, &request(), &SessionDoc::new(), "msg").unwrap_err();
         assert!(
             format!("{err:#}").contains("ALFRED_OFFLINE_PLAN_FILE"),

@@ -21,10 +21,10 @@ use alfred_core::verdict::PlanVerdict;
 use alfred_executor::config::ExecutorModel;
 use anyhow::{Context, Result};
 use crate::disguise::{neutralize_review_language, sanitize_review_summary};
-use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord, LlmClient};
+use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord};
 
-/// 维护者 system prompt（唯一真源）：maintain_llm 与容器侧 maintain 任务（R6b）
-/// 共用同一份。
+/// 维护者 system prompt（唯一真源）：maintain 的审计消息构建与容器侧 maintain
+/// 任务（R6b）共用同一份。
 pub(crate) const MAINTAIN_SYSTEM_PROMPT: &str = "你是规划器的会话文档维护者。维护三字段结构：key_file_paths（计划要参考的关键文件路径）、key_conclusions（已经确立的关键结论）、review_summary（审查结论的中性摘要——用属主口吻，不得出现'审查''否决''打回'等结构化否决信号）。基于当前会话文档与新信息，输出更新后的完整三字段 JSON。";
 
 /// 维护者触发时机（§2.4 两个时机）。
@@ -41,6 +41,18 @@ pub enum MaintainTrigger {
 pub struct MaintainOptions {
     pub run_dir: std::path::PathBuf,
     pub model: ExecutorModel,
+    /// R6b：planner 容器驱动选项（容器内跑 maintain；桥代发 LLM）。
+    pub container: crate::container::PlannerContainerOptions,
+}
+
+impl MaintainOptions {
+    pub fn new(run_dir: std::path::PathBuf, model: ExecutorModel) -> Self {
+        Self {
+            run_dir,
+            model,
+            container: crate::container::PlannerContainerOptions::default(),
+        }
+    }
 }
 
 /// 维护会话文档（两时机触发）。
@@ -50,9 +62,33 @@ pub fn maintain(
     trigger: MaintainTrigger,
 ) -> Result<SessionDoc> {
     if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1") {
+        // 离线模式保留：不经容器（现状直通）。
         Ok(maintain_offline(doc, trigger))
     } else {
-        maintain_llm(opts, doc, trigger)
+        // R6b：容器内 pi 读 session + trigger，产更新后会话文档 JSON（桥代发 LLM）。
+        let out = crate::container::run_maintain_in_container(
+            &opts.container, &opts.model, doc, &trigger,
+        )?;
+        let mut updated = parse_session_doc(&out.output_text)?;
+        // P2 修复：真 LLM 路径对 review_summary 做禁词中和（与离线路径同构）——LLM
+        // 输出不可信，任一条目含结构化否决信号 → 回退中性模板。
+        sanitize_review_summary(&mut updated.review_summary);
+        let messages = maintain_messages(doc, &trigger);
+        log_llm_call(
+            &opts.run_dir,
+            &LlmCallRecord {
+                ts: alfred_core::util::now_rfc3339(),
+                role: "maintain".into(),
+                model: opts.model.inspect_model_id(),
+                offline: false,
+                transport: "container_bridge".to_string(),
+                messages,
+                response: out.output_text.clone(),
+                ok: true,
+                error: None,
+            },
+        )?;
+        Ok(updated)
     }
 }
 
@@ -81,15 +117,11 @@ fn maintain_offline(doc: &SessionDoc, trigger: MaintainTrigger) -> SessionDoc {
     out
 }
 
-/// 真 LLM 重写会话文档（维护者也是大模型，§2.4）。
-fn maintain_llm(
-    opts: &MaintainOptions,
-    doc: &SessionDoc,
-    trigger: MaintainTrigger,
-) -> Result<SessionDoc> {
-    let client = LlmClient::new(opts.model.clone());
-    let current = serde_json::to_string_pretty(doc).context("serialize session doc")?;
-    let trigger_desc = match &trigger {
+/// 构建 maintain 的审计消息（system + user）：与容器侧 maintain 任务同语义
+/// （当前会话文档 + 触发事件描述），供 llm-calls/ 记录断言（P9 证据）。
+fn maintain_messages(doc: &SessionDoc, trigger: &MaintainTrigger) -> Vec<ChatMessage> {
+    let current = serde_json::to_string_pretty(doc).unwrap_or_default();
+    let trigger_desc = match trigger {
         MaintainTrigger::PlanReviewed { verdict, plan } => {
             format!(
                 "一次计划审查结论落定：pass={}，理由={}；计划={}",
@@ -102,32 +134,13 @@ fn maintain_llm(
             format!("属主补充新需求：{message}")
         }
     };
-    let messages = vec![
+    vec![
         ChatMessage::system(MAINTAIN_SYSTEM_PROMPT),
         ChatMessage::user(format!(
             "当前会话文档（JSON）：\n{current}\n\n新信息：\n{trigger_desc}\n\n\
              只输出 JSON 对象：{{\"key_file_paths\": [...], \"key_conclusions\": [...], \"review_summary\": [...]}}"
         )),
-    ];
-    let response = client.chat_with_max_tokens(&messages, 4096)?;
-    let mut updated = parse_session_doc(&response)?;
-    // P2 修复：真 LLM 路径对 review_summary 做禁词中和（与离线路径同构）——LLM 输出
-    // 不可信，任一条目含结构化否决信号 → 回退中性模板。
-    sanitize_review_summary(&mut updated.review_summary);
-    log_llm_call(
-        &opts.run_dir,
-        &LlmCallRecord {
-            ts: alfred_core::util::now_rfc3339(),
-            role: "maintain".into(),
-            model: client.model.inspect_model_id(),
-            offline: false,
-            messages,
-            response: response.clone(),
-            ok: true,
-            error: None,
-        },
-    )?;
-    Ok(updated)
+    ]
 }
 
 /// 从 LLM 输出解析 SessionDoc（容忍 markdown 围栏）。
@@ -254,6 +267,7 @@ mod tests {
             role: "maintain".into(),
             model: "m".into(),
             offline: false,
+            transport: "container_bridge".into(),
             messages: vec![],
             response: "{}".into(),
             ok: true,

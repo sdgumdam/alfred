@@ -1,17 +1,17 @@
-//! 规划器 LLM 直调（施工清单 §3.1：规划器是宿主进程里的 Rust 代码，直接读
-//! 这份配置，用里面的接口地址和密钥发 HTTP 请求）。
+//! 规划器 LLM 调用记录（R6b：ureq 手搓直调退役）。
 //!
-//! - 每次调用落盘 `llm-calls/` 作验收证据（P9 / §五 S0"每次调用落盘
-//!   llm-calls/ 作验收证据"）。
-//! - 离线用 `ALFRED_OFFLINE=1` 切回确定性直通（e2e 可控；仍落盘 llm-calls/
-//!   记录 would-be 请求 + 离线响应，供"从 llm 调用记录断言"）。
+//! R6b 起规划器的 LLM 调用在**容器内**执行（planner 容器驱动，`container.rs`），
+//! 经 `sandbox_agent_bridge` 桥代发到宿主侧 Inspect 模型（与 executor 同机制）。
+//! 宿主不再手搓 HTTP 直调——`LlmClient` / `ureq` 已删除。
 //!
-//! 模型接入配置复用 `~/.config/alfred/config.yml` 的 roles.planner →
-//! models → providers（唯一真源，见 alfred-executor::config）。
+//! 本模块只保留调用记录的**落盘**：每次 converse/maintain 调用（桥代发或离线
+//! 确定性直通）由调用方构造 [`LlmCallRecord`] 并经 [`log_llm_call`] 写到
+//! `run_dir/llm-calls/<seq>.json`（P9 / §五 S0 验收证据）。宿主侧桥服务的调用
+//! 日志（evals/ 下的 inspect 记录）即实际 LLM HTTP 调用的审计源；llm-calls/
+//! 记录承载语义轮次（messages + response），供 e2e 从记录断言会话文档/伪装消息。
 
 use std::path::{Path, PathBuf};
 
-use alfred_executor::config::ExecutorModel;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -47,66 +47,14 @@ pub struct LlmCallRecord {
     pub role: String,
     pub model: String,
     pub offline: bool,
+    /// 调用通道：`"container_bridge"`（容器内 pi 经桥代发）| `"offline"`（离线确定性直通）。
+    /// 旧记录无此字段 → 反序列化缺省空串（向后兼容）。
+    #[serde(default)]
+    pub transport: String,
     pub messages: Vec<ChatMessage>,
     pub response: String,
     pub ok: bool,
     pub error: Option<String>,
-}
-
-/// 规划器 LLM 客户端（宿主 Rust 直调 OpenAI 兼容 /chat/completions）。
-#[derive(Debug, Clone)]
-pub struct LlmClient {
-    pub model: ExecutorModel,
-}
-
-impl LlmClient {
-    pub fn new(model: ExecutorModel) -> Self {
-        Self { model }
-    }
-
-    /// 是否离线模式（`ALFRED_OFFLINE=1`）。
-    pub fn offline(&self) -> bool {
-        std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
-    }
-
-    /// 调用一次对话补全，返回响应文本。
-    pub fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.chat_with_max_tokens(messages, self.model.max_tokens)
-    }
-
-    /// 调用一次对话补全，指定 max_tokens（规划器要吐大段建图指令序列，
-    /// 默认 1024 会截断——见 converse）。
-    pub fn chat_with_max_tokens(
-        &self,
-        messages: &[ChatMessage],
-        max_tokens: u32,
-    ) -> Result<String> {
-        let url = format!(
-            "{}/chat/completions",
-            self.model.base_url.trim_end_matches('/')
-        );
-        let body = serde_json::json!({
-            "model": self.model.model,
-            "messages": messages,
-            "max_tokens": max_tokens.max(self.model.max_tokens),
-            "temperature": 0,
-        });
-        let resp = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", self.model.api_key))
-            .set("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(300))
-            .send_string(&body.to_string())
-            .map_err(|e| anyhow::anyhow!("LLM request to {url} failed: {e}"))?;
-        let text = resp
-            .into_string()
-            .context("LLM response body read failed")?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("LLM response not JSON: {text}"))?;
-        v["choices"][0]["message"]["content"]
-            .as_str()
-            .map(String::from)
-            .with_context(|| format!("LLM response missing choices[0].message.content: {text}"))
-    }
 }
 
 /// 追加一条 LLM 调用记录到 `run_dir/llm-calls/<seq>.json`。
@@ -122,6 +70,9 @@ pub fn log_llm_call(run_dir: &Path, record: &LlmCallRecord) -> Result<PathBuf> {
     Ok(path)
 }
 
+
+/// env 变量（ALFRED_OFFLINE 等）是进程级全局；并行测试会互相踩踏。
+/// 碰 env 的测试（converse_offline_* 等）用这把锁串行化。
 #[cfg(test)]
 pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -144,6 +95,7 @@ mod tests {
             role: "planner".into(),
             model: "openai-api/zhipucoding/glm-5.3".into(),
             offline: false,
+            transport: "container_bridge".into(),
             messages: vec![ChatMessage::user("hi")],
             response: "hello".into(),
             ok: true,
@@ -153,26 +105,15 @@ mod tests {
         let back: LlmCallRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.role, "planner");
         assert!(!back.offline);
+        assert_eq!(back.transport, "container_bridge");
     }
 
     #[test]
-    fn offline_flag_detected() {
-        let _guard = crate::llm::TEST_ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let m = ExecutorModel {
-            provider: "z".into(),
-            model: "m".into(),
-            base_url: "http://x".into(),
-            api_key: "k".into(),
-            max_tokens: 1024,
-            raw_id: false,
-        };
-        let client = LlmClient::new(m);
-        std::env::remove_var("ALFRED_OFFLINE");
-        assert!(!client.offline());
-        std::env::set_var("ALFRED_OFFLINE", "1");
-        assert!(client.offline());
-        std::env::remove_var("ALFRED_OFFLINE");
+    fn llm_call_record_defaults_transport_for_legacy_records() {
+        // 旧记录（无 transport 字段）→ 反序列化缺省空串（向后兼容）
+        let json = r#"{"ts":"2026-08-26T00:00:00Z","role":"converse","model":"m","offline":false,"messages":[],"response":"r","ok":true,"error":null}"#;
+        let rec: LlmCallRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.transport, "");
+        assert!(!rec.offline);
     }
 }

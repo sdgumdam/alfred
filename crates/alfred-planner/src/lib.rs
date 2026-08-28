@@ -20,7 +20,7 @@ pub mod task_gen;
 
 pub use converse::{build_messages, converse, instructions_to_dagspec, ConverseOptions, ConverseOutcome};
 pub use disguise::{contains_forbidden_signal, disguise_rejection, neutralize_review_language, FORBIDDEN_SIGNALS};
-pub use llm::{log_llm_call, ChatMessage, LlmCallRecord, LlmClient};
+pub use llm::{log_llm_call, ChatMessage, LlmCallRecord};
 pub use maintain::{maintain, MaintainOptions, MaintainTrigger};
 
 use alfred_core::request::OwnerRequest;

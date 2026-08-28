@@ -112,6 +112,10 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()>
     let opts = ConverseOptions {
         run_dir: ctx.run_dir.clone(),
         model: ctx.planner_model.clone(),
+        container: alfred_planner::container::PlannerContainerOptions::from_governance(
+            ctx.run_dir.clone(),
+            &run.options,
+        ),
     };
     let outcome = converse(&opts, &run.request, &run.session_doc, &owner_message)?;
     // R6a：对话记录——converse 落定后 append（reviewer 挂载输入数据源，§二.8）。
@@ -180,6 +184,10 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                 &MaintainOptions {
                     run_dir: ctx.run_dir.clone(),
                     model: ctx.planner_model.clone(),
+                    container: alfred_planner::container::PlannerContainerOptions::from_governance(
+                        ctx.run_dir.clone(),
+                        &run.options,
+                    ),
                 },
                 &run.session_doc,
                 MaintainTrigger::PlanReviewed {
