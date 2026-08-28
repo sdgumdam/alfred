@@ -22,6 +22,10 @@ pub struct PlannerTaskGenParams {
     pub output_file: String,
     /// AGT 扩展路径（"/tmp/.agt/agt-policy.ts"）；空串 = 不加载。
     pub agt_ext: String,
+    /// AGT 策略文件容器内路径（"/tmp/.agt/policy.json"）；与 `agt_ext` 同空。
+    pub agt_policy_path: String,
+    /// AGT 审计文件容器内路径（"/tmp/.agt/audit/audit.jsonl"）；与 `agt_ext` 同空。
+    pub agt_audit_path: String,
     /// 桥代理端口基数（每样本自增）。
     pub port_base: u32,
     /// pi 模型（provider/model 形态，如 "inspect-bridge/inspect"）。
@@ -47,6 +51,8 @@ pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String>
         ("__DRIVER_PROMPT_JSON__", json(&params.driver_prompt)?),
         ("__OUTPUT_FILE_JSON__", json(&params.output_file)?),
         ("__AGT_EXT_JSON__", json(&params.agt_ext)?),
+        ("__AGT_POLICY_PATH_JSON__", json(&params.agt_policy_path)?),
+        ("__AGT_AUDIT_PATH_JSON__", json(&params.agt_audit_path)?),
         ("__PORT_BASE__", params.port_base.to_string()),
         ("__PI_MODEL_JSON__", json(&params.pi_model)?),
         ("__WORKSPACE_DIR_JSON__", json(&params.workspace_dir)?),
@@ -72,6 +78,8 @@ pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String>
         "__DRIVER_PROMPT_JSON__",
         "__OUTPUT_FILE_JSON__",
         "__AGT_EXT_JSON__",
+        "__AGT_POLICY_PATH_JSON__",
+        "__AGT_AUDIT_PATH_JSON__",
         "__PORT_BASE__",
         "__PI_MODEL_JSON__",
         "__WORKSPACE_DIR_JSON__",
@@ -103,6 +111,8 @@ mod tests {
             driver_prompt: "读 /inputs，写 /outputs/instructions.json".into(),
             output_file: "/outputs/instructions.json".into(),
             agt_ext: "/tmp/.agt/agt-policy.ts".into(),
+            agt_policy_path: "/tmp/.agt/policy.json".into(),
+            agt_audit_path: "/tmp/.agt/audit/audit.jsonl".into(),
             port_base: 13200,
             pi_model: "inspect-bridge/inspect".into(),
             workspace_dir: "/workspace".into(),
@@ -122,6 +132,8 @@ mod tests {
         assert!(py.contains(r#"PI_MODEL = "inspect-bridge/inspect""#));
         assert!(py.contains(r#"OUTPUT_FILE = "/outputs/instructions.json""#));
         assert!(py.contains(r#"AGT_EXT = "/tmp/.agt/agt-policy.ts""#));
+        assert!(py.contains(r#"AGT_POLICY_PATH = "/tmp/.agt/policy.json""#));
+        assert!(py.contains(r#"AGT_AUDIT_PATH = "/tmp/.agt/audit/audit.jsonl""#));
         // 不得残留 token
         assert!(!py.contains("__COMPOSE_FILE_JSON__"));
         assert!(!py.contains("__MODE_JSON__"));
@@ -129,6 +141,8 @@ mod tests {
         assert!(!py.contains("__DRIVER_PROMPT_JSON__"));
         assert!(!py.contains("__OUTPUT_FILE_JSON__"));
         assert!(!py.contains("__AGT_EXT_JSON__"));
+        assert!(!py.contains("__AGT_POLICY_PATH_JSON__"));
+        assert!(!py.contains("__AGT_AUDIT_PATH_JSON__"));
         assert!(!py.contains("__PORT_BASE__"));
     }
 
@@ -136,11 +150,15 @@ mod tests {
     fn maintain_mode_and_empty_agt() {
         let mut p = params("maintain");
         p.agt_ext = "".into();
+        p.agt_policy_path = "".into();
+        p.agt_audit_path = "".into();
         p.output_file = "/outputs/session.json".into();
         let py = generate_planner_task_py(&p).unwrap();
         assert!(py.contains(r#"MODE = "maintain""#));
         assert!(py.contains(r#"OUTPUT_FILE = "/outputs/session.json""#));
         assert!(py.contains(r#"AGT_EXT = """#));
+        assert!(py.contains(r#"AGT_POLICY_PATH = """#));
+        assert!(py.contains(r#"AGT_AUDIT_PATH = """#));
         // 空 AGT_EXT 时模板的 `if AGT_EXT:` 分支保留（运行期跳过）
         assert!(py.contains("if AGT_EXT:"));
     }

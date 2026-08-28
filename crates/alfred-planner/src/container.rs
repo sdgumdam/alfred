@@ -266,6 +266,10 @@ fn run_planner_container(
             .with_context(|| format!("write planner contract placeholder {}", contract_path.display()))?;
     }
 
+    // AGT 拦写层：拷贝策略 + 扩展到 `<work>/agt/`（策略 ro），审计子目录 rw
+    // （审计 JSONL 落宿主）。None = 不挂 AGT。
+    let agt_work = prepare_agt_work(&work, &opts.agt_dir)?;
+
     // E1/E3：挂载路径必须 canonicalize 成绝对路径（相对路径被 docker 静默变
     // named volume；colima 只共享 ~）。
     let ws_abs = canonicalize_workspace(&ws_dir)?;
@@ -279,7 +283,14 @@ fn run_planner_container(
         .canonicalize()
         .with_context(|| format!("canonicalize planner contract {}", contract_path.display()))?;
 
-    let compose = render_planner_compose(opts, &ws_abs, &inputs_abs, &contract_abs, &outputs_abs)?;
+    let compose = render_planner_compose(
+        opts,
+        &ws_abs,
+        &inputs_abs,
+        &contract_abs,
+        &outputs_abs,
+        agt_work.as_deref(),
+    )?;
     let compose_path = work.join("compose.yaml");
     std::fs::write(&compose_path, compose)
         .with_context(|| format!("write planner compose {}", compose_path.display()))?;
@@ -292,9 +303,13 @@ fn run_planner_container(
         .and_then(|s| s.to_str())
         .unwrap_or("run")
         .to_string();
-    let agt_ext = match &opts.agt_dir {
-        Some(_) => "/tmp/.agt/agt-policy.ts".to_string(),
-        None => String::new(),
+    let (agt_ext, agt_policy_path, agt_audit_path) = match &agt_work {
+        Some(_) => (
+            "/tmp/.agt/agt-policy.ts".to_string(),
+            "/tmp/.agt/policy.json".to_string(),
+            "/tmp/.agt/audit/audit.jsonl".to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
     };
     let task_py_path = work.join("task.py");
     let py = generate_planner_task_py(&PlannerTaskGenParams {
@@ -304,6 +319,8 @@ fn run_planner_container(
         driver_prompt: driver_prompt.to_string(),
         output_file: output_file.to_string(),
         agt_ext,
+        agt_policy_path,
+        agt_audit_path,
         port_base: opts.port_base,
         pi_model: "inspect-bridge/inspect".to_string(),
         workspace_dir: "/workspace".to_string(),
@@ -366,12 +383,15 @@ fn run_planner_container(
 /// 渲染 planner compose：R6a 模板占位符 → canonicalize 后绝对路径。
 ///
 /// AGT 目录为 None 时移除 `/tmp/.agt` 挂载行（最小环境不挂拦写层）。
+/// AGT 为 Some 时追加审计子目录 rw 挂载（`/tmp/.agt/audit` rw——agent 可写审计
+/// 但不可改策略，R6a 拆分挂载语义，与 reviewer 容器一致）。
 fn render_planner_compose(
     opts: &PlannerContainerOptions,
     ws_abs: &Path,
     inputs_abs: &Path,
     contract_abs: &Path,
     outputs_abs: &Path,
+    agt_work: Option<&Path>,
 ) -> Result<String> {
     let mut out = PLANNER_COMPOSE_TMPL
         .replace("{ws}", &ws_abs.display().to_string())
@@ -384,12 +404,17 @@ fn render_planner_compose(
             &format!("image: \"{}\"", opts.image),
         );
 
-    match &opts.agt_dir {
+    match agt_work {
         Some(agt) => {
             let agt_abs = agt
                 .canonicalize()
                 .with_context(|| format!("canonicalize planner agt dir {}", agt.display()))?;
             out = out.replace("{agt_dir}", &agt_abs.display().to_string());
+            // 审计子目录 rw：追加到 volumes 列表（策略目录 ro + 审计 rw 拆开挂载）。
+            out.push_str(&format!(
+                "\n    - {}/audit:/tmp/.agt/audit:rw",
+                agt_abs.display()
+            ));
         }
         None => {
             // 移除 AGT 卷行（占位符先清卷行再清注释里的占位符）
@@ -399,6 +424,34 @@ fn render_planner_compose(
     }
 
     Ok(out)
+}
+
+/// AGT 拦写层准备：拷贝源 agt 目录（agt-policy.ts + policy.json）到 `<work>/agt/`，
+/// 建审计子目录 `audit/`（rw 挂载源）。None → 不挂 AGT。
+fn prepare_agt_work(work: &Path, agt_dir: &Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(src) = agt_dir else {
+        return Ok(None);
+    };
+    let dest = work.join("agt");
+    std::fs::create_dir_all(&dest)
+        .with_context(|| format!("create planner agt dir {}", dest.display()))?;
+    std::fs::create_dir_all(dest.join("audit"))
+        .with_context(|| format!("create planner agt audit dir {}", dest.join("audit").display()))?;
+    std::fs::copy(src.join("agt-policy.ts"), dest.join("agt-policy.ts")).with_context(|| {
+        format!(
+            "copy agt extension {} -> {}",
+            src.join("agt-policy.ts").display(),
+            dest.join("agt-policy.ts").display()
+        )
+    })?;
+    std::fs::copy(src.join("policy.json"), dest.join("policy.json")).with_context(|| {
+        format!(
+            "copy agt policy {} -> {}",
+            src.join("policy.json").display(),
+            dest.join("policy.json").display()
+        )
+    })?;
+    Ok(Some(dest))
 }
 
 /// 内嵌 planner compose 模板（R6a 落码，唯一真源）。
@@ -431,7 +484,8 @@ mod tests {
 
     #[test]
     fn render_compose_mounts_planner_matrix() {
-        // 矩阵 §1.1 planner 行：ws 全量 ro + request/session/contract ro + outputs rw + AGT ro
+        // 矩阵 §1.1 planner 行：ws 全量 ro + request/session/contract ro + outputs rw
+        // + AGT 策略 ro + 审计子目录 rw
         let o = opts("matrix");
         let work = o.run_dir.join(PLANNER_WORK_DIR);
         let inputs = work.join(INPUTS_DIR);
@@ -444,19 +498,23 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let contract = o.run_dir.join("contract.json");
         std::fs::write(&contract, "{}").unwrap();
-        let agt = o.run_dir.join(".agt");
-        std::fs::create_dir_all(&agt).unwrap();
+        let agt_src = o.run_dir.join(".agt");
+        std::fs::create_dir_all(&agt_src).unwrap();
+        std::fs::write(agt_src.join("agt-policy.ts"), "// fake ext").unwrap();
+        std::fs::write(agt_src.join("policy.json"), "{}").unwrap();
 
         let o2 = PlannerContainerOptions {
-            agt_dir: Some(agt.clone()),
+            agt_dir: Some(agt_src.clone()),
             ..o
         };
+        let agt_work = prepare_agt_work(&work, &o2.agt_dir).unwrap().unwrap();
         let yaml = render_planner_compose(
             &o2,
             &ws.canonicalize().unwrap(),
             &inputs.canonicalize().unwrap(),
             &contract.canonicalize().unwrap(),
             &outputs.canonicalize().unwrap(),
+            Some(&agt_work),
         )
         .unwrap();
         // ws 全量 ro
@@ -480,10 +538,17 @@ mod tests {
             yaml.contains(&format!("{}:/outputs", outputs.canonicalize().unwrap().display())),
             "outputs mount missing:\n{yaml}"
         );
-        // AGT ro
+        // AGT 策略 ro + 审计子目录 rw
         assert!(
-            yaml.contains(&format!("{}:/tmp/.agt:ro", agt.canonicalize().unwrap().display())),
+            yaml.contains(&format!("{}:/tmp/.agt:ro", agt_work.canonicalize().unwrap().display())),
             "agt ro mount missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(&format!(
+                "{}/audit:/tmp/.agt/audit:rw",
+                agt_work.canonicalize().unwrap().display()
+            )),
+            "agt audit rw mount missing:\n{yaml}"
         );
         assert!(yaml.contains("network_mode: none"), "network none missing:\n{yaml}");
         cleanup(&o2.run_dir);
@@ -510,6 +575,7 @@ mod tests {
             &inputs.canonicalize().unwrap(),
             &contract.canonicalize().unwrap(),
             &outputs.canonicalize().unwrap(),
+            None,
         )
         .unwrap();
         assert!(
@@ -544,6 +610,7 @@ mod tests {
             &inputs.canonicalize().unwrap(),
             &contract.canonicalize().unwrap(),
             &outputs.canonicalize().unwrap(),
+            None,
         )
         .unwrap();
         assert!(yaml.contains("custom-image:v3"), "image not replaced:\n{yaml}");

@@ -46,6 +46,8 @@ SYSTEM_PROMPT = __SYSTEM_PROMPT_JSON__
 DRIVER_PROMPT = __DRIVER_PROMPT_JSON__
 OUTPUT_FILE = __OUTPUT_FILE_JSON__
 AGT_EXT = __AGT_EXT_JSON__
+AGT_POLICY_PATH = __AGT_POLICY_PATH_JSON__
+AGT_AUDIT_PATH = __AGT_AUDIT_PATH_JSON__
 PORT_BASE = int(__PORT_BASE__)
 PI_MODEL = __PI_MODEL_JSON__
 WORKSPACE_DIR = __WORKSPACE_DIR_JSON__
@@ -173,6 +175,11 @@ def planner_agent():
             sbox = sandbox()
             await _write_models_json(sbox, port)
 
+            env = {"PI_OFFLINE": "1", "HOME": "/root"}
+            if AGT_EXT:
+                env["AGT_POLICY_PATH"] = AGT_POLICY_PATH
+                env["AGT_AUDIT_PATH"] = AGT_AUDIT_PATH
+
             cmd = ["pi", "--mode", "rpc", "--no-session", "--model", PI_MODEL]
             if AGT_EXT:
                 cmd += ["-e", AGT_EXT]
@@ -180,7 +187,7 @@ def planner_agent():
                 cmd=cmd,
                 options=ExecRemoteStreamingOptions(
                     cwd=WORKSPACE_DIR,
-                    env={"PI_OFFLINE": "1", "HOME": "/root"},
+                    env=env,
                     user=SANDBOX_USER or None,
                     concurrency=False,
                     stdin_open=True,
