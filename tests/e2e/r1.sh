@@ -78,9 +78,9 @@ cargo run --quiet -p alfred-cli -- run \
 
 # --- 6. 校验产物（R6e 布局：run 级单一 ws，产物在 ws/src/——executor 首个
 #    workspace_subdirs 挂 /workspace） ---
-EXEC_DIR="$(ls -d "$RUN_DIR"/exec-* 2>/dev/null | sort -V | tail -1 || true)"
+EXEC_DIR="$(ls -d "$RUN_DIR"/exec-[0-9]* 2>/dev/null | sort -V | tail -1 || true)"
 if [[ -z "$EXEC_DIR" ]]; then
-  echo "FAIL: no exec-* dir in $RUN_DIR" >&2
+  echo "FAIL: no exec-N dir in $RUN_DIR" >&2
   echo "--- run_dir 内容 ---" >&2
   find "$RUN_DIR" -maxdepth 2 -type f | sed "s|$REPO_ROOT/||" >&2
   exit 1

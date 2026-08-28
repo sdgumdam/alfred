@@ -11,7 +11,8 @@
 #
 #   1) 真容器真 LLM（需 docker 沙箱镜像 alfred-executor:latest + 
 #      ~/.config/alfred/config.yml 模型凭据；容器 network none + 只挂 workspace）：
-#        - r1        : 容器内 pi 执行 hello.txt → 产物落宿主 + evals/ 证据归档
+#        - r2 case1/1b: 执行审查（reviewer 容器判 C / 离线回退升级挂起）
+#        - r3 case1  : 正路径全环（真规划 → 计划审查 → 真容器执行 → 验收 C → Completed）
 #        - r2 case1/1b: 执行审查（scorer 判 C / P 部分兑现）
 #        - r3 case1  : 正路径全环（真规划 → 计划审查 → 真容器执行 → 验收 C → Completed）
 #        - escape    : 纯容器边界两向验证（无 LLM）
@@ -20,7 +21,7 @@
 #      绕过 planner LLM；计划/执行审查仍走真 LLM）：
 #        - r2 case2/3 : 计划审查（注定不忠实打回 / 解析失败 unscored）
 #        - r3 case2/3/4: 机械升级闭环 / 打回伪装闭环 / 多轮会话文档
-#        - r4 case1/2 : 决策面板（escalated→abandon / plan_rejected→retry→Completed）
+#        - r4 case1/2 : 决策面板（escalated→abandon / plan_rejected→retry→重规划→执行审查离线回退→Escalated）
 #
 #   3) 确定性（无 LLM、无容器）：
 #        - agt : AGT 策略求值原型（node 直测 policy 语义；agt/demo.sh 实机
@@ -51,11 +52,18 @@ for step in "${STEPS[@]}"; do
   log="$LOG_DIR/$step.log"
   echo "=== [$step] ==="
   if [[ "$step" == "agt" ]]; then
-    node tests/e2e/agt/agt-policy.test.mjs >"$log" 2>&1
+    if node tests/e2e/agt/agt-policy.test.mjs >"$log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
   else
-    bash "tests/e2e/$step.sh" >"$log" 2>&1
+    if bash "tests/e2e/$step.sh" >"$log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
   fi
-  rc=$?
   elapsed="$(( $(date +%s) - start ))"
   TIMES+=("$step ${elapsed}s")
   if [[ $rc -eq 0 ]]; then
@@ -77,6 +85,6 @@ if [[ ${#FAILED[@]} -eq 0 ]]; then
   exit 0
 fi
 echo "  结果: FAILED — ${FAILED[*]}"
-echo "  日志 : $LOG_DIR（逐个看 <step>.log 尾部）"
+echo "  日志 : ${LOG_DIR}（逐个看 <step>.log 尾部）"
 echo "============================================="
 exit 1
