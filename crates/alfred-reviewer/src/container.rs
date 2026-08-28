@@ -288,7 +288,7 @@ fn plan_review_inputs(
 
 /// 执行审查输入落盘：request / 契约全字段 / 对话记录（+ session/dagspec 占位，
 /// 模板要求这些文件存在但执行审查不读）。
-fn exec_review_inputs(
+pub(crate) fn exec_review_inputs(
     request: &OwnerRequest,
     contract: &Contract,
     conversation: Option<&ConversationLog>,
