@@ -63,6 +63,7 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 - begin 必须最先，commit 必须最后，且至少一个节点。
 - 每个节点的 contract.prompt 与 acceptance_criteria 必须非空。
 - 每个节点必须声明非空 workspace_subdirs（sandbox.workspace_subdirs，工作区子目录列表，如 ["src"]）：声明的是该节点可见/可写的工作区范围（节点只能看到这些子目录），这是强制约束；空/缺省声明 = 计划不合格。挂载语义：首个子目录挂为该节点工作区根 /workspace，其余子目录挂为 /workspace/<子目录>。
+- workspace_subdirs 必须声明具体子目录名：按任务产物位置声明（如任务写 src/ 下则声明 ["src"]）；禁止声明 "."（工作区根，挂载语义下根由系统接管，声明子目录必须是具体相对目录）；禁止声明与挂载根同名的目录名（如 "workspace"，避免嵌套歧义）；任务描述（contract.prompt）里"根目录"措辞应与声明的子目录一致（首个子目录即该节点工作区根 /workspace）。
 - 默认用缺省沙箱（volumes 空、runtime null、packages 空、network false），workspace_subdirs 按上条必须非空；除非任务确实需要，才声明额外权限。
 - 计划必须忠实反映属主需求，不要做属主没要求的事。
 - 只输出 JSON 数组，不要任何多余文字。"#;
@@ -403,10 +404,54 @@ mod tests {
             system.contains("workspace_subdirs"),
             "system prompt must mention workspace_subdirs: {system}"
         );
+
         // add_node 示例本身带 workspace_subdirs 声明（执行者可见子集）
         assert!(
             system.contains("\"workspace_subdirs\":[\"src\"]"),
             "add_node example must declare workspace_subdirs: {system}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_banishes_root_and_mount_root_subdir_names() {
+        // R6f(补)：规划器提示词必须收敛 workspace_subdirs 命名——禁止声明 "."
+        // （工作区根，挂载语义下根由系统接管）与挂载根同名目录（如 "workspace"，
+        // 嵌套歧义），并提示按任务产物位置声明具体子目录。实测边界：["."] 被
+        // executor validate_workspace_subdir 以 CurDir 拒绝；["workspace"] 产生
+        // ws/workspace 嵌套；["src"] + "in the workspace" → 正确落 ws/src/hello.txt。
+        let msgs = build_messages(&request(), &SessionDoc::new(), "属主：继续");
+        let system = &msgs[0].content;
+        // 禁止声明 "."（工作区根）
+        assert!(
+            system.contains("禁止声明 \".\""),
+            "system prompt must ban '.' as workspace_subdirs: {system}"
+        );
+        assert!(
+            system.contains("根由系统接管"),
+            "system prompt must explain root is system-managed: {system}"
+        );
+        // 禁止声明与挂载根同名的目录名（嵌套歧义）
+        assert!(
+            system.contains("禁止声明与挂载根同名"),
+            "system prompt must ban mount-root-identical subdir names: {system}"
+        );
+        assert!(
+            system.contains("\"workspace\""),
+            "system prompt must name the mount-root collision example: {system}"
+        );
+        // 提示按任务产物位置声明具体子目录名
+        assert!(
+            system.contains("必须声明具体子目录名"),
+            "system prompt must require concrete subdir names: {system}"
+        );
+        assert!(
+            system.contains("按任务产物位置声明"),
+            "system prompt must advise declaring by artifact location: {system}"
+        );
+        // contract.prompt 里"根目录"措辞应与声明的子目录一致（首个子目录即工作区根）
+        assert!(
+            system.contains("\"根目录\"措辞应与声明的子目录一致"),
+            "system prompt must align root-dir wording with declared subset: {system}"
         );
     }
 
