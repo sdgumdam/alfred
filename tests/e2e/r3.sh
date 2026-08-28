@@ -74,10 +74,10 @@ assert st == sys.argv[2], f"state={st}, expected {sys.argv[2]}"
 PY
 }
 
-# 找最后一个 exec-N 目录（execution_count 跨周期单调递增）
+# R6e：执行产物落 run 级单一 ws 的 workspace_subdirs 首目录（executor 首个
+# workspace_subdirs 挂 /workspace）——`<run>/ws/<sub>`，不再有 exec-N/workspace。
 last_exec_ws() { # <run_dir>
-  local run_dir="$1"
-  ls -d "$run_dir"/exec-* 2>/dev/null | sort -V | tail -1 | xargs -I{} echo "{}/workspace"
+  echo "$1/ws/src"
 }
 
 # ============================================================================
@@ -104,10 +104,10 @@ cargo run --quiet -p alfred-cli -- run \
   --image "$IMAGE"
 
 assert_state "$CASE1_DIR" "completed"
-# 产物 + 执行审查 C
-HELLO="$CASE1_DIR/exec-1/workspace/hello.txt"
+# 产物 + 执行审查 C（R6e：产物在 run 级 ws/src）
+HELLO="$CASE1_DIR/ws/src/hello.txt"
 if [[ ! -f "$HELLO" ]] || [[ "$(cat "$HELLO")" != "Hello" ]]; then
-  echo "FAIL(case1): workspace hello.txt missing/wrong content" >&2
+  echo "FAIL(case1): ws/src hello.txt missing/wrong content" >&2
   exit 1
 fi
 python3 - "$CASE1_DIR/state.json" <<'PY' || { echo "FAIL(case1): exec verdict not C" >&2; exit 1; }
@@ -154,6 +154,13 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
         "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
         "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -192,7 +199,7 @@ assert_state "$CASE2_DIR" "completed"
 HELLO2="$(last_exec_ws "$CASE2_DIR")/hello.txt"
 if [[ ! -f "$HELLO2" ]] || [[ "$(cat "$HELLO2")" != "Hello" ]]; then
   echo "FAIL(case2): decide retry 后 hello.txt 未产出（$(last_exec_ws "$CASE2_DIR")）" >&2
-  ls "$CASE2_DIR"/exec-*/workspace/ 2>/dev/null >&2
+  ls "$CASE2_DIR"/ws/ 2>/dev/null >&2
   exit 1
 fi
 python3 - "$CASE2_DIR/state.json" <<'PY' || { echo "FAIL(case2): decide retry 后无新 exec verdict" >&2; exit 1; }
@@ -231,6 +238,13 @@ cat > "$CASE3_DIR/plan-unfaithful.json" <<'JSON'
         "prompt": "Create a file named world.txt in the workspace. Its content must be exactly: World",
         "acceptance_criteria": "world.txt exists in the workspace and its content is exactly 'World'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -247,6 +261,13 @@ cat > "$CASE3_DIR/plan-faithful.json" <<'JSON'
         "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
         "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -340,6 +361,13 @@ cat > "$CASE4_DIR/plan-unfaithful.json" <<'JSON'
         "prompt": "Create a file named world.txt in the workspace. Its content must be exactly: World",
         "acceptance_criteria": "world.txt exists in the workspace and its content is exactly 'World'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -356,6 +384,13 @@ cat > "$CASE4_DIR/plan-faithful.json" <<'JSON'
         "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
         "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]

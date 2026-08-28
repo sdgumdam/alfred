@@ -74,9 +74,10 @@ cargo run --quiet -p alfred-cli -- run \
   --request "$REQUEST" \
   --run-dir "$RUN_DIR" \
   --time-limit "${R1_TIME_LIMIT:-600}" \
-  --image "$IMAGE"
+  --image "$IMAGE" \
 
-# --- 6. 校验产物（R3 布局：执行产物在最新 exec-N/workspace/） ---
+# --- 6. 校验产物（R6e 布局：run 级单一 ws，产物在 ws/src/——executor 首个
+#    workspace_subdirs 挂 /workspace） ---
 EXEC_DIR="$(ls -d "$RUN_DIR"/exec-* 2>/dev/null | sort -V | tail -1 || true)"
 if [[ -z "$EXEC_DIR" ]]; then
   echo "FAIL: no exec-* dir in $RUN_DIR" >&2
@@ -84,13 +85,14 @@ if [[ -z "$EXEC_DIR" ]]; then
   find "$RUN_DIR" -maxdepth 2 -type f | sed "s|$REPO_ROOT/||" >&2
   exit 1
 fi
-if [[ ! -f "$EXEC_DIR/workspace/hello.txt" ]]; then
-  echo "FAIL: $EXEC_DIR/workspace/hello.txt not found" >&2
+WS_HELLO="$RUN_DIR/ws/src/hello.txt"
+if [[ ! -f "$WS_HELLO" ]]; then
+  echo "FAIL: $WS_HELLO not found" >&2
   echo "--- run_dir 内容 ---" >&2
-  find "$RUN_DIR" -maxdepth 2 -type f | sed "s|$REPO_ROOT/||" >&2
+  find "$RUN_DIR" -maxdepth 3 -type f | sed "s|$REPO_ROOT/||" >&2
   exit 1
 fi
-CONTENT="$(cat "$EXEC_DIR/workspace/hello.txt")"
+CONTENT="$(cat "$WS_HELLO")"
 if [[ "$CONTENT" != "Hello" ]]; then
   echo "FAIL: hello.txt content is '$CONTENT', expected 'Hello'" >&2
   exit 1

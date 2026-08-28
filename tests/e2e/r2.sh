@@ -81,14 +81,13 @@ cargo run --quiet -p alfred-cli -- run \
   --time-limit "${R2_TIME_LIMIT:-900}" \
   --image "$IMAGE"
 
-# 断言：hello.txt 内容 + exec verdict C（R3 布局：产物在 exec-N/workspace/，
+# 断言：hello.txt 内容 + exec verdict C（R6e：产物在 run 级 ws/src/，
 # state.json 为治理环状态）
-EXEC1="$(ls -d "$CASE1_DIR"/exec-* 2>/dev/null | sort -V | tail -1 || true)"
-if [[ -z "$EXEC1" ]] || [[ ! -f "$EXEC1/workspace/hello.txt" ]]; then
-  echo "FAIL(case1): exec-N/workspace/hello.txt not found (exec=$EXEC1)" >&2
+if [[ ! -f "$CASE1_DIR/ws/src/hello.txt" ]]; then
+  echo "FAIL(case1): run 级 ws/src/hello.txt not found" >&2
   exit 1
 fi
-[[ "$(cat "$EXEC1/workspace/hello.txt")" == "Hello" ]] || { echo "FAIL(case1): hello.txt content wrong" >&2; exit 1; }
+[[ "$(cat "$CASE1_DIR/ws/src/hello.txt")" == "Hello" ]] || { echo "FAIL(case1): hello.txt content wrong" >&2; exit 1; }
 python3 - "$CASE1_DIR/state.json" <<'PY' || { echo "FAIL(case1): exec verdict not C" >&2; exit 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -131,6 +130,13 @@ cat > "$CASE1B_DIR/plan-faithful.json" <<'JSON'
         "prompt": "Create exactly ONE file named hello.txt in the workspace. Its content must be exactly: Hello. Do NOT create any other file.",
         "acceptance_criteria": "Acceptance requires BOTH files to exist in the workspace: (1) hello.txt, AND (2) world.txt. Satisfying ONLY requirement (1) — hello.txt exists but world.txt does not — counts as PARTIAL fulfillment: grade P, not C. Satisfying neither counts as I.",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -186,6 +192,13 @@ cat > "$CASE2_DIR/dagspec.json" <<'JSON'
         "prompt": "Create a file named world.txt with content World",
         "acceptance_criteria": "world.txt exists with content World",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]

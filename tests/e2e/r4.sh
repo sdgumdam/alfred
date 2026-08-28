@@ -140,6 +140,13 @@ cat > "$CASE1_DIR/plan-faithful.json" <<'JSON'
         "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
         "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -190,6 +197,13 @@ cat > "$CASE2_DIR/plan-unfaithful.json" <<'JSON'
         "prompt": "Create a file named world.txt in the workspace. Its content must be exactly: World",
         "acceptance_criteria": "world.txt exists in the workspace and its content is exactly 'World'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -206,6 +220,13 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
         "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
         "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -228,10 +249,10 @@ cargo run --quiet -p alfred-cli -- panel \
   --run-dir "$CASE2_DIR" \
   --timeout "$PANEL_TL"
 assert_state "$CASE2_DIR" "completed"
-HELLO2="$CASE2_DIR/exec-1/workspace/hello.txt"
+HELLO2="$CASE2_DIR/ws/src/hello.txt"
 if [[ ! -f "$HELLO2" ]] || [[ "$(cat "$HELLO2")" != "Hello" ]]; then
-  echo "FAIL(case2): exec-1 workspace hello.txt missing/wrong" >&2
-  ls "$CASE2_DIR"/exec-*/workspace/ 2>/dev/null >&2
+  echo "FAIL(case2): run 级 ws/src hello.txt missing/wrong" >&2
+  ls "$CASE2_DIR"/ws/ 2>/dev/null >&2
   exit 1
 fi
 assert_panel_session "$CASE2_DIR" "重跑"
