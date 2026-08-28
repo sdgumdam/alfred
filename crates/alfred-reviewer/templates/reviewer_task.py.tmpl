@@ -8,7 +8,7 @@ no real credentials: pi's `~/.pi/agent/models.json` points at the bridge proxy
 with a dummy `sk-none` key.
 
 MODE == "plan_review": pi reads /inputs/{request.json, dagspec.json, session.json,
-  conversation.json, contract.json, owner_message.txt}, judges whether the DagSpec
+  conversation.json, contract.json}, judges whether the DagSpec
   faithfully serves the OwnerRequest, and writes the plan verdict JSON to
   /outputs/verdict.json.
 MODE == "exec_review": pi reads /inputs/{request.json, contract.json,

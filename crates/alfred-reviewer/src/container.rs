@@ -6,7 +6,7 @@
 //!
 //! 流程（照 R6b planner 容器驱动模式）：
 //!   1. 输入落盘：request / dagspec（计划审查）/ session（全源，非投影）/
-//!      conversation / contract / owner_message 写到 `<work>/inputs/`。
+//!      conversation / contract 写到 `<work>/inputs/`。
 //!   2. 渲染 `reviewer.compose.yaml.tmpl`（ws 全量 ro + 对话记录 + 契约全字段
 //!      + AGT 拦写层 ro + 输出卷 rw）→ 生成 reviewer task.py
 //!      （`templates/reviewer_task.py.tmpl`，token 注入）→ spawn
@@ -131,11 +131,10 @@ pub fn run_plan_review_in_container(
     request: &OwnerRequest,
     dagspec: &DagSpec,
     session_doc: Option<&SessionDoc>,
-    owner_message: Option<&str>,
     conversation: Option<&ConversationLog>,
     ws_dir: &Path,
 ) -> Result<ContainerRunOutput> {
-    let inputs = plan_review_inputs(request, dagspec, session_doc, owner_message, conversation)?;
+    let inputs = plan_review_inputs(request, dagspec, session_doc, conversation)?;
     run_reviewer_container(
         opts,
         model,
@@ -194,7 +193,6 @@ pub const PLAN_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把计划审查结
 - /inputs/session.json —— 会话文档（记忆，JSON 对象：key_file_paths / key_conclusions / review_summary）
 - /inputs/conversation.json —— 属主↔规划器对话记录（JSON 对象，turns[] 含 role/content/source）
 - /inputs/contract.json —— 计划节点的契约（JSON 对象，prompt + acceptance_criteria）
-- /inputs/owner_message.txt —— 属主最新消息（文本；可能不存在）
 - /workspace —— 工作区全量（只读；可按需跨查计划引用的文件是否存在）
 
 按上面 SYSTEM_PROMPT 的规则判忠实度，把结论写入 /outputs/verdict.json。
@@ -241,12 +239,11 @@ pub const EXEC_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把执行审查结
 写完即结束。"#;
 
 /// 计划审查输入落盘（R6a 模板约定）：request / dagspec / 会话文档全源 / 对话记录 /
-/// 契约全字段 / 属主消息。
+/// 契约全字段。
 fn plan_review_inputs(
     request: &OwnerRequest,
     dagspec: &DagSpec,
     session_doc: Option<&SessionDoc>,
-    owner_message: Option<&str>,
     conversation: Option<&ConversationLog>,
 ) -> Result<Vec<(String, String)>> {
     let session = match session_doc {
@@ -267,7 +264,7 @@ fn plan_review_inputs(
         .transpose()?
         .unwrap_or_else(|| "{}".to_string());
 
-    let mut files = vec![
+    let files = vec![
         (
             "request.json".to_string(),
             serde_json::to_string_pretty(request).context("serialize OwnerRequest")?,
@@ -280,9 +277,6 @@ fn plan_review_inputs(
         ("conversation.json".to_string(), conv),
         ("contract.json".to_string(), contract),
     ];
-    if let Some(m) = owner_message {
-        files.push(("owner_message.txt".to_string(), m.to_string()));
-    }
     Ok(files)
 }
 
@@ -743,12 +737,11 @@ mod tests {
             "原始需求",
             alfred_core::conversation::ConversationSource::RequestSubmit,
         );
-        let inputs = plan_review_inputs(&req, &dag, Some(&doc), Some("继续"), Some(&conv)).unwrap();
+        let inputs = plan_review_inputs(&req, &dag, Some(&doc), Some(&conv)).unwrap();
         let files: std::collections::HashMap<String, String> = inputs.into_iter().collect();
         assert!(files.contains_key("request.json"));
         assert!(files.contains_key("dagspec.json"));
         assert!(files.contains_key("conversation.json"));
-        assert_eq!(files["owner_message.txt"], "继续");
         // session 全源：保留 review_summary 原名（非投影 owner_feedback）
         let session: serde_json::Value = serde_json::from_str(&files["session.json"]).unwrap();
         assert!(
