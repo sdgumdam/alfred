@@ -111,6 +111,13 @@ JSON
         "prompt": "Create a file named world.txt with content World",
         "acceptance_criteria": "world.txt exists with content World",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
@@ -154,6 +161,13 @@ JSON
         "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
         "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]

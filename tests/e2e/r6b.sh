@@ -96,6 +96,13 @@ JSON
         "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
         "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
         "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
       }
     }
   ]
