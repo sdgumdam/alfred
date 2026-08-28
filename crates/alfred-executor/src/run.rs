@@ -15,7 +15,10 @@ use alfred_core::util::{now_rfc3339, short_id};
 use serde::Serialize;
 
 use crate::artifact::{collect_artifact, snapshot_workspace};
-use crate::compose_gen::{canonicalize_workspace, generate_compose, CONTAINER_WORKSPACE_DIR};
+use crate::compose_gen::{
+    canonicalize_workspace, generate_executor_compose, validate_workspace_subdir, ExecutorMounts,
+    CONTAINER_WORKSPACE_DIR,
+};
 use crate::config::ExecutorModel;
 use crate::driver::{archive_eval_log, poll_until_done, spawn_eval, PollOutcome};
 use crate::task_gen::{generate_task_py, TaskGenParams};
@@ -25,6 +28,9 @@ use crate::task_gen::{generate_task_py, TaskGenParams};
 pub struct RunOptions {
     /// 运行目录（宿主，须位于 ~ 之下——E3）。
     pub run_dir: PathBuf,
+    /// 工作区宿主目录（R6e：run 级单一持久 ws `<run>/ws`）。空 = 回退
+    /// `run_dir/workspace`（旧 per-exec-N 布局，兼容独立调用/测试）。
+    pub workspace_dir: PathBuf,
     /// 沙箱镜像。
     pub image: String,
     /// 契约（prompt + acceptance_criteria）。
@@ -43,6 +49,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             run_dir: PathBuf::new(),
+            workspace_dir: PathBuf::new(),
             image: "alfred-executor:latest".to_string(),
             assignment: TaskAssignment::new(
                 "task-unset",
@@ -86,6 +93,77 @@ pub fn default_run_dir() -> PathBuf {
     base.join(short_id("run"))
 }
 
+/// R6e：解析执行工作区宿主目录。显式 `workspace_dir` 优先；空（未设）回退
+/// `run_dir/workspace`（旧 per-exec-N 布局，兼容独立调用/测试）。
+pub fn resolve_workspace_dir(run_dir: &Path, workspace_dir: &Path) -> PathBuf {
+    if workspace_dir.as_os_str().is_empty() {
+        run_dir.join("workspace")
+    } else {
+        workspace_dir.to_path_buf()
+    }
+}
+
+/// R6e：治理 run 初始化单一持久 ws（`<run>/ws` + git init 基线快照）。
+/// 三容器共享此 ws：executor 产物 rw、planner/reviewer 全量 ro（reviewer 自己
+/// 看 git diff 基线）。幂等——`<run>/ws` 已 git 初始化则直接返回。
+pub fn ensure_run_workspace(run_dir: &Path) -> Result<PathBuf> {
+    let ws = run_dir.join("ws");
+    std::fs::create_dir_all(&ws).with_context(|| format!("create run ws {}", ws.display()))?;
+    init_workspace_git(&ws)?;
+    Ok(ws)
+}
+
+/// R6e：把 ws 初始化为 git 仓库并提交基线空提交（diff 基线）。
+///
+/// 幂等：`<dir>/.git` 已存在则直接返回（不重复 init/commit）。基线 = 空提交
+/// （`git init` 后 `commit --allow-empty`）：executor 之后的改动（未跟踪新建/
+/// 已跟踪修改）相对基线可见；reviewer 容器挂 ws 全量 ro，用只读 git 命令
+/// （status/diff/log）对照基线看执行者改了什么。
+pub fn init_workspace_git(dir: &Path) -> Result<()> {
+    if dir.join(".git").exists() {
+        return Ok(());
+    }
+    let run_git = |args: &[&str]| -> Result<()> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "alfred")
+            .env("GIT_AUTHOR_EMAIL", "alfred@local")
+            .env("GIT_COMMITTER_NAME", "alfred")
+            .env("GIT_COMMITTER_EMAIL", "alfred@local")
+            .output()
+            .with_context(|| format!("git {} in {}", args.join(" "), dir.display()))?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed in {}: {}",
+                args.join(" "),
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+    run_git(&["init", "-q"])?;
+    run_git(&["commit", "--allow-empty", "-q", "-m", "R6e baseline: run 级单一 ws 基线快照"])?;
+    Ok(())
+}
+
+/// 校验 executor 沙箱档案（R6e）：仅允许契约声明的 `workspace_subdirs` 子集挂载
+/// （M5 显式声明制）。volumes/runtime/packages/network 执行驱动尚不支持——按审计
+/// 约束显式拒绝而非静默忽略，防止"申请的约束没生效"。
+fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
+    if !sandbox.volumes.is_empty()
+        || sandbox.runtime.is_some()
+        || !sandbox.packages.is_empty()
+        || sandbox.network
+    {
+        bail!(
+            "executor 沙箱档案不支持 volumes/runtime/packages/network（当前 sandbox={sandbox:?}）；仅支持 workspace_subdirs 子集挂载"
+        );
+    }
+    Ok(())
+}
+
 ///
 /// R6d：执行 eval 只出产物——不再绑定 grader（内嵌 scorer 已移除，执行审查
 /// 由 reviewer 容器承担，见 governance exec_review_step）。
@@ -94,14 +172,10 @@ pub fn execute_run(
     model: &ExecutorModel,
     request: &OwnerRequest,
 ) -> Result<RunOutcome> {
-    // 沙箱档案校验：R1 只支持默认档案（无挂卷 / 无 runtime / 无依赖 / 联网拒绝）。
-    // 非默认档案此前被静默忽略——按审计约束改为显式拒绝，防止"申请的约束没生效"。
-    if opts.assignment.sandbox != SandboxProfile::default() {
-        bail!(
-            "R1 不支持非默认沙箱档案（当前 sandbox={:?}）；仅支持默认档案（volumes 空、runtime 无、packages 空、network=false）",
-            opts.assignment.sandbox
-        );
-    }
+    // 沙箱档案校验（R6e）：executor 支持契约声明的 workspace_subdirs 子集挂载
+    // （M5 显式声明制）；volumes/runtime/packages/network 显式拒绝（审计约束：
+    // 防止"申请的约束没生效"）。见 validate_executor_sandbox。
+    validate_executor_sandbox(&opts.assignment.sandbox)?;
     let started_at = now_rfc3339();
     let run_id = match opts.run_dir.file_name().and_then(|s| s.to_str()) {
         Some(name) => name.to_string(),
@@ -112,17 +186,35 @@ pub fn execute_run(
 
     // 1) 目录与工作区（须先于 compose 生成存在）
     std::fs::create_dir_all(run_dir).with_context(|| format!("create run dir {}", run_dir.display()))?;
-    let workspace_host = run_dir.join("workspace");
+    // R6e：工作区 = run 级单一持久 ws（治理环传 `<run>/ws`；空 = 旧 per-exec-N 布局兜底）。
+    let workspace_host = resolve_workspace_dir(run_dir, &opts.workspace_dir);
     std::fs::create_dir_all(&workspace_host)?;
+    // R6e：契约声明的 workspace_subdirs 先建目录（空目录 = 执行者工作区根/可见子集）。
+    // 校验与 compose 生成共用 validate_workspace_subdir（单一真源）；挂载点父目录 rw，
+    // 执行者可在其下动态新建子目录（新建即宿主可见/git 可见）。
+    for sub in &opts.assignment.sandbox.workspace_subdirs {
+        validate_workspace_subdir(sub)?;
+        std::fs::create_dir_all(workspace_host.join(sub))
+            .with_context(|| format!("create workspace subdir {}", workspace_host.join(sub).display()))?;
+    }
     std::fs::create_dir_all(&evals_dir)?;
     canonicalize_workspace(&workspace_host)?;
+    // R6e：git 基线（幂等）——executor 改动相对基线可见，reviewer 挂 ws 全量 ro 自己看 git diff。
+    init_workspace_git(&workspace_host)?;
 
     // 2) 执行前工作区快照（文件比对基线）
     let before = snapshot_workspace(&workspace_host)?;
 
     // 3) 生成 compose + task.py
     let compose_path = run_dir.join("executor.compose.yaml");
-    let compose = generate_compose(&workspace_host, &opts.image)?;
+    // R6e：executor 容器挂载 = workspace_subdirs 声明子集（rw），非全量 ws（M5 显式
+    // 声明制；空 subdirs = 不挂 ws）。参考卷/AGT 挂载留待后续块（当前 sandbox 校验
+    // 已拒绝 volumes；AGT 未接入 run 路径）。
+    let mounts = ExecutorMounts {
+        workspace_subdirs: opts.assignment.sandbox.workspace_subdirs.clone(),
+        ..Default::default()
+    };
+    let compose = generate_executor_compose(&workspace_host, &opts.image, &mounts)?;
     std::fs::write(&compose_path, compose)?;
     // 注入 task.py 的 compose 路径必须绝对：inspect 相对自身解析根再拼
     // 相对路径会双拼（实测 exec-N/<相对路径> 找不到 compose）。
@@ -349,8 +441,131 @@ mod tests {
         let err = execute_run(&opts, &model, &request).unwrap_err();
         let text = format!("{err:#}");
         assert!(
-            text.contains("R1 不支持非默认沙箱档案"),
+            text.contains("executor 沙箱档案不支持 volumes/runtime/packages/network"),
             "expected sandbox rejection, got: {text}"
         );
+    }
+
+    #[test]
+    fn validate_sandbox_allows_default_and_workspace_subdirs() {
+        // R6e：默认档案 + workspace_subdirs 子集挂载通过（M5 显式声明制）
+        assert!(validate_executor_sandbox(&SandboxProfile::default()).is_ok());
+        let mut sb = SandboxProfile::default();
+        sb.workspace_subdirs = vec!["src".into(), "tests".into()];
+        assert!(validate_executor_sandbox(&sb).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_rejects_unsupported_fields() {
+        // R6e：volumes/runtime/packages/network 任一非默认 → 显式拒绝
+        let err = validate_executor_sandbox(&SandboxProfile {
+            network: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("不支持 volumes/runtime/packages/network"));
+
+        let err = validate_executor_sandbox(&SandboxProfile {
+            runtime: Some("rust".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("不支持 volumes/runtime/packages/network"));
+
+        let err = validate_executor_sandbox(&SandboxProfile {
+            packages: vec!["gcc".into()],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("不支持 volumes/runtime/packages/network"));
+
+        let err = validate_executor_sandbox(&SandboxProfile {
+            volumes: vec![alfred_core::VolumeMount {
+                host_path: "/refs".into(),
+                container_path: "/references".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("不支持 volumes/runtime/packages/network"));
+    }
+
+    #[test]
+    fn resolve_workspace_dir_prefers_explicit_and_falls_back() {
+        // R6e：显式 workspace_dir 优先；空（未设）回退 run_dir/workspace（旧布局）
+        let run = Path::new("/runs/exec-1");
+        assert_eq!(
+            resolve_workspace_dir(run, Path::new("/runs/run-abc/ws")),
+            Path::new("/runs/run-abc/ws")
+        );
+        assert_eq!(
+            resolve_workspace_dir(run, Path::new("")),
+            run.join("workspace")
+        );
+    }
+
+    #[test]
+    fn ensure_run_workspace_creates_ws_with_git_baseline() {
+        // R6e：治理 run 初始化建 `<run>/ws` + git init 基线（幂等）
+        let home = std::env::var("HOME").unwrap();
+        let dir = Path::new(&home).join(".local/state/alfred/test-run-ws-git");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ws = ensure_run_workspace(&dir).unwrap();
+        assert_eq!(ws, dir.join("ws"));
+        assert!(ws.join(".git").is_dir(), "ws 应初始化为 git 仓库：{}", ws.display());
+
+        // 幂等：二次调用不报错、不新增提交
+        ensure_run_workspace(&dir).unwrap();
+
+        // 基线空提交存在
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&log.stdout);
+        assert!(text.contains("R6e baseline"), "基线空提交缺失：{text}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn init_workspace_git_baseline_makes_executor_changes_visible() {
+        // R6e：git init + 空提交基线后，executor 新建文件在 git status 可见
+        //（reviewer 挂 ws 全量 ro 用只读 git 命令对照基线看 diff）。
+        let home = std::env::var("HOME").unwrap();
+        let dir = Path::new(&home).join(".local/state/alfred/test-ws-git-diff");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        init_workspace_git(&dir).unwrap();
+        // 幂等：.git 已存在 → 直接返回（不重复 commit）
+        init_workspace_git(&dir).unwrap();
+
+        // executor 改动（未提交新建文件）
+        std::fs::write(dir.join("hello.txt"), "Hello").unwrap();
+
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            status.contains("hello.txt"),
+            "executor 改动应相对基线可见（git status）：{status}"
+        );
+        // 基线仍是空提交（改动未提交——reviewer 看未提交文件）
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let commits = String::from_utf8_lossy(&log.stdout);
+        assert_eq!(commits.lines().count(), 1, "仅基线一个提交：{commits}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

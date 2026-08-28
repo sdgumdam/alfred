@@ -56,25 +56,21 @@ pub struct ExecutorMounts {
     pub agt_audit_dir: Option<PathBuf>,
 }
 
-/// 生成沙箱 compose：network none（P2）+ 工作区卷（绝对路径）。
-///
-/// S1 现状的固定全量 ws 挂载（过渡期语义，M5(b)）；R6a 起的
-/// `workspace_subdirs` 投影见 [`generate_executor_compose`]。
-pub fn generate_compose(workspace_host_dir: &Path, image: &str) -> Result<String> {
-    let abs = canonicalize_workspace(workspace_host_dir)?;
-    let compose = ComposeFile {
-        services: Services {
-            default: Service {
-                image: image.to_string(),
-                command: "tail -f /dev/null".to_string(),
-                init: true,
-                network_mode: "none".to_string(),
-                stop_grace_period: "1s".to_string(),
-                volumes: vec![format!("{}:{}", abs.display(), CONTAINER_WORKSPACE_DIR)],
-            },
-        },
-    };
-    serde_yaml::to_string(&compose).context("serialize compose yaml")
+/// 校验 workspace subdir 声明：必须相对、非空、不含 `.`/`..`（防 rw 挂载逃逸持久 ws，
+/// 把 rw 挂载静默换基到宿主任意目录）。`generate_executor_compose` 与 run.rs 预建
+/// 子目录共用（单一真源，代码质量红线 1）。
+pub fn validate_workspace_subdir(sub: &str) -> Result<()> {
+    let sub_path = Path::new(sub);
+    if sub.is_empty() || sub_path.is_absolute() {
+        bail!("workspace subdir must be a relative path, got: '{sub}'（绝对/空路径禁止）");
+    }
+    if sub_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    {
+        bail!("workspace subdir must not contain '..' or '.': '{sub}'（越界路径禁止）");
+    }
+    Ok(())
 }
 
 /// 生成 executor 容器 compose：network none + `workspace_subdirs` 投影 + 参考卷 ro
@@ -98,18 +94,9 @@ pub fn generate_executor_compose(
         // M5(a)：空 subdirs = 不挂 ws（显式声明制）——不加任何 ws 子目录卷。
     } else {
         for (i, sub) in mounts.workspace_subdirs.iter().enumerate() {
-            // R6a：子目录必须相对且不越界——绝对路径/`..` 会让 join 逃逸持久 ws，
-            // 把 rw 挂载静默换基到宿主任意目录（防静默换基）。
-            let sub_path = Path::new(sub);
-            if sub.is_empty() || sub_path.is_absolute() {
-                bail!("workspace subdir must be a relative path, got: '{sub}'（绝对/空路径禁止）");
-            }
-            if sub_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
-            {
-                bail!("workspace subdir must not contain '..' or '.': '{sub}'（越界路径禁止）");
-            }
+            // R6a：子目录必须相对且不越界（校验与 run.rs 预建子目录共用
+            // `validate_workspace_subdir`，单一真源）。
+            validate_workspace_subdir(sub)?;
             let host = abs.join(sub);
             if !host.exists() {
                 bail!(
@@ -197,21 +184,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compose_has_network_none_and_workspace_volume() {
-        // 测试目录须位于 HOME 下（E3：colima 只共享 ~）
-        let home = std::env::var("HOME").unwrap();
-        let dir = Path::new(&home).join(".local/state/alfred/test-compose");
-        std::fs::create_dir_all(&dir).unwrap();
-        let yaml = generate_compose(&dir, "alfred-executor:latest").unwrap();
-        assert!(yaml.contains("network_mode: none"), "got:\n{yaml}");
-        assert!(yaml.contains("alfred-executor:latest"));
-        // 绝对路径必须出现在卷里（E1：相对路径被 docker 静默变 named volume）
-        let abs = dir.canonicalize().unwrap();
-        assert!(
-            yaml.contains(&format!("{}:/workspace", abs.display())),
-            "got:\n{yaml}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+    fn validate_subdir_rejects_absolute_and_empty() {
+        // R6e：绝对/空路径禁止（防 rw 挂载静默换基到宿主任意目录）
+        assert!(validate_workspace_subdir("/etc").unwrap_err().to_string().contains("relative path"));
+        assert!(validate_workspace_subdir("").unwrap_err().to_string().contains("relative path"));
+    }
+
+    #[test]
+    fn validate_subdir_rejects_parent_dir_and_cur_dir() {
+        // R6e：`..` / `.` 越界路径禁止
+        assert!(validate_workspace_subdir("../escape").unwrap_err().to_string().contains(".."));
+        assert!(validate_workspace_subdir("./x").unwrap_err().to_string().contains("'..' or '.'"));
+    }
+
+    #[test]
+    fn validate_subdir_accepts_relative_simple() {
+        // R6e：相对简单子目录通过
+        assert!(validate_workspace_subdir("src").is_ok());
+        assert!(validate_workspace_subdir("src/deep/nested").is_ok());
     }
 
     #[test]
