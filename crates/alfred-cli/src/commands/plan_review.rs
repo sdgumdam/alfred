@@ -71,7 +71,7 @@ pub fn plan_review(args: PlanReviewArgs) -> Result<()> {
     println!("  run_dir : {}", run_dir.display());
     println!("  request : {}", request.id);
 
-    let outcome = execute_plan_review(&opts, &reviewer, &request, &dagspec, None, None)?;
+    let outcome = execute_plan_review(&opts, &reviewer, &request, &dagspec, None)?;
 
     println!();
     println!("eval status      : {}", outcome.eval_status);

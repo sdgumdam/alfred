@@ -178,7 +178,6 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
         &run.request,
         &dagspec,
         Some(&run.session_doc),
-        run.owner_message.as_deref(),
     )?;
     match outcome.verdict {
         Some(v) => {

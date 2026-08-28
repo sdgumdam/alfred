@@ -85,14 +85,13 @@ pub fn execute_plan_review(
     request: &OwnerRequest,
     dagspec: &DagSpec,
     session_doc: Option<&SessionDoc>,
-    owner_message: Option<&str>,
 ) -> Result<PlanReviewOutcome> {
     let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1");
     match &opts.container {
         Some(container) if !offline => execute_plan_review_container(
             opts, container, model, request, dagspec, session_doc
         ),
-        _ => execute_plan_review_eval(opts, model, request, dagspec, session_doc, owner_message),
+        _ => execute_plan_review_eval(opts, model, request, dagspec, session_doc),
     }
 }
 
@@ -103,7 +102,6 @@ fn execute_plan_review_eval(
     request: &OwnerRequest,
     dagspec: &DagSpec,
     session_doc: Option<&SessionDoc>,
-    owner_message: Option<&str>,
 ) -> Result<PlanReviewOutcome> {
     let started_at = now_rfc3339();
     let run_id = match opts.run_dir.file_name().and_then(|s| s.to_str()) {
@@ -127,7 +125,7 @@ fn execute_plan_review_eval(
     )?;
 
     let task_py = run_dir.join("plan_review.py");
-    let py = generate_plan_review_py(request, dagspec, session_doc, owner_message)?;
+    let py = generate_plan_review_py(request, dagspec, session_doc)?;
     std::fs::write(&task_py, py)?;
 
     append_audit(run_dir, "plan_review_started", &serde_json::json!({ "run_id": run_id, "request_id": request.id }))?;
