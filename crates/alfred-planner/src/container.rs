@@ -393,7 +393,7 @@ fn render_planner_compose(
         }
         None => {
             // 移除 AGT 卷行（占位符先清卷行再清注释里的占位符）
-            out = out.replace("- {agt_dir}:/workspace/.agt:ro", "");
+            out = out.replace("- {agt_dir}:/tmp/.agt:ro", "");
             out = out.replace("{agt_dir}", "none");
         }
     }
@@ -513,8 +513,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !yaml.contains(":/workspace/.agt:ro"),
-            "AGT 卷行应移除（agt_dir=None）:\n{yaml}"
+            !yaml.contains("- none:/tmp/.agt:ro"),
+            "AGT 卷行应移除（agt_dir=None，不得渲染 stray named volume 'none'）:\n{yaml}"
         );
         cleanup(&o.run_dir);
     }
