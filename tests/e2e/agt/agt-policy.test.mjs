@@ -114,6 +114,35 @@ const rePolicy = parsePolicy(JSON.stringify({
 const d13 = evaluateToolCall(rePolicy, bash("echo hi"));
 assert(d13.decision === "deny" && d13.rule === "bad-re", "非法正则 → 按命中 → deny（fail-closed）");
 
+console.log("== planner-policy.json 语义（target_path 拦写） ==");
+const plannerPolicy = parsePolicy(readFileSync(path.join(here, "planner-policy.json"), "utf8"));
+
+// 写 /outputs（DagSpec 产出路径，planner 合法产出挂载）→ allow（显式 allow-write-to-outputs）
+const p1 = evaluateToolCall(plannerPolicy, write("/outputs/instructions.json"));
+assert(p1.decision === "allow" && p1.rule === "allow-write-to-outputs", `planner write /outputs/instructions.json → allow(${p1.rule})`);
+
+// 写 /workspace → deny（deny-write-to-workspace：target_path.startswith('/workspace') 命中）
+const p2 = evaluateToolCall(plannerPolicy, write("/workspace/foo.txt"));
+assert(p2.decision === "deny" && p2.rule === "deny-write-to-workspace", `planner write /workspace/foo.txt → deny(${p2.rule})`);
+
+// edit /workspace 同样 deny（or tool_name == 'edit' 分支）
+const p2b = evaluateToolCall(plannerPolicy, edit("/workspace/src/lib.rs"));
+assert(p2b.decision === "deny" && p2b.rule === "deny-write-to-workspace", `planner edit /workspace/src/lib.rs → deny(${p2b.rule})`);
+
+// 读工具（bash cat /workspace）→ allow（只拦写，不拦读）
+const p3 = evaluateToolCall(plannerPolicy, bash("cat /workspace/src/main.rs"));
+assert(p3.decision === "allow", `planner read（bash cat /workspace）→ allow（got ${p3.decision}）`);
+
+// 无 path 的 write：target_path 缺失 → .startswith 返回 false 非抛错 → 规则不命中 → default allow
+const p4 = evaluateToolCall(plannerPolicy, { tool_name: "write", args: { content: "x" } });
+assert(p4.decision === "allow", `planner write 无 path → allow（got ${p4.decision}）`);
+
+if (failures > 0) {
+  console.error(`\n${failures} assertion(s) failed`);
+  process.exit(1);
+}
+console.log("\nALL PASS: AGT 策略求值原型（确定性）");
+
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);

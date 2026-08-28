@@ -151,7 +151,7 @@ Planning → PlanReviewing → Executing → ExecReviewing
 | `r3.sh` | 治理环闭环四用例：正路径全环 / 机械升级闭环（decide retry 续跑）/ 打回伪装闭环 / 多轮会话文档 | 真 LLM + 离线注入 |
 | `r4.sh` | 决策面板 RPC 两用例：escalated→panel abandon→Abandoned / plan_rejected→panel retry→真重跑→Completed | 离线注入（面板属主会话真 LLM） |
 | `escape.sh` | 越界写边界两向验证：容器内 /tmp 写不落宿主 + 工作区写穿透宿主（纯 docker，无 LLM） | 纯容器边界 |
-| `agt/agt-policy.test.mjs` | AGT 策略求值原型确定性测试（24 断言） | 无 LLM 无容器 |
+| `agt/agt-policy.test.mjs` | AGT 策略求值原型确定性测试（29 断言） | 无 LLM 无容器 |
 | `agt/demo.sh` | AGT 实机演示：沙箱容器内 pi + 策略扩展拦截 `rm -rf`（审计 deny+allow） | 真容器真 LLM（可选演示） |
 
 **统一入口**：
@@ -176,7 +176,7 @@ escape）覆盖"真实执行与审查"；离线注入（r2 case2·3 / r3 case2·
 | 密钥不进容器 | 容器内 models.json 哑 key；真实 key 只留宿主 eval 进程（env_clear + 白名单注入） | R0 审计（docker inspect env 零命中） |
 | 越界写拦截 | 只挂 workspace 卷；工作区外路径在容器 overlay，不落宿主 | `tests/e2e/escape.sh`（两向验证 PASS） |
 | 审查隔离 | 执行审查 scorer 只见验收标准+产物摘要，不见 prompt；规划器不感知审查者/执行者 | r2/r3 e2e 断言 |
-| 工具级策略（原型，默认关） | AGT 风格 pi 扩展拦 `tool_call`（rm -rf / sudo / 秘密读取 / 越界写） | `tests/e2e/agt/`（确定性 24 断言 + 实机演示）——启用与否属主定，见 `.plans/AGT评估.md` |
+| 工具级策略（原型，默认关） | AGT 风格 pi 扩展拦 `tool_call`（rm -rf / sudo / 秘密读取 / 越界写） | `tests/e2e/agt/`（确定性 29 断言 + 实机演示）——启用与否属主定，见 `.plans/AGT评估.md` |
 
 ---
 

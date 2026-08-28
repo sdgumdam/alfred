@@ -182,7 +182,7 @@ Tiered routing (§3.3, all six rows in code):
 | `r3.sh` | governance loop, four cases: happy path full loop / mechanical-escalation loop (decide retry) / disguised-rejection loop / multi-turn session doc | real LLM + offline injection |
 | `r4.sh` | decision-panel RPC, two cases: escalated→panel abandon→Abandoned / plan_rejected→panel retry→real rerun→Completed | offline injection (panel owner session is a real LLM) |
 | `escape.sh` | out-of-workspace-write boundary, two-way: in-container /tmp write does not land on host + workspace write lands on host (pure docker, no LLM) | pure container boundary |
-| `agt/agt-policy.test.mjs` | AGT policy-eval prototype, deterministic (24 assertions) | no LLM, no container |
+| `agt/agt-policy.test.mjs` | AGT policy-eval prototype, deterministic (29 assertions) | no LLM, no container |
 | `agt/demo.sh` | AGT live demo: in-sandbox pi + policy extension blocks `rm -rf` (audit deny+allow) | real container + real LLM (optional demo) |
 
 **Unified entry:**

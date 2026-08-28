@@ -142,30 +142,81 @@ function getNested(obj: Record<string, unknown>, path: string): unknown {
   return cur;
 }
 
+/** 剥掉平衡的外层括号（`(A) and B` 的 `(A)` → `A`；整体 `(A and B)` → `A and B`）。 */
+function stripOuterParens(expr: string): string {
+  let t = expr.trim();
+  while (t.startsWith("(") && t.endsWith(")")) {
+    let depth = 0;
+    let outerPair = true;
+    for (let i = 0; i < t.length; i++) {
+      if (t[i] === "(") depth++;
+      else if (t[i] === ")") {
+        depth--;
+        if (depth === 0 && i !== t.length - 1) {
+          outerPair = false;
+          break;
+        }
+      }
+    }
+    if (!outerPair || depth !== 0) break;
+    t = t.slice(1, -1).trim();
+  }
+  return t;
+}
+
+/** 顶层（paren depth 0）的 op 拆分；无顶层 op → null。支持 `(A or B) and C` 分组。 */
+function splitTopLevel(expr: string, op: string): string[] | null {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let found = false;
+  for (let i = 0; i < expr.length; i++) {
+    const c = expr[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    if (depth === 0 && expr.startsWith(op, i)) {
+      parts.push(expr.slice(start, i));
+      start = i + op.length;
+      i += op.length - 1;
+      found = true;
+    }
+  }
+  if (!found) return null;
+  parts.push(expr.slice(start));
+  return parts;
+}
+
 export function evalCondition(expr: string, ctx: Record<string, unknown>, depth = 0): boolean {
   if (depth > MAX_EXPRESSION_DEPTH) return false;
   if (expr.length > 2000) return false;
 
-  const orIdx = expr.indexOf(" or ");
-  if (orIdx !== -1) {
-    return expr.split(" or ").some((p) => evalCondition(p.trim(), ctx, depth + 1));
-  }
-  const andIdx = expr.indexOf(" and ");
-  if (andIdx !== -1) {
-    return expr.split(" and ").every((p) => evalCondition(p.trim(), ctx, depth + 1));
+  const e = stripOuterParens(expr);
+
+  // 顶层（不在括号内）的 or / and 才拆分——支持 (A or B) and C 分组语义。
+  const orParts = splitTopLevel(e, " or ");
+  if (orParts) return orParts.some((p) => evalCondition(p.trim(), ctx, depth + 1));
+  const andParts = splitTopLevel(e, " and ");
+  if (andParts) return andParts.every((p) => evalCondition(p.trim(), ctx, depth + 1));
+
+  // 字符串前缀方法（planner-policy 的 target_path.startswith('/workspace')）。
+  // 非字符串（含缺失）返回 false 而非抛错——无 path 的 write 不因此 fail-closed deny。
+  let m = e.match(/^([\w.]+)\.startswith\(\s*['"]([^'"]+)['"]\s*\)$/);
+  if (m) {
+    const actual = getNested(ctx, m[1]);
+    return typeof actual === "string" && actual.startsWith(m[2]);
   }
 
-  let m = expr.match(/^([\w.]+)\s*==\s*['"]([^'"]+)['"]$/);
+  m = e.match(/^([\w.]+)\s*==\s*['"]([^'"]+)['"]$/);
   if (m) return getNested(ctx, m[1]) === m[2];
-  m = expr.match(/^([\w.]+)\s*!=\s*['"]([^'"]+)['"]$/);
+  m = e.match(/^([\w.]+)\s*!=\s*['"]([^'"]+)['"]$/);
   if (m) return getNested(ctx, m[1]) !== m[2];
-  m = expr.match(/^([\w.]+)\s+in\s+\[([^\]]*)\]$/);
+  m = e.match(/^([\w.]+)\s+in\s+\[([^\]]*)\]$/);
   if (m) {
     const actual = getNested(ctx, m[1]);
     const items = m[2].split(",").map((s) => s.trim().replace(/^['"]|['"]$/g, ""));
     return items.includes(String(actual));
   }
-  m = expr.match(/^([\w.]+)\s*(>=|<=|>|<)\s*(\d+(?:\.\d+)?)$/);
+  m = e.match(/^([\w.]+)\s*(>=|<=|>|<)\s*(\d+(?:\.\d+)?)$/);
   if (m) {
     const actual = Number(getNested(ctx, m[1]));
     const target = Number(m[3]);
@@ -177,7 +228,7 @@ export function evalCondition(expr: string, ctx: Record<string, unknown>, depth 
       case "<=": return actual <= target;
     }
   }
-  m = expr.match(/^[\w.]+$/);
+  m = e.match(/^[\w.]+$/);
   if (m) return Boolean(getNested(ctx, m[0]));
   return false;
 }
@@ -240,7 +291,10 @@ export function evaluateToolCall(
   const command = extractCommand(event.tool_name, event.args);
   const path = extractPath(event.tool_name, event.args);
   if (command !== undefined) ctx["command"] = command;
-  if (path !== undefined) ctx["path"] = path;
+  if (path !== undefined) {
+    ctx["path"] = path;
+    ctx["target_path"] = path; // 策略条件用 target_path（与 AGT 语义一致）
+  }
   ctx["path_escapes_workspace"] = path !== undefined && pathEscapesWorkspace(path);
   ctx["command_escapes_workspace"] = command !== undefined && commandEscapesWorkspace(command);
 
