@@ -14,9 +14,9 @@ MODE == "converse": pi reads /inputs/{request.json, session.json, owner_message.
 MODE == "maintain": pi reads /inputs/session.json + /inputs/trigger.json and
   writes the updated session doc JSON to /outputs/session.json.
 
-The AGT write-denial extension (`-e /workspace/.agt/agt-policy.ts`) is loaded
-when AGT_EXT is non-empty; policy and audit paths default to
-/workspace/.agt/{policy.json, audit/audit.jsonl}.
+The AGT write-denial extension (`-e /tmp/.agt/agt-policy.ts`) is loaded when
+AGT_EXT is non-empty; policy and audit paths default to
+/tmp/.agt/{policy.json, audit/audit.jsonl}.
 """
 
 import json

@@ -59,7 +59,7 @@ pub struct PlannerContainerOptions {
     pub settle_grace_seconds: f64,
     /// 是否轮询 `inspect ctl` 观测面。
     pub ctl_enabled: bool,
-    /// AGT 策略 + 扩展目录（挂 `/workspace/.agt` ro；含 policy.json + agt-policy.ts）。
+    /// AGT 策略 + 扩展目录（挂 `/tmp/.agt` ro；含 policy.json + agt-policy.ts）。
     /// None = 不挂 AGT、不加载扩展（测试/最小环境）。
     pub agt_dir: Option<PathBuf>,
 }
@@ -293,7 +293,7 @@ fn run_planner_container(
         .unwrap_or("run")
         .to_string();
     let agt_ext = match &opts.agt_dir {
-        Some(_) => "/workspace/.agt/agt-policy.ts".to_string(),
+        Some(_) => "/tmp/.agt/agt-policy.ts".to_string(),
         None => String::new(),
     };
     let task_py_path = work.join("task.py");
@@ -365,7 +365,7 @@ fn run_planner_container(
 
 /// 渲染 planner compose：R6a 模板占位符 → canonicalize 后绝对路径。
 ///
-/// AGT 目录为 None 时移除 `/workspace/.agt` 挂载行（最小环境不挂拦写层）。
+/// AGT 目录为 None 时移除 `/tmp/.agt` 挂载行（最小环境不挂拦写层）。
 fn render_planner_compose(
     opts: &PlannerContainerOptions,
     ws_abs: &Path,
