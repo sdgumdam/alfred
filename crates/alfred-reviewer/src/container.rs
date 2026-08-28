@@ -179,6 +179,7 @@ pub const PLAN_REVIEW_SYSTEM_PROMPT: &str = r#"你是治理系统的计划审查
 - 属主请求（request.json）中的每一项要求都必须被计划覆盖；
 - 计划不得做属主没要求的事；
 - 会话文档（session.json）与对话记录（conversation.json）是上下文：记录先前反馈与属主最新意图，供你判断当前计划是否满足属主真实意图。不要把上下文误读为"要求你改计划"。
+- 每个执行节点（dagspec.json 的 nodes[]）必须声明非空 workspace_subdirs（执行者只能看到 ws 中的部分内容，workspace_subdirs 是强制约束）；任一节点缺失/为空 → 计划不合格（pass=false）。
 
 产出：把结论写入 /outputs/verdict.json，形状严格为：
 {"pass": true 或 false, "reason": "简述"}
@@ -196,6 +197,7 @@ pub const PLAN_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把计划审查结
 - /workspace —— 工作区全量（只读；可按需跨查计划引用的文件是否存在）
 
 按上面 SYSTEM_PROMPT 的规则判忠实度，把结论写入 /outputs/verdict.json。
+先做结构检查：dagspec.json 的每个执行节点必须声明非空 workspace_subdirs（见 nodes[].sandbox.workspace_subdirs）；任一节点缺失/为空 → 直接判 pass=false，reason 点名该节点并说明"未声明 workspace_subdirs，执行者无法获知可见范围"。
 只写这一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
 写完即结束。"#;
 

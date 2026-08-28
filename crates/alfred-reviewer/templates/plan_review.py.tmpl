@@ -95,6 +95,7 @@ The session doc is context ONLY: it records prior feedback so you can tell wheth
 Decide: does the plan faithfully serve the owner request?
 - every requirement in the owner request must be addressed by the plan;
 - the plan must not do things the owner did not ask for.
+- every execution node in the plan must declare a non-empty "workspace_subdirs" (the executor can only see the ws subdirectories the plan declares — a node missing/empty workspace_subdirs leaves the executor unable to know its visible scope → plan must FAIL).
 
 Respond ONLY with a JSON object of exactly this shape:
 {{"pass": true or false, "reason": "brief explanation"}}
