@@ -7,38 +7,23 @@ Inspect model (the executor provider). The container has no external
 network and holds no real credentials: pi's `~/.pi/agent/models.json`
 points at the bridge proxy with a dummy `sk-none` key.
 
-R2 adds the ExecVerdict scorer (执行审查) into the same eval. 投影物理隔离：
-- executor (pi) 只拿 Sample.input = CONTRACT_PROMPT（契约任务描述）；
-- scorer 只拿 Sample.target = ACCEPTANCE_CRITERIA（契约验收标准）判 Artifact；
-两份资料在模板结构上分离，模型上下文级隔离（pi 只见 prompt / grader 只见验收标准+产物摘要）（钉死项 §3.1 原文）。
+R6d 移除内嵌 ExecVerdict scorer（R2 投影隔离 grader）：执行审查改由独立
+reviewer 容器（ws 全量 ro + 契约全字段 + 对话记录）承担（对齐方案 §二.6 +
+§4 第 196 行）。本 eval 只驱动执行者（pi）在沙箱内产出产物，不判分、不读
+验收标准。
 """
 
 import json
-import re
 import time
 
-import anyio
-from typing import Literal
-
-from pydantic import BaseModel
 from inspect_ai import Task, task
 from inspect_ai.agent import sandbox_agent_bridge
 from inspect_ai.dataset import MemoryDataset, Sample
-from inspect_ai.model import (
-    ChatCompletionChoice,
-    ChatMessageAssistant,
-    GenerateConfig,
-    ModelOutput,
-    ResponseSchema,
-    get_model,
-)
-from inspect_ai.scorer import Score, accuracy, scorer, stderr
 from inspect_ai.solver import solver
 from inspect_ai.util import (
     ExecCompleted,
     ExecRemoteStreamingOptions,
     ExecStdout,
-    json_schema,
     sandbox,
     store,
 )
@@ -49,148 +34,12 @@ from inspect_ai.util import (
 # 见 alfred-executor task_gen.rs。
 COMPOSE_FILE = __COMPOSE_FILE_JSON__
 CONTRACT_PROMPT = __CONTRACT_PROMPT_JSON__
-ACCEPTANCE_CRITERIA = __ACCEPTANCE_CRITERIA_JSON__
 PORT_BASE = int(__PORT_BASE__)
 PI_MODEL = __PI_MODEL_JSON__
 WORKSPACE_DIR = __WORKSPACE_DIR_JSON__
 SANDBOX_USER = __SANDBOX_USER_JSON__
 RUN_ID = __RUN_ID_JSON__
 SETTLE_GRACE_SECONDS = float(__SETTLE_GRACE_SECONDS__)
-
-# ---- R2 执行审查 scorer（锁死五桩：schema 经 Inspect 抽象 + [BEGIN DATA]
-#      中和 + Pydantic 校验 + 失败 unscored + temperature=0/seed 经宿主 Model
-#      config）。grader 模型经宿主 `--model-role grader=<reviewer>` 绑定，本
-#      文件不写任何 provider 专属字段。 ----
-FailureClass = Literal[
-# grader 可判：contract_ambiguity / fidelity_dispute（单 grader 投影可观测）；
-# contract_fault 需对照属主原意（grader 投影不可见），R3 全上下文判定接入前为死路径——已知限制
-    # - contract_ambiguity: 契约本身写得有歧义
-    # - fidelity_dispute: 产物与契约之间有争议，是否兑现说法不一
-    # - contract_fault: 产物忠实于契约，但契约偏离了属主本意
-    # mechanical（机械性失败：环境/工具故障）不是 grader 能判的——由编排器按
-    # 执行状态判定（eval error/timeout → mechanical，R3 接续）；disagreement
-    # （多审查者分歧）留多 grader 未来。二者不进 grader 的判分类别。
-    "contract_ambiguity",
-    "fidelity_dispute",
-    "contract_fault",
-]
-
-def _extract_json_text(text: str) -> str:
-    """从模型输出中提取 JSON 文本（容忍 markdown 代码围栏/前后杂文）。
-
-    zhipu 等网关忽略 json_schema 时会返回自由文本——强提示下仍可能用
-    ```json 围栏包裹。这是解析健壮性（Pydantic 校验前），不是 provider
-    专属字段拼装。先试原文，再试剥围栏，最后试首个 {...} 平衡块。
-    """
-    candidates = [text.strip()]
-    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    if m:
-        candidates.append(m.group(1).strip())
-    for cand in candidates:
-        try:
-            json.loads(cand)
-            return cand
-        except Exception:
-            pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        cand = text[start : end + 1]
-        try:
-            json.loads(cand)
-            return cand
-        except Exception:
-            pass
-    return text
-
-
-def _neutralize_data_markers(text: str) -> str:
-    """剥除/转义 [BEGIN DATA]/[END DATA] 标记（FinalAudit P3 修复，防御纵深）。
-
-    数据块边界只能由模板持有：artifact / 验收标准文本里若出现同名标记，会在
-    grader 提示词里伪造数据块边界（注入/中和绕过）。插入前把标记改写为无
-    冲突形式，保证 [BEGIN DATA]...[/END DATA] 结构不被内容夺权。
-    """
-    return (
-        text.replace("[BEGIN DATA]", "[BEGIN_DATA]")
-        .replace("[END DATA]", "[END_DATA]")
-    )
-
-
-class ExecVerdict(BaseModel):
-    grade: Literal["C", "I", "P"]
-    failure_class: FailureClass | None = None
-    rationale: str
-
-    def validate_invariant(self):
-        if self.grade == "C" and self.failure_class is not None:
-            raise ValueError("grade C must have failure_class = None")
-        if self.grade in ("I", "P") and self.failure_class is None:
-            raise ValueError("grade I/P requires failure_class")
-
-
-@scorer(metrics=[accuracy(), stderr()])
-def exec_verdict_scorer():
-    async def score(state, target):
-        # grader = 审查者模型（宿主进程；由 spawn_eval --model-role grader= 绑定）
-        model = get_model(role="grader")
-        artifact = state.output.completion or "(no output)"
-        grading_prompt = f"""You are assessing a submitted artifact against acceptance criteria.
-
-[BEGIN DATA]
-[Acceptance Criteria]: {_neutralize_data_markers(target.text)}
-[Artifact]: {_neutralize_data_markers(artifact)}
-[END DATA]
-
-Determine whether the artifact satisfies the acceptance criteria.
-Respond ONLY with a JSON object of exactly this shape:
-{{"grade": "C" or "P" or "I", "failure_class": "contract_ambiguity"|"fidelity_dispute"|"contract_fault"|null, "rationale": "brief reason"}}
-
-Grade definitions (§3.3):
-- "C" (通过): the artifact fully satisfies the acceptance criteria; failure_class MUST be null.
-- "P" (部分通过): the artifact PARTIALLY satisfies the acceptance criteria — a real partial delivery exists (some acceptance points met) but the contract is not fully fulfilled; failure_class MUST be one of the enumerated values.
-- "I" (不通过): the artifact does not satisfy the acceptance criteria (no substantive delivery or fully off-target); failure_class MUST be one of the enumerated values.
-
-Failure classes (§3.3):
-- "contract_ambiguity": the contract itself is ambiguous — fulfillment cannot be judged because the acceptance criteria are unclear.
-- "fidelity_dispute": there is a genuine dispute between the artifact and the contract — reasonable people disagree on whether it is fulfilled.
-- "contract_fault": the artifact faithfully matches the contract, but the contract deviates from the owner's actual intent.
-
-Do NOT judge mechanical failures (environment/tool errors) — the orchestrator detects those from execution status (eval error/timeout). Do NOT judge grader disagreement — that is reserved for a multi-grader setup.
-"""
-        result = await model.generate(
-            grading_prompt,
-            config=GenerateConfig(
-                response_schema=ResponseSchema(
-                    name="exec_verdict",
-                    json_schema=json_schema(ExecVerdict),
-                    description="Exec verdict: grade C/P/I, optional failure_class, rationale",
-                    strict=True,
-                ),
-                temperature=0,
-                seed=42,
-            ),
-        )
-        try:
-            verdict = ExecVerdict.model_validate_json(_extract_json_text(result.completion))
-            verdict.validate_invariant()
-        except Exception as e:
-            return Score.unscored(
-                explanation=result.completion,
-                metadata={"unscored_reason": "verdict_parse_failure", "detail": str(e)},
-            )
-        return Score(
-            value=verdict.grade,
-            answer=artifact,
-            explanation=verdict.rationale,
-            metadata={
-                "failure_class": verdict.failure_class,
-                "grade": verdict.grade,
-                "rationale": verdict.rationale,
-            },
-        )
-
-    return score
 
 
 def _models_json(port: int) -> dict:
@@ -300,42 +149,6 @@ async def _drive_pi(proc, prompt: str) -> tuple[bool, int | None]:
     return settled, exit_code
 
 
-async def _collect_artifact_summary(sbox, cwd: str, max_files: int = 200, max_bytes_per_file: int = 4000) -> str:
-    """Collect workspace artifact summary for the scorer.
-
-    投影物理隔离的"产物面"：scorer 判分依据是 pi 在 workspace 产出的文件。
-    这里把工作区文件清单 + 内容摘要收进 state.output.completion，scorer 只见
-    这个摘要，不见契约 prompt。
-    """
-    listing = await sbox.exec(
-        ["bash", "-c", "find . -type f -not -path './.git/*' | sort"],
-        cwd=cwd,
-    )
-    files = [ln for ln in listing.stdout.split("\n") if ln.strip()]
-    if not files:
-        return "(no files produced in workspace)"
-
-    parts = []
-    total = 0
-    for f in files[:max_files]:
-        size_r = await sbox.exec(
-            ["bash", "-c", f"wc -c < '{f}' 2>/dev/null || echo 0"],
-            cwd=cwd,
-        )
-        size = size_r.stdout.strip()
-        content_r = await sbox.exec(
-            ["bash", "-c", f"head -c {max_bytes_per_file} '{f}' 2>/dev/null"],
-            cwd=cwd,
-        )
-        content = content_r.stdout
-        parts.append(f"--- {f} ({size} bytes) ---\n{content}")
-        total += min(len(content), max_bytes_per_file)
-        if total > 80_000:
-            parts.append("...(artifact summary truncated)")
-            break
-    return "\n".join(parts)
-
-
 @solver
 def pi_agent():
     async def solve(state, generate):
@@ -362,17 +175,6 @@ def pi_agent():
             if not settled:
                 raise RuntimeError(f"pi RPC did not settle (exit_code={exit_code})")
 
-            # R2: 产物摘要 → state.output（scorer 判分的投影；scorer 不见 prompt）
-            artifact_summary = await _collect_artifact_summary(sbox, WORKSPACE_DIR)
-            state.output = ModelOutput(
-                model="artifact-collector",
-                choices=[
-                    ChatCompletionChoice(
-                        message=ChatMessageAssistant(content=artifact_summary),
-                        stop_reason="stop",
-                    )
-                ],
-            )
         return state
 
     return solve
@@ -381,10 +183,7 @@ def pi_agent():
 @task
 def executor_task():
     return Task(
-        dataset=MemoryDataset(
-            [Sample(id=RUN_ID, input=CONTRACT_PROMPT, target=ACCEPTANCE_CRITERIA)]
-        ),
+        dataset=MemoryDataset([Sample(id=RUN_ID, input=CONTRACT_PROMPT)]),
         solver=[pi_agent()],
-        scorer=exec_verdict_scorer(),
         sandbox=("docker", COMPOSE_FILE),
     )

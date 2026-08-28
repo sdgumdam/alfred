@@ -11,8 +11,6 @@ pub struct TaskGenParams {
     pub compose_file: String,
     /// 契约 prompt（给执行者 pi 的任务描述）。
     pub contract_prompt: String,
-    /// 契约验收标准（给审查者 scorer 的判分依据——投影物理隔离）。
-    pub acceptance_criteria: String,
     /// 桥代理端口基数（每样本自增）。
     pub port_base: u32,
     /// pi 模型（provider/model 形态，如 "inspect-bridge/inspect"）。
@@ -35,7 +33,6 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
     let inject: &[(&str, String)] = &[
         ("__COMPOSE_FILE_JSON__", json(&params.compose_file)?),
         ("__CONTRACT_PROMPT_JSON__", json(&params.contract_prompt)?),
-        ("__ACCEPTANCE_CRITERIA_JSON__", json(&params.acceptance_criteria)?),
         ("__PORT_BASE__", params.port_base.to_string()),
         ("__PI_MODEL_JSON__", json(&params.pi_model)?),
         ("__WORKSPACE_DIR_JSON__", json(&params.workspace_dir)?),
@@ -57,7 +54,6 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
     for token in [
         "__COMPOSE_FILE_JSON__",
         "__CONTRACT_PROMPT_JSON__",
-        "__ACCEPTANCE_CRITERIA_JSON__",
         "__PI_MODEL_JSON__",
         "__WORKSPACE_DIR_JSON__",
         "__SANDBOX_USER_JSON__",
@@ -84,7 +80,6 @@ mod tests {
         let py = generate_task_py(&TaskGenParams {
             compose_file: "/run/executor.compose.yaml".into(),
             contract_prompt: "Create hello.txt with content Hello".into(),
-            acceptance_criteria: "hello.txt exists with content Hello".into(),
             port_base: 13100,
             pi_model: "inspect-bridge/inspect".into(),
             workspace_dir: "/workspace".into(),
@@ -98,51 +93,29 @@ mod tests {
         assert!(py.contains(r#"RUN_ID = "run-test-1""#));
         assert!(py.contains(r#"PORT_BASE = int(13100)"#));
         assert!(py.contains(r#"PI_MODEL = "inspect-bridge/inspect""#));
-        assert!(py.contains(r#"ACCEPTANCE_CRITERIA = "hello.txt exists with content Hello""#));
         // 不得残留 token
         assert!(!py.contains("__COMPOSE_FILE_JSON__"));
         assert!(!py.contains("__CONTRACT_PROMPT_JSON__"));
-        assert!(!py.contains("__ACCEPTANCE_CRITERIA_JSON__"));
+        // R6d：执行 eval 只出产物无审查行为——生成产物不得含任何 scorer 残留
+        for residue in [
+            "exec_verdict_scorer",
+            "_collect_artifact_summary",
+            "_neutralize_data_markers",
+            "[BEGIN DATA]",
+            "scorer=",
+            "ACCEPTANCE_CRITERIA",
+            "get_model(role=",
+        ] {
+            assert!(!py.contains(residue), "R6d scorer 残留: {residue}\n{py}");
+        }
     }
 
-    #[test]
-    fn grader_neutralizes_data_markers_in_prompt() {
-        // FinalAudit P3 修复：artifact / 验收标准插入 [BEGIN DATA] 前须经
-        // _neutralize_data_markers 中和（防伪造数据块边界，防御纵深）。
-        let py = generate_task_py(&TaskGenParams {
-            compose_file: "/x".into(),
-            contract_prompt: "p".into(),
-            acceptance_criteria: "a".into(),
-            port_base: 13100,
-            pi_model: "inspect-bridge/inspect".into(),
-            workspace_dir: "/workspace".into(),
-            sandbox_user: "root".into(),
-            run_id: "r".into(),
-            settle_grace_seconds: 20.0,
-        })
-        .unwrap();
-        assert!(
-            py.contains("[Acceptance Criteria]: {_neutralize_data_markers(target.text)}"),
-            "acceptance criteria 须经中和：\n{}",
-            py
-        );
-        assert!(
-            py.contains("[Artifact]: {_neutralize_data_markers(artifact)}"),
-            "artifact 须经中和：\n{}",
-            py
-        );
-        // 中和函数本身存在，且替换逻辑把标记改写为无冲突形式
-        assert!(py.contains("def _neutralize_data_markers"));
-        assert!(py.contains(".replace(\"[BEGIN DATA]\", \"[BEGIN_DATA]\")"));
-        assert!(py.contains(".replace(\"[END DATA]\", \"[END_DATA]\")"));
-    }
     #[test]
     fn prompt_with_quotes_and_newlines_survives() {
         let prompt = "Say \"hi\"\nand 'bye'\n\\backslash";
         let py = generate_task_py(&TaskGenParams {
             compose_file: "/x".into(),
             contract_prompt: prompt.into(),
-            acceptance_criteria: "criteria".into(),
             port_base: 13100,
             pi_model: "inspect-bridge/inspect".into(),
             workspace_dir: "/workspace".into(),

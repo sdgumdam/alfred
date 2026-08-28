@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::artifact::{collect_artifact, snapshot_workspace};
 use crate::compose_gen::{canonicalize_workspace, generate_compose, CONTAINER_WORKSPACE_DIR};
 use crate::config::ExecutorModel;
-use crate::driver::{archive_eval_log, extract_exec_verdict, parse_dump, poll_until_done, spawn_eval, PollOutcome};
+use crate::driver::{archive_eval_log, poll_until_done, spawn_eval, PollOutcome};
 use crate::task_gen::{generate_task_py, TaskGenParams};
 
 /// 单次运行选项。
@@ -141,7 +141,6 @@ pub fn execute_run(
     let py = generate_task_py(&TaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),
         contract_prompt: opts.assignment.contract.prompt.clone(),
-        acceptance_criteria: opts.assignment.contract.acceptance_criteria.clone(),
         port_base: opts.port_base,
         pi_model: "inspect-bridge/inspect".to_string(),
         workspace_dir: CONTAINER_WORKSPACE_DIR.to_string(),
@@ -192,18 +191,16 @@ pub fn execute_run(
         }
     };
 
-    // R2: 从 dump 结构化读取执行审查结论（verdict / unscored_reason）。
-    // R2Audit2 修复：归档/读取/解析任一失败都不再被 if-let 静默吞掉——落
-    // audit 事件 + state.json 填 error + 以 Err 上报（§6：审查出错必须升级，
-    // 不允许"出错就悄悄放行"）。第二个重复的 archive 块一并删除。
-    let dump = match archive_eval_log(&outcome.location, &evals_dir) {
+    // R6d：执行 eval 只出产物无审查行为——归档 eval log（P9 证据）但不再从
+    // dump 提取执行审查结论（内嵌 scorer 已移除；审查由 reviewer 容器承担，
+    // 见 governance exec_review_step）。归档失败仍为硬错误（证据链完整性）。
+    match archive_eval_log(&outcome.location, &evals_dir) {
         Ok(dump) => {
             append_audit(
                 run_dir,
                 "eval_log_archived",
                 &serde_json::json!({ "dump": dump }),
             )?;
-            dump
         }
         Err(e) => {
             let msg = format!("archive eval log failed: {e:#}");
@@ -215,36 +212,9 @@ pub fn execute_run(
             bail!(msg);
         }
     };
-    let text = match std::fs::read_to_string(&dump) {
-        Ok(t) => t,
-        Err(e) => {
-            let msg = format!("read eval log dump {} failed: {e}", dump.display());
-            fail_run(
-                run_dir, request, opts, model, &run_id, &started_at,
-                &outcome.status, Some(&outcome.location),
-                "eval_log_read_failed", "eval_log_read_failed", &msg,
-            )?;
-            bail!(msg);
-        }
-    };
-    let v = match parse_dump(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = format!("parse eval log dump {} failed: {e:#}", dump.display());
-            fail_run(
-                run_dir, request, opts, model, &run_id, &started_at,
-                &outcome.status, Some(&outcome.location),
-                "eval_log_parse_failed", "eval_log_parse_failed", &msg,
-            )?;
-            bail!(msg);
-        }
-    };
-    let review = extract_exec_verdict(&v);
-    let verdict = review.verdict;
-    let verdict_unscored_reason = review.unscored_reason;
-    if let Some(detail) = review.detail {
-        eprintln!("[alfred] warn: exec verdict detail: {detail}");
-    }
+    // R6d：执行 eval 恒无审查结论（无内嵌 scorer）。
+    let verdict = None;
+    let verdict_unscored_reason = None;
 
     // 7) 产物采集（执行后快照 → diff）
     let artifact = collect_artifact(&opts.assignment.task_id, &workspace_host, &before)?;
