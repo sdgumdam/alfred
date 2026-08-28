@@ -5,10 +5,16 @@
   "deny_on_policy_error": true,
   "rules": [
     {
-      "name": "workspace-write-deny",
-      "description": "结构性拒绝写工作区（planner 无 workspace edit 权限，不产出任何 workspace 内容；产出经 /outputs 挂载）",
-      "condition": "tool_name in ['write', 'edit', 'rename', 'delete', 'mkdir', 'move', 'copy', 'create'] and path_escapes_workspace == 'false'",
+      "name": "deny-write-to-workspace",
+      "description": "结构性拒绝写工作区（planner 无 workspace edit 权限；产出经 /outputs 挂载写入，不写 ws）",
+      "condition": "(tool_name == 'write' or tool_name == 'edit') and target_path.startswith('/workspace')",
       "action": "deny"
+    },
+    {
+      "name": "allow-write-to-outputs",
+      "description": "允许写 /outputs（DagSpec 产出路径，planner 的合法产出挂载）",
+      "condition": "(tool_name == 'write') and target_path.startswith('/outputs')",
+      "action": "allow"
     },
     {
       "name": "no-sudo",
@@ -19,7 +25,7 @@
     },
     {
       "name": "no-recursive-delete",
-      "description": "阻断递归删除（rm -rf 等）——防止清空工作区",
+      "description": "阻断递归删除（rm -rf 等）",
       "condition": "tool_name == 'bash'",
       "command_patterns": [{ "source": "\\brm\\b[\\s\\S]*-(?:r[fF]|[fF]r)\\b", "flags": "i" }],
       "action": "deny"

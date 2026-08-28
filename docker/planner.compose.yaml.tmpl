@@ -30,5 +30,5 @@ services:
     - {request_path}:/inputs/request.json:ro
     - {session_path}:/inputs/session.json:ro
     - {contract_path}:/inputs/contract.json:ro
-    - {agt_dir}:/workspace/.agt:ro
+    - {agt_dir}:/tmp/.agt:ro
     - {outputs_dir}:/outputs

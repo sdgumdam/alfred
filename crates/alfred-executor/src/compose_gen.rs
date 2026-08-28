@@ -45,8 +45,8 @@ pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
 /// - `workspace_subdirs`：契约声明的工作区子目录（相对持久 ws）。空 = 不挂 ws
 ///   （M5 已定：方案推荐 a，显式声明制）。
 /// - `ref_volumes`：只读参考卷（`SandboxProfile.volumes`，档案声明）。
-/// - `agt_dir`：AGT 策略目录（policy.json/agt-policy.ts，挂到 `/workspace/.agt`，ro）。
-/// - `agt_audit_dir`：AGT 审计输出子目录（挂到 `/workspace/.agt/audit`，rw——
+/// - `agt_dir`：AGT 策略目录（policy.json/agt-policy.ts，挂到 `/tmp/.agt`，ro）。
+/// - `agt_audit_dir`：AGT 审计输出子目录（挂到 `/tmp/.agt/audit`，rw——
 ///   审计 JSONL 落此）。策略与审计拆开挂载：agent 可写审计但不可改策略（R6a）。
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorMounts {
@@ -84,8 +84,8 @@ pub fn generate_compose(workspace_host_dir: &Path, image: &str) -> Result<String
 /// - 首个 subdir → `/workspace`（rw，契约声明的子目录即执行者工作区根）；
 /// - 其余 subdir → `/workspace/<subdir>`（rw）；
 /// - 参考卷 → `<container_path>`（ro，按 `VolumeMount` 声明）；
-/// - AGT 策略目录 → `/workspace/.agt`（ro，agent 不可改策略）；
-/// - AGT 审计子目录 → `/workspace/.agt/audit`（rw，审计 JSONL 落此）。
+/// - AGT 策略目录 → `/tmp/.agt`（ro，agent 不可改策略）；
+/// - AGT 审计子目录 → `/tmp/.agt/audit`（rw，审计 JSONL 落此）。
 /// 空 subdirs → 不挂 ws（M5 已定：显式声明制）。
 pub fn generate_executor_compose(
     workspace_host_dir: &Path,
@@ -145,14 +145,14 @@ pub fn generate_executor_compose(
             .canonicalize()
             .with_context(|| format!("canonicalize agt dir {}", agt.display()))?;
         // R6a：策略目录只读——agent 不可改策略文件。
-        volumes.push(format!("{}:/workspace/.agt:ro", agt_abs.display()));
+        volumes.push(format!("{}:/tmp/.agt:ro", agt_abs.display()));
     }
     if let Some(audit) = &mounts.agt_audit_dir {
         let audit_abs = audit
             .canonicalize()
             .with_context(|| format!("canonicalize agt audit dir {}", audit.display()))?;
         // R6a：审计输出子目录 rw——agent 可写审计但不可改策略（拆开挂载）。
-        volumes.push(format!("{}:/workspace/.agt/audit:rw", audit_abs.display()));
+        volumes.push(format!("{}:/tmp/.agt/audit:rw", audit_abs.display()));
     }
     let compose = ComposeFile {
         services: Services {
@@ -301,7 +301,7 @@ mod tests {
         // R6a：AGT 策略目录 ro（agent 不可改策略）
         assert!(
             yaml.contains(&format!(
-                "{}:/workspace/.agt:ro",
+                "{}:/tmp/.agt:ro",
                 agt.canonicalize().unwrap().display()
             )),
             "got:\n{yaml}"
@@ -309,7 +309,7 @@ mod tests {
         // R6a：AGT 审计输出子目录 rw（agent 可写审计）
         assert!(
             yaml.contains(&format!(
-                "{}:/workspace/.agt/audit:rw",
+                "{}:/tmp/.agt/audit:rw",
                 agt_audit.canonicalize().unwrap().display()
             )),
             "got:\n{yaml}"
@@ -399,7 +399,7 @@ mod tests {
         );
         // network none + AGT 拦写层 ro + 输出卷
         assert!(text.contains("network_mode: none"), "got:\n{text}");
-        assert!(text.contains("/workspace/.agt:ro"), "got:\n{text}");
+        assert!(text.contains("/tmp/.agt:ro"), "got:\n{text}");
         assert!(text.contains("{outputs_dir}:/outputs"), "got:\n{text}");
     }
 
@@ -423,7 +423,7 @@ mod tests {
         );
         // network none + AGT 拦写层 ro + 输出卷
         assert!(text.contains("network_mode: none"), "got:\n{text}");
-        assert!(text.contains("/workspace/.agt:ro"), "got:\n{text}");
+        assert!(text.contains("/tmp/.agt:ro"), "got:\n{text}");
         assert!(text.contains("{outputs_dir}:/outputs"), "got:\n{text}");
     }
 }

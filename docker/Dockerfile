@@ -1,18 +1,22 @@
-# alfred 执行者沙箱镜像（R1）
-# 来源：.plans/r0-lab/Dockerfile.pi（R0 已验证：network-none 容器内经桥调通 zhipu）
-# 内容：inspect 默认沙箱镜像 + Node 22 二进制 + pi-coding-agent（全局 npm）
-# 说明：容器 network_mode: none，所有依赖必须在构建期烤进镜像（无运行期网络）。
-FROM aisiuk/inspect-tool-support
+# alfred 沙箱基础镜像：Debian 12 slim + node 22 + pi coding agent。
+# 三容器（planner/executor/reviewer）共用，差异只在 compose 挂载面（可见范围矩阵）。
+# apt 源用阿里云镜像（国内网络直连可靠），node 从 npmmirror 拉。
+FROM debian:12-slim
 
-# pi 要求 node >= 22.19；Debian bookworm apt 只有 node 18，
-# 故安装官方 Node 22 二进制（当前机器为 arm64）。
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates xz-utils \
-    && curl -fsSL https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-arm64.tar.xz -o /tmp/node.tar.xz \
-    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
-    && rm /tmp/node.tar.xz \
-    && node --version \
-    && npm --version \
-    && npm install -g @earendil-works/pi-coding-agent@0.84.3 \
-    && npm cache clean --force \
-    && pi --version
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates xz-utils procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# node 22（pi 要求 >=22.19），npmmirror 拉 pi
+RUN ARCH=$(dpkg --print-architecture) \
+    && NODE_VER=v22.19.0 \
+    && curl -fsSL https://npmmirror.com/mirrors/node/${NODE_VER}/node-${NODE_VER}-linux-${ARCH}.tar.xz \
+       | tar -xJ -C /usr/local --strip-components=1 \
+    && node --version
+
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install -g @earendil-works/pi-coding-agent
+
+WORKDIR /workspace

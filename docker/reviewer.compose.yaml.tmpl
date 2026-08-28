@@ -16,7 +16,7 @@
 #                       全可见语义：不得与 planner 的投影会话文件同源——
 #                       planner 挂 {session_path}（投影后），reviewer 挂真源
 #   {contract_path}    → {run_dir}/contract.json（契约全字段）
-#   {agt_dir}          → AGT 策略 + 扩展目录（挂到 /workspace/.agt，ro）
+#   {agt_dir}          → AGT 策略 + 扩展目录（挂到 /tmp/.agt，ro）
 #   {outputs_dir}      → 容器产出挂载（verdict 写 /outputs，rw）
 # 只读参考卷（矩阵"按需 ro"行）与审查记录/verdict 输入（矩阵第 8 行）由编排器
 # 按运行期需要动态追加，不在本模板写死。
@@ -33,5 +33,5 @@ services:
     - {request_path}:/inputs/request.json:ro
     - {session_full_path}:/inputs/session.json:ro
     - {contract_path}:/inputs/contract.json:ro
-    - {agt_dir}:/workspace/.agt:ro
+    - {agt_dir}:/tmp/.agt:ro
     - {outputs_dir}:/outputs
