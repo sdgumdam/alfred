@@ -83,6 +83,7 @@ pub fn execute_exec_review(
     model: &ExecutorModel,
     request: &OwnerRequest,
     contract: &Contract,
+    workspace_subdirs: &[String],
     conversation: Option<&alfred_core::conversation::ConversationLog>,
 ) -> Result<ExecReviewOutcome> {
     let started_at = now_rfc3339();
@@ -110,6 +111,7 @@ pub fn execute_exec_review(
         model,
         request,
         contract,
+        workspace_subdirs,
         conversation,
         &opts.ws_dir,
     ) {
@@ -349,7 +351,7 @@ mod tests {
             reviewer_models: vec![],
         };
         let conv: Option<ConversationLog> = None;
-        let inputs = crate::container::exec_review_inputs(&req, &contract, conv.as_ref()).unwrap();
+        let inputs = crate::container::exec_review_inputs(&req, &contract, &["output".to_string()], conv.as_ref()).unwrap();
         let files: std::collections::HashMap<String, String> = inputs.into_iter().collect();
         let c: serde_json::Value = serde_json::from_str(&files["conversation.json"]).unwrap();
         assert_eq!(c["turns"].as_array().unwrap().len(), 0);

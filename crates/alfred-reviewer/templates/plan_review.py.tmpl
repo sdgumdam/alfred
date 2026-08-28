@@ -96,6 +96,7 @@ Decide: does the plan faithfully serve the owner request?
 - every requirement in the owner request must be addressed by the plan;
 - the plan must not do things the owner did not ask for.
 - every execution node in the plan must declare a non-empty "workspace_subdirs" (the executor can only see the ws subdirectories the plan declares — a node missing/empty workspace_subdirs leaves the executor unable to know its visible scope → plan must FAIL).
+- mount semantics: a node's workspace_subdirs[0] is mounted as that node's workspace root (/workspace) — "workspace root"/"root directory" wording in the contract refers to that first subdirectory (host ws/<workspace_subdirs[0]>), NOT the full ws the reviewer sees. Contract wording must be consistent with the declared workspace_subdirs[0].
 
 Respond ONLY with a JSON object of exactly this shape:
 {{"pass": true or false, "reason": "brief explanation"}}

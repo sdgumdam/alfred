@@ -187,6 +187,22 @@ mod tests {
     }
 
     #[test]
+    fn plan_review_py_mandates_mount_semantics() {
+        // R6f：离线计划审查（plan_review.py.tmpl）同步挂载语义路径翻译——
+        // workspace_subdirs[0] 即节点工作区根 /workspace，契约"根目录"措辞应
+        // 与首个子目录一致（离线直判路径与容器 PLAN_REVIEW_*_PROMPT 同一语义）。
+        let py = generate_plan_review_py(&sample_request(), &sample_dagspec(), None).unwrap();
+        assert!(
+            py.contains("workspace_subdirs[0]") && py.contains("workspace root (/workspace)"),
+            "plan_review.py 必须含挂载语义路径翻译:\n{py}"
+        );
+        assert!(
+            py.contains("host ws/<workspace_subdirs[0]>"),
+            "plan_review.py 必须给宿主 ws 翻译:\n{py}"
+        );
+    }
+
+    #[test]
     fn injects_session_doc() {
         // P2 修复：计划审查模板评分器输入含会话文档（审查者全可见）；属主消息
         // 经 conversation.json 可达（R6cReview：owner_message.txt 死输入已移除）。

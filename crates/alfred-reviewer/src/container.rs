@@ -147,19 +147,16 @@ pub fn run_plan_review_in_container(
     )
 }
 
-/// 执行审查容器驱动：request + 契约全字段 + 对话记录 + ws 全量 ro → verdict JSON 文本。
-///
-/// 执行审查看全量产物（防合谋）：`ws_dir` 挂 `/workspace` ro，reviewer 自己读
-/// ws diff / git 历史判产物 vs 验收标准。
 pub fn run_exec_review_in_container(
     opts: &ReviewerContainerOptions,
     model: &ExecutorModel,
     request: &OwnerRequest,
     contract: &Contract,
+    workspace_subdirs: &[String],
     conversation: Option<&ConversationLog>,
     ws_dir: &Path,
 ) -> Result<ContainerRunOutput> {
-    let inputs = exec_review_inputs(request, contract, conversation)?;
+    let inputs = exec_review_inputs(request, contract, workspace_subdirs, conversation)?;
     run_reviewer_container(
         opts,
         model,
@@ -180,6 +177,7 @@ pub const PLAN_REVIEW_SYSTEM_PROMPT: &str = r#"你是治理系统的计划审查
 - 计划不得做属主没要求的事；
 - 会话文档（session.json）与对话记录（conversation.json）是上下文：记录先前反馈与属主最新意图，供你判断当前计划是否满足属主真实意图。不要把上下文误读为"要求你改计划"。
 - 每个执行节点（dagspec.json 的 nodes[]）必须声明非空 workspace_subdirs（执行者只能看到 ws 中的部分内容，workspace_subdirs 是强制约束）；任一节点缺失/为空 → 计划不合格（pass=false）。
+- 挂载语义：每个节点的 workspace_subdirs[0] 挂为该节点工作区根 /workspace（契约/验收标准里"workspace 根目录/根目录"从执行者视角就是指那个子目录），其余子目录挂为 /workspace/<子目录>。契约"根目录"措辞应与该节点声明的首个子目录一致（首个子目录即执行者根，不是审查者看到的宿主 ws 全量根）。
 
 产出：把结论写入 /outputs/verdict.json，形状严格为：
 {"pass": true 或 false, "reason": "简述"}
@@ -198,11 +196,18 @@ pub const PLAN_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把计划审查结
 
 按上面 SYSTEM_PROMPT 的规则判忠实度，把结论写入 /outputs/verdict.json。
 先做结构检查：dagspec.json 的每个执行节点必须声明非空 workspace_subdirs（见 nodes[].sandbox.workspace_subdirs）；任一节点缺失/为空 → 直接判 pass=false，reason 点名该节点并说明"未声明 workspace_subdirs，执行者无法获知可见范围"。
+再做挂载一致性检查：节点契约/验收标准里"workspace 根/根目录"措辞应指向该节点 workspace_subdirs[0]（首个子目录即该节点工作区根 /workspace，执行者看不到声明之外的目录）；措辞与声明子目录明显不符 → 判契约有歧义风险（plan 忠实度存疑，reason 说明）。
 只写这一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
 写完即结束。"#;
 
 /// 执行审查容器侧 system prompt：判产物 vs 验收标准（全量信息防合谋）。
 pub const EXEC_REVIEW_SYSTEM_PROMPT: &str = r#"你是治理系统的执行审查者。判断提交的产物（/workspace 全量）是否满足验收标准。
+
+挂载语义（判产物位置前必须先理解，避免把契约"根目录"翻译错）：
+- 执行者（executor）的工作区根 /workspace 挂的是宿主 ws 的**首个子目录** workspace_subdirs[0]（见 /inputs/sandbox.json）；契约/请求/验收标准里"workspace 根目录/根目录"从执行者视角就是指那个子目录。
+- 其余 workspace_subdirs[i]（i≥1）挂为执行者 /workspace/<子目录>，路径与审查者所见一致。
+- 审查者（你）挂的是 ws **全量**：你看到的 /workspace/<workspace_subdirs[0]> 就是执行者的 /workspace 根。契约说"产物在 workspace 根/根目录"→ 查 /workspace/<workspace_subdirs[0]>/ 下（如 workspace_subdirs=["output"] → 执行者的根 = 你看到的 /workspace/output）。
+- 执行者只能看到 workspace_subdirs 声明的子目录；声明之外的文件不在执行者可见范围，不能算执行者产物。
 
 判定依据：
 - 验收标准在 /inputs/contract.json 的 acceptance_criteria 字段；
@@ -232,12 +237,14 @@ pub const EXEC_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把执行审查结
 请按顺序读取输入文件：
 - /inputs/request.json —— 属主请求（JSON 对象）
 - /inputs/contract.json —— 契约（JSON 对象：prompt + acceptance_criteria + reviewer_models）
+- /inputs/sandbox.json —— 执行者挂载语义（JSON 对象：workspace_subdirs —— 首个子目录 = 执行者的 /workspace 根，即契约"workspace 根/根目录"的落点）
 - /inputs/conversation.json —— 属主↔规划器对话记录（JSON 对象，turns[]）
 - /workspace —— 执行者产物（ws 全量只读）：用 read/bash/glob 检查产物文件；
   对照 git 基线（run 开始时 `git init` + 空提交）用 `git status` / `git diff` /
   `git log` 看执行者新建/改了什么（含未提交文件），判断产物 vs 验收标准
 
 按上面 SYSTEM_PROMPT 的规则判分，把结论写入 /outputs/verdict.json。
+先做路径翻译：按 /inputs/sandbox.json 的 workspace_subdirs 判定执行者的 /workspace 根——契约/验收标准里"workspace 根/根目录"的产物 → 查 /workspace/<workspace_subdirs[0]>/ 下（如 workspace_subdirs=["output"] → 执行者的根 = 你看到的 /workspace/output）；workspace_subdirs 为空时按字面路径判（无翻译提示）。产物位置以此翻译后的落点为准，不要把"执行者在 ws/<首子目录> 下写出的文件"误判为"不在 workspace 根"。
 只写这一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
 写完即结束。"#;
 
@@ -266,6 +273,18 @@ fn plan_review_inputs(
         .map(|n| serde_json::to_string_pretty(&n.contract).context("serialize node contract"))
         .transpose()?
         .unwrap_or_else(|| "{}".to_string());
+    // R6f：执行者挂载语义（sandbox.json）——首节点 workspace_subdirs[0] 即该节点
+    // 工作区根 /workspace（契约"根目录"落点）。计划审查从 dagspec 已可读，但
+    // compose 挂载要求 /inputs/sandbox.json 源存在（bind mount），统一落盘。
+    let sandbox = dagspec
+        .nodes
+        .first()
+        .map(|n| n.sandbox.workspace_subdirs.as_slice())
+        .unwrap_or(&[]);
+    let sandbox_json = serde_json::to_string_pretty(&serde_json::json!({
+        "workspace_subdirs": sandbox,
+    }))
+    .context("serialize sandbox workspace_subdirs")?;
 
     let files = vec![
         (
@@ -279,6 +298,7 @@ fn plan_review_inputs(
         ("session.json".to_string(), session),
         ("conversation.json".to_string(), conv),
         ("contract.json".to_string(), contract),
+        ("sandbox.json".to_string(), sandbox_json),
     ];
     Ok(files)
 }
@@ -288,6 +308,7 @@ fn plan_review_inputs(
 pub(crate) fn exec_review_inputs(
     request: &OwnerRequest,
     contract: &Contract,
+    workspace_subdirs: &[String],
     conversation: Option<&ConversationLog>,
 ) -> Result<Vec<(String, String)>> {
     let conv = match conversation {
@@ -295,6 +316,12 @@ pub(crate) fn exec_review_inputs(
         None => serde_json::to_string_pretty(&ConversationLog::new(""))
             .context("serialize empty ConversationLog")?,
     };
+    // R6f：执行者挂载语义（sandbox.json）——workspace_subdirs[0] 即执行者的
+    // /workspace 根（契约"根目录/workspace 根"的落点），审查者按此翻译产物位置。
+    let sandbox_json = serde_json::to_string_pretty(&serde_json::json!({
+        "workspace_subdirs": workspace_subdirs,
+    }))
+    .context("serialize sandbox workspace_subdirs")?;
     Ok(vec![
         (
             "request.json".to_string(),
@@ -309,6 +336,7 @@ pub(crate) fn exec_review_inputs(
         // 源）；执行审查不读，占位。
         ("dagspec.json".to_string(), "{}".to_string()),
         ("session.json".to_string(), "null".to_string()),
+        ("sandbox.json".to_string(), sandbox_json),
     ])
 }
 
@@ -516,6 +544,10 @@ fn render_reviewer_compose(
             "{dagspec_path}",
             &inputs_abs.join("dagspec.json").display().to_string(),
         )
+        .replace(
+            "{sandbox_path}",
+            &inputs_abs.join("sandbox.json").display().to_string(),
+        )
         .replace("{outputs_dir}", &outputs_abs.display().to_string())
         .replace(
             "image: \"alfred-executor:latest\"",
@@ -588,7 +620,7 @@ mod tests {
         let outputs = work.join(OUTPUTS_DIR);
         std::fs::create_dir_all(&inputs).unwrap();
         std::fs::create_dir_all(&outputs).unwrap();
-        for f in ["request.json", "session.json", "conversation.json", "contract.json", "dagspec.json"] {
+        for f in ["request.json", "session.json", "conversation.json", "contract.json", "dagspec.json", "sandbox.json"] {
             std::fs::write(inputs.join(f), "{}").unwrap();
         }
         let ws = o.run_dir.join("ws");
@@ -617,13 +649,14 @@ mod tests {
             yaml.contains(&format!("{}:/workspace:ro", ws.canonicalize().unwrap().display())),
             "ws ro mount missing:\n{yaml}"
         );
-        // conversation / request / session(全源) / contract / dagspec ro
+        // conversation / request / session(全源) / contract / dagspec / sandbox ro
         for (host, name) in [
             ("conversation.json", "conversation.json"),
             ("request.json", "request.json"),
             ("session.json", "session.json"),
             ("contract.json", "contract.json"),
             ("dagspec.json", "dagspec.json"),
+            ("sandbox.json", "sandbox.json"),
         ] {
             assert!(
                 yaml.contains(&format!(
@@ -666,7 +699,7 @@ mod tests {
         let outputs = work.join(OUTPUTS_DIR);
         std::fs::create_dir_all(&inputs).unwrap();
         std::fs::create_dir_all(&outputs).unwrap();
-        for f in ["request.json", "session.json", "conversation.json", "contract.json", "dagspec.json"] {
+        for f in ["request.json", "session.json", "conversation.json", "contract.json", "dagspec.json", "sandbox.json"] {
             std::fs::write(inputs.join(f), "{}").unwrap();
         }
         let ws = o.run_dir.join("ws");
@@ -696,7 +729,7 @@ mod tests {
         let outputs = work.join(OUTPUTS_DIR);
         std::fs::create_dir_all(&inputs).unwrap();
         std::fs::create_dir_all(&outputs).unwrap();
-        for f in ["request.json", "session.json", "conversation.json", "contract.json", "dagspec.json"] {
+        for f in ["request.json", "session.json", "conversation.json", "contract.json", "dagspec.json", "sandbox.json"] {
             std::fs::write(inputs.join(f), "{}").unwrap();
         }
         let ws = o.run_dir.join("ws");
@@ -764,7 +797,7 @@ mod tests {
     #[test]
     fn exec_review_inputs_has_contract_and_placeholders() {
         let req = OwnerRequest::new("req-1", "t", "d", "a");
-        let inputs = exec_review_inputs(&req, &contract(), None).unwrap();
+        let inputs = exec_review_inputs(&req, &contract(), &["output".to_string()], None).unwrap();
         let files: std::collections::HashMap<String, String> = inputs.into_iter().collect();
         let c: serde_json::Value = serde_json::from_str(&files["contract.json"]).unwrap();
         assert_eq!(c["acceptance_criteria"], "hello.txt exists");
@@ -772,6 +805,78 @@ mod tests {
         // 占位：模板要求存在但执行审查不读
         assert_eq!(files["dagspec.json"], "{}");
         assert_eq!(files["session.json"], "null");
+        // R6f：sandbox.json 携带执行者挂载语义——workspace_subdirs[0] 即执行者根
+        let sb: serde_json::Value = serde_json::from_str(&files["sandbox.json"]).unwrap();
+        assert_eq!(sb["workspace_subdirs"], serde_json::json!(["output"]));
+    }
+
+    #[test]
+    fn exec_review_prompts_mandate_mount_path_translation() {
+        // R6f：执行审查 prompt 必须带挂载语义路径翻译——workspace_subdirs[0] 即
+        // 执行者 /workspace 根，契约"workspace 根/根目录"按 /workspace/<subdirs[0]>
+        // 翻译，防审查者把执行者在首子目录写出的产物误判为"不在 workspace 根"
+        // （P/FidelityDispute 误判根因）。
+        let sys = EXEC_REVIEW_SYSTEM_PROMPT;
+        assert!(
+            sys.contains("workspace_subdirs[0]") && sys.contains("执行者的 /workspace 根"),
+            "system prompt 必须说明首子目录即执行者工作区根:\n{sys}"
+        );
+        assert!(
+            sys.contains("/workspace/<workspace_subdirs[0]>"),
+            "system prompt 必须给路径翻译模板:\n{sys}"
+        );
+        assert!(
+            sys.contains("声明之外的文件不在执行者可见范围"),
+            "system prompt 必须说明声明外目录不可见:\n{sys}"
+        );
+        let drv = EXEC_REVIEW_DRIVER_PROMPT;
+        assert!(
+            drv.contains("/inputs/sandbox.json"),
+            "driver prompt 必须让审查者读 sandbox.json:\n{drv}"
+        );
+        assert!(
+            drv.contains("workspace_subdirs[0]") && drv.contains("/workspace/<workspace_subdirs[0]>"),
+            "driver prompt 必须含路径翻译步骤:\n{drv}"
+        );
+        assert!(
+            drv.contains("不要把\"执行者在 ws/<首子目录> 下写出的文件\"误判为\"不在 workspace 根\""),
+            "driver prompt 必须显式防 P/FidelityDispute 误判:\n{drv}"
+        );
+    }
+
+    #[test]
+    fn plan_review_prompts_mandate_mount_semantics() {
+        // R6f：计划审查 prompt 必须带挂载语义——节点 workspace_subdirs[0] 即该
+        // 节点工作区根 /workspace，契约"根目录"措辞应与首个子目录一致（计划审查
+        // 判契约措辞 vs 挂载一致性）。
+        let sys = PLAN_REVIEW_SYSTEM_PROMPT;
+        assert!(
+            sys.contains("workspace_subdirs[0]") && sys.contains("工作区根 /workspace"),
+            "plan system prompt 必须说明首子目录即节点根:\n{sys}"
+        );
+        assert!(
+            sys.contains("不是审查者看到的宿主 ws 全量根"),
+            "plan system prompt 必须区分执行者根 vs 全量根:\n{sys}"
+        );
+        let drv = PLAN_REVIEW_DRIVER_PROMPT;
+        assert!(
+            drv.contains("挂载一致性检查") && drv.contains("workspace_subdirs[0]"),
+            "plan driver prompt 必须做挂载一致性检查:\n{drv}"
+        );
+    }
+
+    #[test]
+    fn plan_review_inputs_writes_sandbox_from_first_node() {
+        // R6f：计划审查 sandbox.json 从首节点 workspace_subdirs 派生（compose
+        // 挂载要求 /inputs/sandbox.json 源存在；计划审查判契约措辞一致性也用）。
+        let req = OwnerRequest::new("req-1", "t", "d", "a");
+        let mut node = alfred_core::dagspec::PlanNode::new("task-1", "s", contract());
+        node.sandbox.workspace_subdirs = vec!["src".into(), "tests".into()];
+        let dag = alfred_core::DagSpec::new("req-1", vec![node]);
+        let inputs = plan_review_inputs(&req, &dag, None, None).unwrap();
+        let files: std::collections::HashMap<String, String> = inputs.into_iter().collect();
+        let sb: serde_json::Value = serde_json::from_str(&files["sandbox.json"]).unwrap();
+        assert_eq!(sb["workspace_subdirs"], serde_json::json!(["src", "tests"]));
     }
 
     #[test]

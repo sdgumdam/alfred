@@ -378,6 +378,7 @@ fn exec_review_step(
             &ctx.reviewer_model,
             &run.request,
             &contract,
+            &node.sandbox.workspace_subdirs,
             conversation.as_ref(),
         )?;
         (

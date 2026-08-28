@@ -27,6 +27,11 @@ pub struct ExecReviewArgs {
     #[arg(long)]
     pub contract: PathBuf,
 
+    /// 执行者挂载语义：workspace_subdirs（逗号分隔，如 "output" 或 "src,tests"）；
+    /// 首个子目录 = 执行者工作区根 /workspace，契约"根目录"按此翻译。缺省空。
+    #[arg(long, default_value = "")]
+    pub workspace_subdirs: String,
+
     /// ws 全量目录（执行者产物；挂载到容器 /workspace ro）。
     #[arg(long)]
     pub ws_dir: PathBuf,
@@ -62,6 +67,14 @@ pub fn exec_review(args: ExecReviewArgs) -> Result<()> {
         .with_context(|| format!("read contract {}", args.contract.display()))?;
     let contract: Contract = serde_json::from_str(&contract_text)
         .with_context(|| format!("parse Contract {}", args.contract.display()))?;
+    // R6f：执行者挂载语义——workspace_subdirs[0] 即执行者 /workspace 根（契约
+    // "根目录"落点）。逗号分隔解析；空串 = 空声明（审查者按字面路径判）。
+    let workspace_subdirs: Vec<String> = args
+        .workspace_subdirs
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let reviewer = load_reviewer_model()?;
     if let Ok(executor) = load_executor_model() {
@@ -110,8 +123,9 @@ pub fn exec_review(args: ExecReviewArgs) -> Result<()> {
     println!("  run_dir  : {}", run_dir.display());
     println!("  ws_dir   : {}", args.ws_dir.display());
     println!("  request  : {}", request.id);
+    println!("  subdirs  : {:?}", workspace_subdirs);
 
-    let outcome = execute_exec_review(&opts, &reviewer, &request, &contract, conversation.as_ref())?;
+    let outcome = execute_exec_review(&opts, &reviewer, &request, &contract, &workspace_subdirs, conversation.as_ref())?;
 
     println!();
     println!("eval status      : {}", outcome.eval_status);
