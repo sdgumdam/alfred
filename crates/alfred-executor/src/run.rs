@@ -148,9 +148,11 @@ pub fn init_workspace_git(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 校验 executor 沙箱档案（R6e）：仅允许契约声明的 `workspace_subdirs` 子集挂载
-/// （M5 显式声明制）。volumes/runtime/packages/network 执行驱动尚不支持——按审计
-/// 约束显式拒绝而非静默忽略，防止"申请的约束没生效"。
+/// 校验 executor 沙箱档案（R6e）：仅允许契约声明的 `workspace_subdirs` 子集挂载。
+/// **空声明 = 防御性报错**（R6e 块B：executor ws 挂载非空保证——空声明是计划
+/// 缺陷，计划审查应打回重规划；不静默跳过挂载、不静默回退挂全量）。
+/// volumes/runtime/packages/network 执行驱动尚不支持——按审计约束显式拒绝而非
+/// 静默忽略，防止"申请的约束没生效"。
 fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
     if !sandbox.volumes.is_empty()
         || sandbox.runtime.is_some()
@@ -159,6 +161,13 @@ fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
     {
         bail!(
             "executor 沙箱档案不支持 volumes/runtime/packages/network（当前 sandbox={sandbox:?}）；仅支持 workspace_subdirs 子集挂载"
+        );
+    }
+    if sandbox.workspace_subdirs.is_empty() {
+        // R6e 块B：executor ws 挂载非空保证——空声明 = 计划缺陷（计划审查应打回
+        // 重规划），executor 侧防御性失败：不静默跳过挂载、不静默回退挂全量。
+        bail!(
+            "executor 沙箱 workspace_subdirs 为空：计划审查应拦截，executor 挂载不能为空（拒绝空声明，不挂全量）"
         );
     }
     Ok(())
@@ -173,8 +182,8 @@ pub fn execute_run(
     request: &OwnerRequest,
 ) -> Result<RunOutcome> {
     // 沙箱档案校验（R6e）：executor 支持契约声明的 workspace_subdirs 子集挂载
-    // （M5 显式声明制）；volumes/runtime/packages/network 显式拒绝（审计约束：
-    // 防止"申请的约束没生效"）。见 validate_executor_sandbox。
+    // （R6e 块B：非空挂载保证，空声明防御性报错）；volumes/runtime/packages/network
+    // 显式拒绝（审计约束：防止"申请的约束没生效"）。见 validate_executor_sandbox。
     validate_executor_sandbox(&opts.assignment.sandbox)?;
     let started_at = now_rfc3339();
     let run_id = match opts.run_dir.file_name().and_then(|s| s.to_str()) {
@@ -207,9 +216,9 @@ pub fn execute_run(
 
     // 3) 生成 compose + task.py
     let compose_path = run_dir.join("executor.compose.yaml");
-    // R6e：executor 容器挂载 = workspace_subdirs 声明子集（rw），非全量 ws（M5 显式
-    // 声明制；空 subdirs = 不挂 ws）。参考卷/AGT 挂载留待后续块（当前 sandbox 校验
-    // 已拒绝 volumes；AGT 未接入 run 路径）。
+    // R6e：executor 容器挂载 = workspace_subdirs 声明子集（rw），非全量 ws（块B：
+    // 非空挂载保证——空 subdirs 已被 validate_executor_sandbox 防御性报错）。
+    // 参考卷/AGT 挂载留待后续块（当前 sandbox 校验已拒绝 volumes；AGT 未接入 run 路径）。
     let mounts = ExecutorMounts {
         workspace_subdirs: opts.assignment.sandbox.workspace_subdirs.clone(),
         ..Default::default()
@@ -447,9 +456,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_sandbox_allows_default_and_workspace_subdirs() {
-        // R6e：默认档案 + workspace_subdirs 子集挂载通过（M5 显式声明制）
-        assert!(validate_executor_sandbox(&SandboxProfile::default()).is_ok());
+    fn validate_sandbox_rejects_empty_workspace_subdirs() {
+        // R6e 块B：executor ws 挂载非空保证——空声明防御性报错（不静默跳过/不挂全量）
+        let err = validate_executor_sandbox(&SandboxProfile::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("workspace_subdirs 为空"),
+            "空 subdirs 必须报错，got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_allows_nonempty_workspace_subdirs() {
+        // R6e 块B：非空 workspace_subdirs 子集挂载通过（挂载非空保证）
         let mut sb = SandboxProfile::default();
         sb.workspace_subdirs = vec!["src".into(), "tests".into()];
         assert!(validate_executor_sandbox(&sb).is_ok());

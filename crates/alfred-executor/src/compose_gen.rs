@@ -7,8 +7,8 @@
 //!   canonicalize 后路径才与 docker/报错信息一致。
 //!
 //! R6a（三容器挂载矩阵）：`generate_executor_compose` 落矩阵 §1.1 executor 行——
-//! `workspace_subdirs` 子集投影（空 = 不挂 ws，M5 已定）+ 参考卷 ro + AGT 挂载；
-//! planner/reviewer 模板见 `docker/planner.compose.yaml.tmpl` /
+//! `workspace_subdirs` 子集投影（非空挂载，R6e 块B：空声明防御性报错）+ 参考卷 ro
+//! + AGT 挂载；planner/reviewer 模板见 `docker/planner.compose.yaml.tmpl` /
 //! `docker/reviewer.compose.yaml.tmpl`（静态模板，编排器渲染占位符）。
 
 use std::path::{Path, PathBuf};
@@ -42,8 +42,9 @@ pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
 
 /// executor 容器挂载参数（R6a：矩阵 §1.1 executor 行落码）。
 ///
-/// - `workspace_subdirs`：契约声明的工作区子目录（相对持久 ws）。空 = 不挂 ws
-///   （M5 已定：方案推荐 a，显式声明制）。
+/// - `workspace_subdirs`：契约声明的工作区子目录（相对持久 ws）。**非空必挂**
+///   （R6e 块B：executor ws 挂载非空保证）；空 = 防御性报错（计划审查应打回
+///   重规划，executor 不静默跳过、不静默挂全量）。
 /// - `ref_volumes`：只读参考卷（`SandboxProfile.volumes`，档案声明）。
 /// - `agt_dir`：AGT 策略目录（policy.json/agt-policy.ts，挂到 `/tmp/.agt`，ro）。
 /// - `agt_audit_dir`：AGT 审计输出子目录（挂到 `/tmp/.agt/audit`，rw——
@@ -82,7 +83,8 @@ pub fn validate_workspace_subdir(sub: &str) -> Result<()> {
 /// - 参考卷 → `<container_path>`（ro，按 `VolumeMount` 声明）；
 /// - AGT 策略目录 → `/tmp/.agt`（ro，agent 不可改策略）；
 /// - AGT 审计子目录 → `/tmp/.agt/audit`（rw，审计 JSONL 落此）。
-/// 空 subdirs → 不挂 ws（M5 已定：显式声明制）。
+/// 空 subdirs → 防御性报错（R6e 块B：executor ws 挂载非空保证——空声明是计划
+/// 缺陷，计划审查应打回重规划；executor 不静默跳过、不静默回退挂全量）。
 pub fn generate_executor_compose(
     workspace_host_dir: &Path,
     image: &str,
@@ -91,27 +93,30 @@ pub fn generate_executor_compose(
     let abs = canonicalize_workspace(workspace_host_dir)?;
     let mut volumes: Vec<String> = Vec::new();
     if mounts.workspace_subdirs.is_empty() {
-        // M5(a)：空 subdirs = 不挂 ws（显式声明制）——不加任何 ws 子目录卷。
-    } else {
-        for (i, sub) in mounts.workspace_subdirs.iter().enumerate() {
-            // R6a：子目录必须相对且不越界（校验与 run.rs 预建子目录共用
-            // `validate_workspace_subdir`，单一真源）。
-            validate_workspace_subdir(sub)?;
-            let host = abs.join(sub);
-            if !host.exists() {
-                bail!(
-                    "workspace subdir '{}' does not exist under {} (declared in workspace_subdirs)",
-                    sub,
-                    abs.display()
-                );
-            }
-            let target = if i == 0 {
-                CONTAINER_WORKSPACE_DIR.to_string()
-            } else {
-                format!("{}/{}", CONTAINER_WORKSPACE_DIR, sub)
-            };
-            volumes.push(format!("{}:{}:rw", host.display(), target));
+        // R6e 块B：executor 挂载非空保证——空声明是计划缺陷（计划审查应打回
+        // 重规划），executor 侧防御性失败：不静默跳过挂载、不静默回退挂全量。
+        bail!(
+            "executor 沙箱 workspace_subdirs 为空：计划审查应拦截，executor 挂载不能为空（拒绝空声明，不挂全量）"
+        );
+    }
+    for (i, sub) in mounts.workspace_subdirs.iter().enumerate() {
+        // R6a：子目录必须相对且不越界（校验与 run.rs 预建子目录共用
+        // `validate_workspace_subdir`，单一真源）。
+        validate_workspace_subdir(sub)?;
+        let host = abs.join(sub);
+        if !host.exists() {
+            bail!(
+                "workspace subdir '{}' does not exist under {} (declared in workspace_subdirs)",
+                sub,
+                abs.display()
+            );
         }
+        let target = if i == 0 {
+            CONTAINER_WORKSPACE_DIR.to_string()
+        } else {
+            format!("{}/{}", CONTAINER_WORKSPACE_DIR, sub)
+        };
+        volumes.push(format!("{}:{}:rw", host.display(), target));
     }
     for vol in &mounts.ref_volumes {
         // E1 防呆：参考卷宿主路径必须绝对（相对路径被 docker 静默变 named volume）
@@ -248,14 +253,15 @@ mod tests {
     }
 
     #[test]
-    fn executor_compose_empty_subdirs_mounts_no_workspace() {
-        // M5 已定：空 subdirs = 不挂 ws（显式声明制）
+    fn executor_compose_empty_subdirs_errors() {
+        // R6e 块B：executor ws 挂载非空保证——空 workspace_subdirs 防御性报错
+        // （不静默跳过挂载、不静默回退挂全量）
         let ws = home_dir("empty");
         let mounts = ExecutorMounts::default();
-        let yaml = generate_executor_compose(&ws, "alfred-executor:latest", &mounts).unwrap();
+        let err = generate_executor_compose(&ws, "alfred-executor:latest", &mounts).unwrap_err();
         assert!(
-            !yaml.contains(":/workspace"),
-            "empty subdirs 不得挂 ws 卷，got:\n{yaml}"
+            err.to_string().contains("workspace_subdirs 为空"),
+            "空 subdirs 必须报错，got: {err}"
         );
         std::fs::remove_dir_all(&ws).ok();
     }
