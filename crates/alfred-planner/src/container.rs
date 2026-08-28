@@ -482,7 +482,7 @@ mod tests {
         );
         // AGT ro
         assert!(
-            yaml.contains(&format!("{}:/workspace/.agt:ro", agt.canonicalize().unwrap().display())),
+            yaml.contains(&format!("{}:/tmp/.agt:ro", agt.canonicalize().unwrap().display())),
             "agt ro mount missing:\n{yaml}"
         );
         assert!(yaml.contains("network_mode: none"), "network none missing:\n{yaml}");
