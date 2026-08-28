@@ -14,7 +14,7 @@
 #   {request_path}  → {run_dir}/request.json
 #   {session_path}  → {run_dir}/session.json（投影后会话文档）
 #   {contract_path} → {run_dir}/contract.json（planner 自己写的契约，只读回看）
-#   {agt_dir}       → AGT 策略 + 扩展目录（挂到 /workspace/.agt，ro）
+#   {agt_dir}       → AGT 策略 + 扩展目录（挂到 /tmp/.agt，ro）
 #   {outputs_dir}   → 容器产出挂载（建图指令/DagSpec 写 /outputs，rw）
 # 只读参考卷（矩阵"按需 ro"行）由编排器按 SandboxProfile.volumes 动态追加，
 # 不在本模板写死。

@@ -20,7 +20,7 @@ pub struct PlannerTaskGenParams {
     pub driver_prompt: String,
     /// 容器内产出文件绝对路径（"/outputs/instructions.json" 或 "/outputs/session.json"）。
     pub output_file: String,
-    /// AGT 扩展路径（"/workspace/.agt/agt-policy.ts"）；空串 = 不加载。
+    /// AGT 扩展路径（"/tmp/.agt/agt-policy.ts"）；空串 = 不加载。
     pub agt_ext: String,
     /// 桥代理端口基数（每样本自增）。
     pub port_base: u32,
@@ -102,7 +102,7 @@ mod tests {
             system_prompt: "system 规则：建图指令序列。".into(),
             driver_prompt: "读 /inputs，写 /outputs/instructions.json".into(),
             output_file: "/outputs/instructions.json".into(),
-            agt_ext: "/workspace/.agt/agt-policy.ts".into(),
+            agt_ext: "/tmp/.agt/agt-policy.ts".into(),
             port_base: 13200,
             pi_model: "inspect-bridge/inspect".into(),
             workspace_dir: "/workspace".into(),
@@ -121,7 +121,7 @@ mod tests {
         assert!(py.contains(r#"PORT_BASE = int(13200)"#));
         assert!(py.contains(r#"PI_MODEL = "inspect-bridge/inspect""#));
         assert!(py.contains(r#"OUTPUT_FILE = "/outputs/instructions.json""#));
-        assert!(py.contains(r#"AGT_EXT = "/workspace/.agt/agt-policy.ts""#));
+        assert!(py.contains(r#"AGT_EXT = "/tmp/.agt/agt-policy.ts""#));
         // 不得残留 token
         assert!(!py.contains("__COMPOSE_FILE_JSON__"));
         assert!(!py.contains("__MODE_JSON__"));
