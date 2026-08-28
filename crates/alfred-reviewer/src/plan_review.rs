@@ -76,6 +76,24 @@ pub fn default_review_dir() -> PathBuf {
     base.join(short_id("planreview"))
 }
 
+/// R6e(补A)：计划审查强制 workspace_subdirs 声明——每个执行节点必须有非空
+/// `workspace_subdirs`（属主原话："执行者只能看到 ws 中的部分内容"，workspace_subdirs
+/// 是执行节点的强制约束）。缺失/为空 → 计划不合格 → 打回重规划（空声明在计划层就
+/// 被拦，executor 永远拿不到空挂载）。
+///
+/// 返回 `(节点 id, verdict.reason 用原因)`；None = 所有节点都已声明。
+pub fn missing_workspace_subdirs(dagspec: &DagSpec) -> Option<(String, String)> {
+    for node in &dagspec.nodes {
+        if node.sandbox.workspace_subdirs.is_empty() {
+            return Some((
+                node.id.clone(),
+                format!("节点 {} 未声明 workspace_subdirs，执行者无法获知可见范围", node.id),
+            ));
+        }
+    }
+    None
+}
+
 ///
 /// R6c 调度：`container` 为 Some 且非离线（`ALFRED_OFFLINE` 未设）→ 容器路径
 /// （reviewer 容器读全量信息）；否则 → 旧 eval 直判路径（离线回归 / 独立子命令）。
@@ -86,6 +104,14 @@ pub fn execute_plan_review(
     dagspec: &DagSpec,
     session_doc: Option<&SessionDoc>,
 ) -> Result<PlanReviewOutcome> {
+    // R6e(补A)：计划审查结构闸门——任一执行节点缺/空 workspace_subdirs 声明 →
+    // 直接判不合格（pass=false）打回重规划，不派模型。空声明在计划层就被拦，
+    // executor 永远拿不到空挂载（属主："执行者只能看到 ws 中的部分内容"）。
+    if let Some((node_id, reason)) = missing_workspace_subdirs(dagspec) {
+        return reject_missing_workspace_subdirs(
+            opts, model, request, dagspec, &node_id, &reason,
+        );
+    }
     let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1");
     match &opts.container {
         Some(container) if !offline => execute_plan_review_container(
@@ -93,6 +119,70 @@ pub fn execute_plan_review(
         ),
         _ => execute_plan_review_eval(opts, model, request, dagspec, session_doc),
     }
+}
+
+/// R6e(补A)：计划审查结构闸门命中——节点缺 workspace_subdirs 声明 → 直接
+/// pass=false 打回重规划（不派模型，省一次审查 eval）。落 audit + state.json /
+/// verdict.json，调用方（治理环）读 `verdict` 判 PlanReviewRejected → 回退重规划。
+fn reject_missing_workspace_subdirs(
+    opts: &PlanReviewOptions,
+    model: &ExecutorModel,
+    request: &OwnerRequest,
+    dagspec: &DagSpec,
+    node_id: &str,
+    reason: &str,
+) -> Result<PlanReviewOutcome> {
+    let started_at = now_rfc3339();
+    let run_id = match opts.run_dir.file_name().and_then(|s| s.to_str()) {
+        Some(name) => name.to_string(),
+        None => short_id("planreview"),
+    };
+    let run_dir = &opts.run_dir;
+
+    std::fs::create_dir_all(run_dir)
+        .with_context(|| format!("create run dir {}", run_dir.display()))?;
+
+    // 输入落盘（P9 证据 + R3 续跑输入）。
+    std::fs::write(
+        run_dir.join("request.json"),
+        serde_json::to_string_pretty(request).context("serialize OwnerRequest")?,
+    )?;
+    std::fs::write(
+        run_dir.join("dagspec.json"),
+        serde_json::to_string_pretty(dagspec).context("serialize DagSpec")?,
+    )?;
+
+    append_audit(
+        run_dir,
+        "plan_review_started",
+        &serde_json::json!({ "run_id": run_id, "request_id": request.id }),
+    )?;
+    append_audit(
+        run_dir,
+        "plan_review_rejected_missing_workspace_subdirs",
+        &serde_json::json!({ "node_id": node_id, "reason": reason }),
+    )?;
+
+    let rec = PlanReviewOutcome {
+        run_id,
+        request_id: request.id.clone(),
+        reviewer_model: model.inspect_model_id(),
+        // 结构闸门命中：不派模型，无 eval——状态显式标 skipped（诚实，非 success/error）。
+        eval_status: "skipped".to_string(),
+        eval_location: None,
+        verdict: Some(PlanVerdict::new(false, reason)),
+        unscored_reason: None,
+        started_at,
+        finished_at: now_rfc3339(),
+        error: None,
+    };
+    write_state(run_dir, request, dagspec, &rec)?;
+    append_audit(
+        run_dir,
+        "plan_review_finished",
+        &serde_json::json!({ "status": "skipped", "verdict": rec.verdict, "error": rec.error }),
+    )?;
+    Ok(rec)
 }
 
 /// 旧 eval 直判路径（离线回归 / 独立 plan-review）。
@@ -543,5 +633,122 @@ mod tests {
         // R6c：缺省走旧 eval 路径（独立 plan-review / 离线回归）
         let opts = PlanReviewOptions::default();
         assert!(opts.container.is_none());
+    }
+
+    // ---- R6e(补A)：计划审查强制 workspace_subdirs 声明 ----
+
+    fn node_with_subdirs(id: &str, subdirs: &[&str]) -> alfred_core::dagspec::PlanNode {
+        alfred_core::dagspec::PlanNode {
+            id: id.into(),
+            summary: "task".into(),
+            contract: alfred_core::contract::Contract {
+                prompt: "do the thing".into(),
+                acceptance_criteria: "thing done".into(),
+                reviewer_models: vec![],
+            },
+            sandbox: alfred_core::contract::SandboxProfile {
+                workspace_subdirs: subdirs.iter().map(|s| s.to_string()).collect(),
+                ..alfred_core::contract::SandboxProfile::default()
+            },
+        }
+    }
+
+    fn dag(nodes: Vec<alfred_core::dagspec::PlanNode>) -> DagSpec {
+        DagSpec::new("req-1", nodes)
+    }
+
+    fn sample_model() -> ExecutorModel {
+        ExecutorModel {
+            provider: "test".into(),
+            model: "test-model".into(),
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            max_tokens: 1024,
+            raw_id: true,
+        }
+    }
+
+    #[test]
+    fn missing_workspace_subdirs_detects_empty_declaration() {
+        // 节点缺/空 workspace_subdirs → 命中，reason 点名节点 id
+        let d = dag(vec![node_with_subdirs("task-1", &[])]);
+        let hit = missing_workspace_subdirs(&d);
+        assert_eq!(hit.as_ref().map(|(id, _)| id.as_str()), Some("task-1"));
+        let reason = hit.unwrap().1;
+        assert!(
+            reason.contains("task-1") && reason.contains("workspace_subdirs"),
+            "reason 应点名节点并说明缺失：{reason}"
+        );
+        assert!(reason.contains("执行者无法获知可见范围"), "reason 应说明后果：{reason}");
+    }
+
+    #[test]
+    fn missing_workspace_subdirs_allows_declared_nodes() {
+        // 所有节点都声明非空 workspace_subdirs → 放行
+        let d = dag(vec![
+            node_with_subdirs("task-1", &["src"]),
+            node_with_subdirs("task-2", &["tests", "docs"]),
+        ]);
+        assert!(missing_workspace_subdirs(&d).is_none());
+    }
+
+    #[test]
+    fn missing_workspace_subdirs_detects_first_missing() {
+        // 多节点：返回第一个缺声明的节点
+        let d = dag(vec![
+            node_with_subdirs("task-1", &["src"]),
+            node_with_subdirs("task-2", &[]),
+            node_with_subdirs("task-3", &[]),
+        ]);
+        let hit = missing_workspace_subdirs(&d);
+        assert_eq!(hit.as_ref().map(|(id, _)| id.as_str()), Some("task-2"));
+    }
+
+    fn home_run_dir(tag: &str) -> PathBuf {
+        let home = std::env::var("HOME").unwrap();
+        let dir = Path::new(&home).join(format!(".local/state/alfred/test-plan-review-r6e-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn execute_plan_review_rejects_missing_workspace_subdirs() {
+        // 计划审查结构闸门：节点缺 workspace_subdirs → 不派模型，直接 pass=false
+        // 打回重规划（PlanReviewRejected → 回退 planner）。verdict/state/audit 落盘。
+        let run_dir = home_run_dir("reject");
+        let opts = PlanReviewOptions {
+            run_dir: run_dir.clone(),
+            time_limit_secs: 300,
+            ctl_enabled: false,
+            container: None,
+        };
+        let req = OwnerRequest::new("req-r6e-a", "t", "d", "a");
+        let d = dag(vec![node_with_subdirs("task-1", &[])]);
+        let out = execute_plan_review(&opts, &sample_model(), &req, &d, None).unwrap();
+
+        // 结论：pass=false + reason 点名节点（不派模型：eval_status=skipped）
+        assert_eq!(out.eval_status, "skipped");
+        let v = out.verdict.expect("结构闸门必须产出 verdict");
+        assert!(!v.pass, "缺 workspace_subdirs 的计划必须打回");
+        assert!(
+            v.reason.contains("task-1") && v.reason.contains("workspace_subdirs"),
+            "reason 应点名节点：{}",
+            v.reason
+        );
+        assert_eq!(out.unscored_reason, None);
+
+        // 落盘证据：verdict.json（pass=false）+ state.json + audit.jsonl（拒绝事件）
+        let verdict_text = std::fs::read_to_string(run_dir.join("verdict.json")).unwrap();
+        let verdict_json: Value = serde_json::from_str(&verdict_text).unwrap();
+        assert_eq!(verdict_json["verdict"]["pass"], false);
+        let audit_text = std::fs::read_to_string(run_dir.join("audit.jsonl")).unwrap();
+        assert!(
+            audit_text.contains("plan_review_rejected_missing_workspace_subdirs"),
+            "audit 应记录结构闸门拒绝事件"
+        );
+        assert!(run_dir.join("state.json").exists());
+        assert!(run_dir.join("request.json").exists());
+        assert!(run_dir.join("dagspec.json").exists());
+        std::fs::remove_dir_all(&run_dir).ok();
     }
 }
