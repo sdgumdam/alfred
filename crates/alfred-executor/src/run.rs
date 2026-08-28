@@ -12,7 +12,6 @@ use alfred_core::assignment::TaskAssignment;
 use alfred_core::contract::SandboxProfile;
 use alfred_core::request::OwnerRequest;
 use alfred_core::util::{now_rfc3339, short_id};
-use alfred_core::verdict::ExecVerdict;
 use serde::Serialize;
 
 use crate::artifact::{collect_artifact, snapshot_workspace};
@@ -74,10 +73,6 @@ pub struct RunOutcome {
     pub finished_at: String,
     /// 失败原因（eval status error / timed_out / crashed 各自填）；成功为 None。
     pub error: Option<String>,
-    /// 执行审查结论（R2：scorer 判 C/I/P）。unscored 时为 None。
-    pub verdict: Option<ExecVerdict>,
-    /// 执行审查 unscored 原因（verdict_parse_failure 等）；成功判分为 None。
-    pub verdict_unscored_reason: Option<String>,
 }
 
 /// run 目录缺省基座（`ALFRED_STATE_DIR` 或 `~/.local/state/alfred/runs`）。
@@ -92,13 +87,11 @@ pub fn default_run_dir() -> PathBuf {
 }
 
 ///
-/// `grader` 为执行审查 scorer 的判分模型（config roles.reviewer）；R2 起
-/// 执行 eval 内嵌 ExecVerdict scorer，grader 经 `--model-role` 绑定并注入
-/// 其 provider key。
+/// R6d：执行 eval 只出产物——不再绑定 grader（内嵌 scorer 已移除，执行审查
+/// 由 reviewer 容器承担，见 governance exec_review_step）。
 pub fn execute_run(
     opts: &RunOptions,
     model: &ExecutorModel,
-    grader: Option<&ExecutorModel>,
     request: &OwnerRequest,
 ) -> Result<RunOutcome> {
     // 沙箱档案校验：R1 只支持默认档案（无挂卷 / 无 runtime / 无依赖 / 联网拒绝）。
@@ -153,7 +146,7 @@ pub fn execute_run(
     append_audit(run_dir, "run_started", &serde_json::json!({ "run_id": run_id, "task_id": opts.assignment.task_id }))?;
 
     // 4) spawn detached eval
-    let launch = spawn_eval(&task_py, model, grader, &evals_dir, opts.time_limit_secs)?;
+    let launch = spawn_eval(&task_py, model, None, &evals_dir, opts.time_limit_secs)?;
     append_audit(
         run_dir,
         "eval_launched",
@@ -173,7 +166,7 @@ pub fn execute_run(
             );
             fail_run(
                 run_dir, request, opts, model, &run_id, &started_at,
-                "timed_out", None, "eval_timed_out", "eval_timed_out", &msg,
+                "timed_out", None, "eval_timed_out", &msg,
             )?;
             bail!(msg);
         }
@@ -185,7 +178,7 @@ pub fn execute_run(
             );
             fail_run(
                 run_dir, request, opts, model, &run_id, &started_at,
-                "crashed", None, "eval_crashed", "eval_crashed", &msg,
+                "crashed", None, "eval_crashed", &msg,
             )?;
             bail!(msg);
         }
@@ -207,15 +200,11 @@ pub fn execute_run(
             fail_run(
                 run_dir, request, opts, model, &run_id, &started_at,
                 &outcome.status, Some(&outcome.location),
-                "eval_log_archive_failed", "eval_log_archive_failed", &msg,
+                "eval_log_archive_failed", &msg,
             )?;
             bail!(msg);
         }
     };
-    // R6d：执行 eval 恒无审查结论（无内嵌 scorer）。
-    let verdict = None;
-    let verdict_unscored_reason = None;
-
     // 7) 产物采集（执行后快照 → diff）
     let artifact = collect_artifact(&opts.assignment.task_id, &workspace_host, &before)?;
     append_audit(
@@ -242,8 +231,6 @@ pub fn execute_run(
         started_at,
         finished_at,
         error: eval_error,
-        verdict,
-        verdict_unscored_reason,
     };
     write_state(run_dir, request, &rec)?;
     append_audit(run_dir, "run_finished", &serde_json::json!({ "status": outcome.status, "error": rec.error }))?;
@@ -258,9 +245,8 @@ pub fn execute_run(
 
 /// 失败路径统一构造 RunOutcome + 落 audit + 落盘 state.json（不悄悄放行）。
 ///
-/// R2Audit2 修复：eval 异常（timed_out/crashed）与 verdict 提取失败
-/// （archive/read/parse）共用——不再用 if-let 静默吞错误。填 error 后以
-/// Err 上报给调用方（§6：审查出错必须升级属主，不允许"出错就悄悄放行"）。
+/// eval 异常（timed_out/crashed）与 eval log 归档失败共用——不再用 if-let
+/// 静默吞错误。填 error 后以 Err 上报给调用方（不悄悄放行）。
 #[allow(clippy::too_many_arguments)]
 fn fail_run(
     run_dir: &Path,
@@ -272,7 +258,6 @@ fn fail_run(
     eval_status: &str,
     eval_location: Option<&str>,
     event: &str,
-    unscored_reason: &str,
     msg: &str,
 ) -> Result<()> {
     append_audit(run_dir, event, &serde_json::json!({ "run_id": run_id, "error": msg }))?;
@@ -286,8 +271,6 @@ fn fail_run(
         started_at: started_at.to_string(),
         finished_at: now_rfc3339(),
         error: Some(msg.to_string()),
-        verdict: None,
-        verdict_unscored_reason: Some(unscored_reason.to_string()),
     };
     write_state(run_dir, request, &rec)?;
     Ok(())
@@ -363,7 +346,7 @@ mod tests {
             acceptance_criteria: "a".into(),
             created_at: "2026-08-25T00:00:00Z".into(),
         };
-        let err = execute_run(&opts, &model, None, &request).unwrap_err();
+        let err = execute_run(&opts, &model, &request).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("R1 不支持非默认沙箱档案"),

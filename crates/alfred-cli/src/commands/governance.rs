@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use alfred_core::conversation::{
-    append_to_disk, ConversationRole, ConversationSource,
+    append_to_disk, load_conversation, ConversationRole, ConversationSource,
 };
 use alfred_core::governance::{GovernanceEvent, GovernanceRun};
 use alfred_core::util::now_rfc3339;
@@ -20,6 +20,7 @@ use alfred_executor::config::ExecutorModel;
 use alfred_executor::run::{execute_run, RunOptions};
 use alfred_planner::converse::{converse, ConverseOptions};
 use alfred_planner::maintain::{maintain, MaintainOptions, MaintainTrigger};
+use alfred_reviewer::exec_review::{execute_exec_review, ExecReviewOptions};
 use alfred_reviewer::plan_review::{execute_plan_review, PlanReviewOptions};
 use alfred_reviewer::ReviewerContainerOptions;
 use serde_json::Value;
@@ -271,7 +272,7 @@ fn execution_step(
         settle_grace_seconds: run.options.settle_grace_seconds,
         ctl_enabled: run.options.ctl_enabled,
     };
-    match execute_run(&opts, &ctx.executor_model, Some(&ctx.reviewer_model), &run.request) {
+    match execute_run(&opts, &ctx.executor_model, &run.request) {
         Ok(outcome) => {
             audit(
                 &ctx.run_dir,
@@ -323,16 +324,69 @@ fn execution_step(
     }
 }
 
-/// ExecReviewing：读执行审查结论（内嵌 scorer 已判 C/I/P）→ §3.3 路由。
+/// ExecReviewing：执行审查改调 reviewer 容器（ws 全量 ro + 对话记录）→ §3.3 路由。
+///
+/// R6d：不再读执行 eval 内嵌 verdict（scorer 已移除，执行 eval 只出产物）。
+/// 执行审查由 `execute_exec_review`（alfred-reviewer）在独立 reviewer 容器内
+/// 判产物 vs 验收标准——容器挂 **ws 全量 ro**（执行者产物 exec-{n}/workspace），
+/// 审查者自己读 ws 全量（含超过旧 scorer 4000B/文件截断的内容）。
+/// 离线回退（ALFRED_OFFLINE=1）：不跑容器（无 docker）——执行 eval 无审查
+/// 结论 → 升级属主（§六继承项，不悄悄放行）。
 fn exec_review_step(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
     pending: &mut Option<alfred_executor::run::RunOutcome>,
 ) -> Result<()> {
-    let outcome = pending
+    // 消费执行 outcome（Executing → ExecReviewing 跨态传递；R6d 后执行 eval
+    // 不携带审查结论，仅保留跨态约束）。
+    pending
         .take()
         .context("governance state ExecReviewing without execution outcome")?;
-    match outcome.verdict.clone() {
+    let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1");
+
+    let (verdict, unscored_reason) = if offline {
+        (
+            None,
+            "offline: 执行审查容器跳过（ALFRED_OFFLINE=1，执行 eval 无内嵌 scorer）"
+                .to_string(),
+        )
+    } else {
+        let dagspec = run
+            .dagspec
+            .clone()
+            .context("governance state ExecReviewing without dagspec")?;
+        let node = dagspec
+            .nodes
+            .first()
+            .context("dagspec has no nodes (exec review)")?
+            .clone();
+        let contract = node.contract;
+        let conversation = load_conversation(&ctx.run_dir)
+            .map_err(anyhow::Error::msg)
+            .ok()
+            .flatten();
+        // 执行审查看执行者产物：exec-{n}/workspace（execute_run 的产物工作区）。
+        let exec_dir = ctx.run_dir.join(format!("exec-{}", run.execution_count));
+        let ws_dir = exec_dir.join("workspace");
+        let exec_review_dir = ctx.run_dir.join("exec-review");
+        let opts = ExecReviewOptions::from_governance(exec_review_dir, ws_dir, &run.options);
+        let outcome = execute_exec_review(
+            &opts,
+            &ctx.reviewer_model,
+            &run.request,
+            &contract,
+            conversation.as_ref(),
+        )?;
+        (
+            outcome.verdict,
+            outcome
+                .unscored_reason
+                .or(outcome.error)
+                .unwrap_or_else(|| "exec review unscored".to_string()),
+        )
+    };
+
+    match verdict {
         Some(v) => {
             run.exec_verdicts.push(v.clone());
             let decision = alfred_core::route(&v).map_err(|e| anyhow::anyhow!(e))?;
@@ -386,15 +440,11 @@ fn exec_review_step(
             }
         }
         None => {
-            // §六继承项：执行审查本身出错（unscored）→ 升级，不悄悄放行。
-            let reason = outcome
-                .verdict_unscored_reason
-                .or(outcome.error)
-                .unwrap_or_else(|| "exec review unscored".to_string());
+            // §六继承项：执行审查本身出错（unscored / 离线回退）→ 升级，不悄悄放行。
             audit(
                 &ctx.run_dir,
                 "exec_review_error_escalated",
-                &serde_json::json!({ "reason": reason }),
+                &serde_json::json!({ "reason": unscored_reason }),
             )?;
             run.apply(GovernanceEvent::ExecReviewError)?;
         }
@@ -495,6 +545,113 @@ pub fn default_governance_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model(provider: &str) -> ExecutorModel {
+        ExecutorModel {
+            provider: provider.into(),
+            model: "m".into(),
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            max_tokens: 1024,
+            raw_id: false,
+        }
+    }
+
+    fn home_dir(tag: &str) -> PathBuf {
+        let home = std::env::var("HOME").unwrap();
+        let dir = Path::new(&home).join(format!(".local/state/alfred/test-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cleanup(dir: &Path) {
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn pending_outcome() -> alfred_executor::run::RunOutcome {
+        alfred_executor::run::RunOutcome {
+            run_id: "exec-1".into(),
+            task_id: "task-1".into(),
+            executor_model: "executor".into(),
+            eval_status: "success".into(),
+            eval_location: None,
+            artifact: None,
+            started_at: "t0".into(),
+            finished_at: "t1".into(),
+            error: None,
+        }
+    }
+
+    fn run_in_exec_reviewing() -> GovernanceRun {
+        let request = alfred_core::request::OwnerRequest::new("req-1", "t", "d", "a");
+        let mut run = GovernanceRun::new(
+            "run-exec-review",
+            request,
+            alfred_core::governance::GovernanceOptions::default(),
+        );
+        run.apply(GovernanceEvent::PlanProduced).unwrap();
+        run.apply(GovernanceEvent::PlanReviewPassed).unwrap();
+        run.apply(GovernanceEvent::ExecutionSucceeded).unwrap();
+        assert_eq!(
+            run.state(),
+            alfred_core::governance::GovernanceState::ExecReviewing
+        );
+        // 容器路径需要 dagspec + execution_count（离线路径不读，设上保持状态一致）。
+        let node = alfred_core::dagspec::PlanNode::new(
+            "task-1",
+            "create hello.txt",
+            alfred_core::contract::Contract {
+                prompt: "p".into(),
+                acceptance_criteria: "a".into(),
+                reviewer_models: vec![],
+            },
+        );
+        run.dagspec = Some(alfred_core::DagSpec::new("req-1", vec![node]));
+        run.execution_count = 1;
+        run
+    }
+
+    #[test]
+    fn exec_review_step_offline_falls_back_without_container() {
+        // R6d 离线回退：ALFRED_OFFLINE=1 → exec_review_step 不跑 reviewer 容器
+        // （无 docker），执行 eval 无审查结论 → 升级属主（§六继承项，不悄悄放行）。
+        // 本测试是 alfred-cli 内唯一碰 ALFRED_OFFLINE 的测试（无并行 env 冲突）。
+        std::env::set_var("ALFRED_OFFLINE", "1");
+
+        let run_dir = home_dir("exec-review-offline");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut run = run_in_exec_reviewing();
+        let ctx = GovernanceContext {
+            run_dir: run_dir.clone(),
+            planner_model: model("planner"),
+            executor_model: model("executor"),
+            reviewer_model: model("reviewer"),
+        };
+        let mut pending = Some(pending_outcome());
+
+        exec_review_step(&mut run, &ctx, &mut pending).unwrap();
+
+        // 升级属主（ExecReviewError → Escalated + escalation_source=Execution）
+        assert_eq!(run.state(), alfred_core::governance::GovernanceState::Escalated);
+        assert_eq!(
+            run.escalation_source,
+            Some(alfred_core::governance::EscalationSource::Execution)
+        );
+        // 未跑容器：无 exec-review 目录
+        assert!(
+            !run_dir.join("exec-review").exists(),
+            "离线回退不应创建 exec-review 目录"
+        );
+        // 审计含升级事件
+        let audit_text = std::fs::read_to_string(run_dir.join("audit.jsonl")).unwrap();
+        assert!(
+            audit_text.contains("exec_review_error_escalated"),
+            "audit 缺 exec_review_error_escalated：\n{audit_text}"
+        );
+
+        std::env::remove_var("ALFRED_OFFLINE");
+        cleanup(&run_dir);
+    }
 
     #[test]
     fn format_plan_reply_is_semantic_not_instruction_json() {
