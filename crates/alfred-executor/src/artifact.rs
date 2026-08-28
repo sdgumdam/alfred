@@ -1,4 +1,5 @@
-//! 产物采集：容器 workspace 卷（挂 run_dir/workspace，绝对路径）的文件比对。
+//! 产物采集：容器 workspace 卷（R6e：挂 run 级单一持久 ws `<run>/ws`，绝对路径）的
+//! 文件比对。
 //!
 //! 执行前后对工作区做快照（相对路径 + 大小 + SHA-256），差异即执行者产物。
 //! 跳过符号链接（防产物逃逸工作区）。
@@ -29,6 +30,11 @@ fn walk(root: &Path, dir: &Path, map: &mut BTreeMap<String, FileEntry>) -> Resul
             continue;
         }
         if ft.is_dir() {
+            // 跳过 VCS 内部目录（R6e：ws 是 git 仓库——`.git` 内部文件不算执行产物，
+            // 混入会污染 artifact 的文件清单/SHA，且让 diff 出现基线噪音）。
+            if path.file_name().and_then(|s| s.to_str()) == Some(".git") {
+                continue;
+            }
             walk(root, &path, map)?;
         } else if ft.is_file() {
             let rel = path
@@ -160,6 +166,26 @@ mod tests {
         let snap = snapshot_workspace(&dir).unwrap();
         assert!(snap.contains_key("real.txt"));
         assert!(!snap.contains_key("evil"), "symlink must be skipped");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_skips_git_dir() {
+        // R6e：ws 是 git 仓库（基线）——`.git` 内部文件不算执行产物，必须跳过，
+        // 否则污染 artifact 文件清单/SHA 且 diff 出现基线噪音。
+        let dir = std::env::temp_dir().join(format!("alfred-gitdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, ".git/HEAD", "ref: refs/heads/main\n");
+        write_file(&dir, ".git/config", "[core]\n");
+        write_file(&dir, "src/main.rs", "fn main() {}");
+        let snap = snapshot_workspace(&dir).unwrap();
+        assert!(snap.contains_key("src/main.rs"));
+        assert!(
+            snap.keys().all(|k| !k.starts_with(".git/")),
+            "`.git` 内部文件必须被跳过：{:?}",
+            snap.keys().collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

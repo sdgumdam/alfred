@@ -13,6 +13,7 @@ use alfred_core::conversation::{
 use alfred_core::governance::{GovernanceOptions, GovernanceRun};
 use alfred_core::request::OwnerRequest;
 use alfred_executor::config::{load_executor_model, load_planner_model, load_reviewer_model};
+use alfred_executor::run::ensure_run_workspace;
 use clap::Args;
 
 use super::governance::{
@@ -70,6 +71,9 @@ pub fn run(args: RunArgs) -> Result<()> {
     let run_dir = args.run_dir.clone().unwrap_or_else(default_governance_dir);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("create run dir {}", run_dir.display()))?;
+    // R6e：治理 run 初始化单一持久 ws（git init 基线快照）——三容器共享此 ws：
+    // executor 产物落 run/ws（rw），planner/reviewer 挂全量 ro（reviewer 看 git diff）。
+    ensure_run_workspace(&run_dir)?;
     std::fs::write(
         run_dir.join("request.json"),
         serde_json::to_string_pretty(&request).context("serialize OwnerRequest")?,

@@ -265,6 +265,9 @@ fn execution_step(
     let exec_dir = ctx.run_dir.join(format!("exec-{}", run.execution_count));
     let opts = RunOptions {
         run_dir: exec_dir.clone(),
+        // R6e：执行产物落 run 级单一持久 ws（`<run>/ws`，git 基线），exec-N 只做
+        // 记录（evals/task.py/compose/state.json）不挂产物。
+        workspace_dir: ctx.run_dir.join("ws"),
         image: run.options.image.clone(),
         assignment,
         time_limit_secs: run.options.exec_time_limit_secs,
@@ -328,7 +331,7 @@ fn execution_step(
 ///
 /// R6d：不再读执行 eval 内嵌 verdict（scorer 已移除，执行 eval 只出产物）。
 /// 执行审查由 `execute_exec_review`（alfred-reviewer）在独立 reviewer 容器内
-/// 判产物 vs 验收标准——容器挂 **ws 全量 ro**（执行者产物 exec-{n}/workspace），
+/// 判产物 vs 验收标准——容器挂 **ws 全量 ro**（执行者产物 run/ws，git 基线），
 /// 审查者自己读 ws 全量（含超过旧 scorer 4000B/文件截断的内容）。
 /// 离线回退（ALFRED_OFFLINE=1）：不跑容器（无 docker）——执行 eval 无审查
 /// 结论 → 升级属主（§六继承项，不悄悄放行）。
@@ -365,9 +368,9 @@ fn exec_review_step(
             .map_err(anyhow::Error::msg)
             .ok()
             .flatten();
-        // 执行审查看执行者产物：exec-{n}/workspace（execute_run 的产物工作区）。
-        let exec_dir = ctx.run_dir.join(format!("exec-{}", run.execution_count));
-        let ws_dir = exec_dir.join("workspace");
+        // R6e：执行审查看 run 级单一持久 ws（git 基线）——executor 产物在 run/ws，
+        // 不再挂 exec-{n}/workspace；reviewer 挂 ws 全量 ro 自己看 git diff。
+        let ws_dir = ctx.run_dir.join("ws");
         let exec_review_dir = ctx.run_dir.join("exec-review");
         let opts = ExecReviewOptions::from_governance(exec_review_dir, ws_dir, &run.options);
         let outcome = execute_exec_review(

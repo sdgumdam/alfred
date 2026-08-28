@@ -231,8 +231,9 @@ pub const EXEC_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把执行审查结
 - /inputs/request.json —— 属主请求（JSON 对象）
 - /inputs/contract.json —— 契约（JSON 对象：prompt + acceptance_criteria + reviewer_models）
 - /inputs/conversation.json —— 属主↔规划器对话记录（JSON 对象，turns[]）
-- /workspace —— 执行者产物（ws 全量只读）：用 read/bash/glob 检查产物文件、
-  git 历史与未提交文件，判断产物 vs 验收标准
+- /workspace —— 执行者产物（ws 全量只读）：用 read/bash/glob 检查产物文件；
+  对照 git 基线（run 开始时 `git init` + 空提交）用 `git status` / `git diff` /
+  `git log` 看执行者新建/改了什么（含未提交文件），判断产物 vs 验收标准
 
 按上面 SYSTEM_PROMPT 的规则判分，把结论写入 /outputs/verdict.json。
 只写这一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
