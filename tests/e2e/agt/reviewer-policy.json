@@ -1,0 +1,35 @@
+{
+  "apiVersion": "governance.toolkit/v1",
+  "name": "alfred-reviewer-deny-write",
+  "default_action": "allow",
+  "deny_on_policy_error": true,
+  "rules": [
+    {
+      "name": "deny-write-in-workspace",
+      "description": "结构性拒绝写工作区（reviewer 无 workspace 写入权限；ws ro 双保险）",
+      "condition": "tool_name in ['write', 'edit', 'rename', 'delete', 'mkdir', 'move', 'copy', 'create'] and path_escapes_workspace in ['false']",
+      "action": "deny"
+    },
+    {
+      "name": "deny-bash-write-redirect-to-workspace",
+      "description": "阻断 bash 写重定向到 /workspace（> 覆盖 ws 文件，ro 之外的兜底）",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [{ "source": ">\\s*/workspace", "flags": "i" }],
+      "action": "deny"
+    },
+    {
+      "name": "no-sudo",
+      "description": "沙箱内禁用 sudo",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [{ "source": "\\bsudo\\b", "flags": "i" }],
+      "action": "deny"
+    },
+    {
+      "name": "no-recursive-delete",
+      "description": "阻断递归删除（rm -rf 等）——防止清空工作区",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [{ "source": "\\brm\\b[\\s\\S]*-(?:r[fF]|[fF]r)\\b", "flags": "i" }],
+      "action": "deny"
+    }
+  ]
+}
