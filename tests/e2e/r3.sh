@@ -75,10 +75,41 @@ assert st == sys.argv[2], f"state={st}, expected {sys.argv[2]}"
 PY
 }
 
-# R6e：执行产物落 run 级单一 ws 的 workspace_subdirs 首目录（executor 首个
-# workspace_subdirs 挂 /workspace）——`<run>/ws/<sub>`，不再有 exec-N/workspace。
-last_exec_ws() { # <run_dir>
-  echo "$1/ws/src"
+# R6f：产物路径解析——不硬编码 workspace_subdirs 名。真规划器按 R6fPlannerNaming
+# 约束自由选具体子目录名（本机实测 ['output']，非固定 'src'）；离线注入计划也以
+# 其声明的 workspace_subdirs 为准（dagspec.json 落 run 根，单一真源）。从
+# dagspec.json 读首个执行节点 workspace_subdirs[0]（executor 挂载语义：首个子目录
+# = 该节点工作区根 /workspace，产物落 `<run>/ws/<sub>`）拼 hello.txt 路径；dagspec
+# 缺失/无声明（计划审查闸门应拦截，防御性回退）→ ws/ 任意子目录找 hello.txt
+# （排除 .git）。
+run_ws_hello() { # <run_dir> → stdout hello.txt 绝对路径；找不到 → 非零退出
+  local run_dir="$1"
+  local sub hello
+  if [[ -f "$run_dir/dagspec.json" ]]; then
+    sub="$(python3 - "$run_dir/dagspec.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    for n in d.get("nodes", []):
+        subs = n.get("sandbox", {}).get("workspace_subdirs") or []
+        if subs:
+            print(subs[0])
+            break
+except Exception:
+    pass
+PY
+)"
+    if [[ -n "$sub" && -d "$run_dir/ws/$sub" ]]; then
+      echo "$run_dir/ws/$sub/hello.txt"
+      return 0
+    fi
+  fi
+  hello="$(find "$run_dir/ws" -mindepth 2 -maxdepth 2 -name hello.txt -not -path '*/.git/*' 2>/dev/null | head -1 || true)"
+  if [[ -n "$hello" ]]; then
+    echo "$hello"
+    return 0
+  fi
+  return 1
 }
 
 # ============================================================================
@@ -105,10 +136,10 @@ cargo run --quiet -p alfred-cli -- run \
   --image "$IMAGE"
 
 assert_state "$CASE1_DIR" "completed"
-# 产物 + 执行审查 C（R6e：产物在 run 级 ws/src）
-HELLO="$CASE1_DIR/ws/src/hello.txt"
-if [[ ! -f "$HELLO" ]] || [[ "$(cat "$HELLO")" != "Hello" ]]; then
-  echo "FAIL(case1): ws/src hello.txt missing/wrong content" >&2
+# 产物 + 执行审查 C（R6f：产物在 run 级 ws/<workspace_subdirs[0]>）
+HELLO="$(run_ws_hello "$CASE1_DIR" || true)"
+if [[ -z "$HELLO" || ! -f "$HELLO" ]] || [[ "$(cat "$HELLO")" != "Hello" ]]; then
+  echo "FAIL(case1): hello.txt missing/wrong content (resolved: ${HELLO:-<none>})" >&2
   exit 1
 fi
 python3 - "$CASE1_DIR/state.json" <<'PY' || { echo "FAIL(case1): exec verdict not C" >&2; exit 1; }
@@ -197,9 +228,9 @@ cargo run --quiet -p alfred-cli -- decide \
   --image "$IMAGE"
 
 assert_state "$CASE2_DIR" "completed"
-HELLO2="$(last_exec_ws "$CASE2_DIR")/hello.txt"
-if [[ ! -f "$HELLO2" ]] || [[ "$(cat "$HELLO2")" != "Hello" ]]; then
-  echo "FAIL(case2): decide retry 后 hello.txt 未产出（$(last_exec_ws "$CASE2_DIR")）" >&2
+HELLO2="$(run_ws_hello "$CASE2_DIR" || true)"
+if [[ -z "$HELLO2" || ! -f "$HELLO2" ]] || [[ "$(cat "$HELLO2")" != "Hello" ]]; then
+  echo "FAIL(case2): decide retry 后 hello.txt 未产出（resolved: ${HELLO2:-<none>}）" >&2
   ls "$CASE2_DIR"/ws/ 2>/dev/null >&2
   exit 1
 fi

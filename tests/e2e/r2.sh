@@ -57,6 +57,42 @@ cargo test --quiet
 
 R2_RUNS="$REPO_ROOT/tests/e2e/.runs"
 
+# --- 产物路径解析（R6f）---
+# 不硬编码 workspace_subdirs 名：真规划器按 R6fPlannerNaming 约束自由选具体子目录
+# 名（本机实测 ['output']，非固定 'src'）。从 run 根 dagspec.json 读首个执行节点
+# 声明的 workspace_subdirs[0]（executor 挂载语义：首个子目录 = 该节点工作区根
+# /workspace，产物落 ws/<sub>/）拼 hello.txt 路径；dagspec 缺失/无声明（计划审查
+# 闸门应拦截，防御性回退）→ ws/ 任意子目录找 hello.txt（排除 .git）。
+run_ws_hello() { # <run_dir> → stdout hello.txt 绝对路径；找不到 → 非零退出
+  local run_dir="$1"
+  local sub hello
+  if [[ -f "$run_dir/dagspec.json" ]]; then
+    sub="$(python3 - "$run_dir/dagspec.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    for n in d.get("nodes", []):
+        subs = n.get("sandbox", {}).get("workspace_subdirs") or []
+        if subs:
+            print(subs[0])
+            break
+except Exception:
+    pass
+PY
+)"
+    if [[ -n "$sub" && -d "$run_dir/ws/$sub" ]]; then
+      echo "$run_dir/ws/$sub/hello.txt"
+      return 0
+    fi
+  fi
+  hello="$(find "$run_dir/ws" -mindepth 2 -maxdepth 2 -name hello.txt -not -path '*/.git/*' 2>/dev/null | head -1 || true)"
+  if [[ -n "$hello" ]]; then
+    echo "$hello"
+    return 0
+  fi
+  return 1
+}
+
 # ============================================================================
 # Case 1：执行审查正路径（scorer 判 C）
 # ============================================================================
@@ -79,13 +115,14 @@ cargo run --quiet -p alfred-cli -- run \
   --time-limit "${R2_TIME_LIMIT:-900}" \
   --image "$IMAGE"
 
-# 断言：hello.txt 内容 + exec verdict C（R6e：产物在 run 级 ws/src/，
-# state.json 为治理环状态）
-if [[ ! -f "$CASE1_DIR/ws/src/hello.txt" ]]; then
-  echo "FAIL(case1): run 级 ws/src/hello.txt not found" >&2
+# 断言：hello.txt 内容 + exec verdict C（R6f：产物在 run 级
+# ws/<workspace_subdirs[0]>/，state.json 为治理环状态）
+HELLO1="$(run_ws_hello "$CASE1_DIR" || true)"
+if [[ -z "$HELLO1" || ! -f "$HELLO1" ]]; then
+  echo "FAIL(case1): hello.txt not found under $CASE1_DIR/ws/ (declared workspace_subdirs[0]; resolved: ${HELLO1:-<none>})" >&2
   exit 1
 fi
-[[ "$(cat "$CASE1_DIR/ws/src/hello.txt")" == "Hello" ]] || { echo "FAIL(case1): hello.txt content wrong" >&2; exit 1; }
+[[ "$(cat "$HELLO1")" == "Hello" ]] || { echo "FAIL(case1): hello.txt content wrong" >&2; exit 1; }
 python3 - "$CASE1_DIR/state.json" <<'PY' || { echo "FAIL(case1): exec verdict not C" >&2; exit 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))

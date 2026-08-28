@@ -9,7 +9,8 @@
 #   4. 写 OwnerRequest（创建 hello.txt，内容 Hello）
 #   5. cargo run -p alfred-cli -- run ...   （R3 起为完整治理环：规划→计划审查→
 #      执行→执行审查；执行产物/证据在最新 exec-N/ 下）
-#   6. 校验 exec-N/workspace/hello.txt 存在且内容为 Hello（R3 布局：执行子 run）
+#   6. 校验 ws/<workspace_subdirs[0]>/hello.txt 存在且内容为 Hello（R6f 布局：
+#      run 级单一 ws，子目录名不硬编码——真规划器按 R6fPlannerNaming 自由选）
 #   7. 校验 exec-N/evals/ 证据归档（*.eval 与 *.dump.json，P9）
 #
 # 验收（施工清单 S2）："容器里真跑出文件且变化符合预期"
@@ -52,6 +53,42 @@ echo "[r1] sandbox image : $IMAGE"
 echo "[r1] cargo build ..."
 cargo build --quiet
 
+# --- 3.5 产物路径解析（R6f）---
+# 不硬编码 workspace_subdirs 名：真规划器按 R6fPlannerNaming 约束自由选具体子目录
+# 名（本机实测 ['output']，非固定 'src'）。从 run 根 dagspec.json 读首个执行节点
+# 声明的 workspace_subdirs[0]（executor 挂载语义：首个子目录 = 该节点工作区根
+# /workspace，产物落 ws/<sub>/）拼 hello.txt 路径；dagspec 缺失/无声明（计划审查
+# 闸门应拦截，防御性回退）→ ws/ 任意子目录找 hello.txt（排除 .git）。
+run_ws_hello() { # <run_dir> → stdout hello.txt 绝对路径；找不到 → 非零退出
+  local run_dir="$1"
+  local sub hello
+  if [[ -f "$run_dir/dagspec.json" ]]; then
+    sub="$(python3 - "$run_dir/dagspec.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    for n in d.get("nodes", []):
+        subs = n.get("sandbox", {}).get("workspace_subdirs") or []
+        if subs:
+            print(subs[0])
+            break
+except Exception:
+    pass
+PY
+)"
+    if [[ -n "$sub" && -d "$run_dir/ws/$sub" ]]; then
+      echo "$run_dir/ws/$sub/hello.txt"
+      return 0
+    fi
+  fi
+  hello="$(find "$run_dir/ws" -mindepth 2 -maxdepth 2 -name hello.txt -not -path '*/.git/*' 2>/dev/null | head -1 || true)"
+  if [[ -n "$hello" ]]; then
+    echo "$hello"
+    return 0
+  fi
+  return 1
+}
+
 # --- 4. 写 OwnerRequest ---
 RUN_DIR="${RUN_DIR:-$REPO_ROOT/tests/e2e/.runs/run-r1-hello}"
 rm -rf "$RUN_DIR"
@@ -76,8 +113,8 @@ cargo run --quiet -p alfred-cli -- run \
   --time-limit "${R1_TIME_LIMIT:-600}" \
   --image "$IMAGE" \
 
-# --- 6. 校验产物（R6e 布局：run 级单一 ws，产物在 ws/src/——executor 首个
-#    workspace_subdirs 挂 /workspace） ---
+# --- 6. 校验产物（R6f 布局：run 级单一 ws，产物在 ws/<workspace_subdirs[0]>/——
+#    executor 首个 workspace_subdirs 挂 /workspace；子目录名真规划器自由选，不硬编码） ---
 EXEC_DIR="$(ls -d "$RUN_DIR"/exec-[0-9]* 2>/dev/null | sort -V | tail -1 || true)"
 if [[ -z "$EXEC_DIR" ]]; then
   echo "FAIL: no exec-N dir in $RUN_DIR" >&2
@@ -85,9 +122,9 @@ if [[ -z "$EXEC_DIR" ]]; then
   find "$RUN_DIR" -maxdepth 2 -type f | sed "s|$REPO_ROOT/||" >&2
   exit 1
 fi
-WS_HELLO="$RUN_DIR/ws/src/hello.txt"
-if [[ ! -f "$WS_HELLO" ]]; then
-  echo "FAIL: $WS_HELLO not found" >&2
+WS_HELLO="$(run_ws_hello "$RUN_DIR" || true)"
+if [[ -z "$WS_HELLO" || ! -f "$WS_HELLO" ]]; then
+  echo "FAIL: hello.txt not found under $RUN_DIR/ws/ (declared workspace_subdirs[0]; resolved: ${WS_HELLO:-<none>})" >&2
   echo "--- run_dir 内容 ---" >&2
   find "$RUN_DIR" -maxdepth 3 -type f | sed "s|$REPO_ROOT/||" >&2
   exit 1
@@ -114,6 +151,7 @@ echo "[r1] evals arch : *.eval x${#EVAL_FILES[@]}, *.dump.json x${#DUMP_FILES[@]
 echo ""
 echo "PASS: 容器内 pi 完成小需求，产物落宿主 run 目录"
 echo "  exec_dir: $EXEC_DIR"
+echo "  ws_hello: $WS_HELLO"
 echo "  content : $CONTENT"
 echo "  evals   : $(ls "$EXEC_DIR/evals/" 2>/dev/null | tr '\n' ' ')"
 exit 0
