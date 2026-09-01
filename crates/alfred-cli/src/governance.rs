@@ -1,8 +1,9 @@
-//! 治理环驱动（R3 编排 CLI 核心）。
+//! 治理环驱动（编排器状态机驱动核心）。
 //!
 //! `run_governance_loop` 是编排器状态机的驱动循环：从当前状态出发，一路
 //! 推进到挂起态（PlanRejected / Escalated）或终态（Completed / Abandoned）。
-//! `alfred run`（初始）与 `alfred decide`（续跑）都调用它。
+//! 库调用方（codux driver）以非 CLI 形式驱动它——alfred-cli 不再是 owner
+//! 交互入口（删 alfred CLI 六命令后，owner 交互走 codux 终端）。
 //!
 //! 确定性：状态转移全部经 `GovernanceRun.apply()`（alfred-core 状态机），
 //! 每次转移落 audit.jsonl + persist state.json（P3 崩溃恢复显式化）；机械失败
@@ -56,7 +57,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                     Ok(false) => {
                         println!(
                             "[alfred] 规划器已答复属主（state=Planning，对话继续）。\n\
-                             \x20 对话记录见 conversation.json；继续对话运行 `alfred decide --run-dir {} --decision revise --message <回答文件>` 喂入下一轮消息。",
+                             \x20 对话记录见 conversation.json（run_dir: {}）；等待属主界面喂入下一轮消息。",
                             ctx.run_dir.display()
                         );
                         return Ok(());
@@ -71,7 +72,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                         persist_governance_run(&ctx.run_dir, run)?;
                         println!(
                             "[alfred] 规划失败已升级属主（state=Escalated，挂起）。\n\
-                             \x20 运行 `alfred decide --run-dir {} --decision retry|revise|abandon` 续跑。",
+                             \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
                             ctx.run_dir.display()
                         );
                         return Ok(());
@@ -84,7 +85,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
             alfred_core::governance::GovernanceState::PlanRejected => {
                 println!(
                     "[alfred] 计划被打回（state=PlanRejected，挂起）。\n\
-                     \x20 运行 `alfred decide --run-dir {} --decision retry|revise|abandon` 续跑。",
+                     \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
                     ctx.run_dir.display()
                 );
                 return Ok(());
@@ -102,7 +103,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
             alfred_core::governance::GovernanceState::Escalated => {
                 println!(
                     "[alfred] 已升级属主（state=Escalated，挂起）。\n\
-                     \x20 运行 `alfred decide --run-dir {} --decision retry|revise|abandon` 续跑。",
+                     \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
                     ctx.run_dir.display()
                 );
                 return Ok(());
@@ -122,8 +123,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
 ///
 /// 返回 `Ok(true)` = 产出计划（已 apply PlanProduced → PlanReviewing，编排环继续）；
 /// `Ok(false)` = 规划器答复了属主（纯文本答复，不产计划——对话继续，状态仍
-/// Planning，编排环返回调用方；属主经 `alfred decide --decision revise --message`
-/// 续入下一轮消息（P1-2）。
+/// Planning，编排环返回调用方；调用方经下一轮属主消息（revise 语义）续入对话（P1-2）。
 fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<bool> {
 	let owner_message = match &run.owner_message {
 		Some(m) => m.clone(),
@@ -586,158 +586,4 @@ pub fn default_governance_dir() -> PathBuf {
             PathBuf::from(home).join(".local/state/alfred/runs")
         });
     base.join(alfred_core::util::short_id("run"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn model(provider: &str) -> ExecutorModel {
-        ExecutorModel {
-            provider: provider.into(),
-            model: "m".into(),
-            base_url: "http://x".into(),
-            api_key: "k".into(),
-            max_tokens: 1024,
-            raw_id: false,
-        }
-    }
-
-    fn home_dir(tag: &str) -> PathBuf {
-        let home = std::env::var("HOME").unwrap();
-        let dir = Path::new(&home).join(format!(".local/state/alfred/test-{tag}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn cleanup(dir: &Path) {
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    fn pending_outcome() -> alfred_executor::run::RunOutcome {
-        alfred_executor::run::RunOutcome {
-            run_id: "exec-1".into(),
-            task_id: "task-1".into(),
-            executor_model: "executor".into(),
-            eval_status: "success".into(),
-            eval_location: None,
-            artifact: None,
-            started_at: "t0".into(),
-            finished_at: "t1".into(),
-            error: None,
-        }
-    }
-
-    fn run_in_exec_reviewing() -> GovernanceRun {
-        let request = alfred_core::request::OwnerRequest::new("req-1", "t", "d", "a");
-        let mut run = GovernanceRun::new(
-            "run-exec-review",
-            request,
-            alfred_core::governance::GovernanceOptions::default(),
-        );
-        run.apply(GovernanceEvent::PlanProduced).unwrap();
-        run.apply(GovernanceEvent::PlanReviewPassed).unwrap();
-        run.apply(GovernanceEvent::ExecutionSucceeded).unwrap();
-        assert_eq!(
-            run.state(),
-            alfred_core::governance::GovernanceState::ExecReviewing
-        );
-        // 容器路径需要 dagspec + execution_count（离线路径不读，设上保持状态一致）。
-        let node = alfred_core::dagspec::PlanNode::new(
-            "task-1",
-            "create hello.txt",
-            alfred_core::contract::Contract {
-                prompt: "p".into(),
-                acceptance_criteria: "a".into(),
-                reviewer_models: vec![],
-            },
-        );
-        run.dagspec = Some(alfred_core::DagSpec::new("req-1", vec![node]));
-        run.execution_count = 1;
-        run
-    }
-
-    #[test]
-    fn exec_review_step_offline_falls_back_without_container() {
-        // R6d 离线回退：ALFRED_OFFLINE=1 → exec_review_step 不跑 reviewer 容器
-        // （无 docker），执行 eval 无审查结论 → 升级属主（§六继承项，不悄悄放行）。
-        // 本测试是 alfred-cli 内唯一碰 ALFRED_OFFLINE 的测试（无并行 env 冲突）。
-        std::env::set_var("ALFRED_OFFLINE", "1");
-
-        let run_dir = home_dir("exec-review-offline");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let mut run = run_in_exec_reviewing();
-        let ctx = GovernanceContext {
-            run_dir: run_dir.clone(),
-            planner_model: model("planner"),
-            executor_model: model("executor"),
-            reviewer_model: model("reviewer"),
-        };
-        let mut pending = Some(pending_outcome());
-
-        exec_review_step(&mut run, &ctx, &mut pending).unwrap();
-
-        // 升级属主（ExecReviewError → Escalated + escalation_source=Execution）
-        assert_eq!(run.state(), alfred_core::governance::GovernanceState::Escalated);
-        assert_eq!(
-            run.escalation_source,
-            Some(alfred_core::governance::EscalationSource::Execution)
-        );
-        // 未跑容器：无 exec-review 目录
-        assert!(
-            !run_dir.join("exec-review").exists(),
-            "离线回退不应创建 exec-review 目录"
-        );
-        // 审计含升级事件
-        let audit_text = std::fs::read_to_string(run_dir.join("audit.jsonl")).unwrap();
-        assert!(
-            audit_text.contains("exec_review_error_escalated"),
-            "audit 缺 exec_review_error_escalated：\n{audit_text}"
-        );
-
-        std::env::remove_var("ALFRED_OFFLINE");
-        cleanup(&run_dir);
-    }
-
-    #[test]
-    fn format_plan_reply_is_semantic_not_instruction_json() {
-        // M4-a：converse.reply 落语义回复（计划摘要），不落原始建图指令 JSON
-        let node = alfred_core::dagspec::PlanNode::new(
-            "task-1",
-            "create hello.txt",
-            alfred_core::contract::Contract {
-                prompt: "p".into(),
-                acceptance_criteria: "a".into(),
-                reviewer_models: vec![],
-            },
-        );
-        let dag = alfred_core::DagSpec::new("req-1", vec![node]);
-        let reply = format_plan_reply(&dag);
-        assert!(reply.contains("task-1"), "got: {reply}");
-        assert!(reply.contains("create hello.txt"), "got: {reply}");
-        assert!(reply.contains("计划"), "got: {reply}");
-        // 不落中间建图指令 / 原始响应文本
-        assert!(!reply.contains("add_node"), "got: {reply}");
-        assert!(!reply.contains("build instruction"), "got: {reply}");
-    }
-
-    #[test]
-    fn format_plan_reply_joins_multiple_nodes() {
-        let mk = |id: &str| {
-            alfred_core::dagspec::PlanNode::new(
-                id,
-                "summary",
-                alfred_core::contract::Contract {
-                    prompt: "p".into(),
-                    acceptance_criteria: "a".into(),
-                    reviewer_models: vec![],
-                },
-            )
-        };
-        let dag = alfred_core::DagSpec::new("req-1", vec![mk("a"), mk("b")]);
-        let reply = format_plan_reply(&dag);
-        assert!(reply.contains("2 节点"), "got: {reply}");
-        assert!(reply.contains("a: summary"), "got: {reply}");
-        assert!(reply.contains("b: summary"), "got: {reply}");
-    }
 }

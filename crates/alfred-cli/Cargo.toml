@@ -2,18 +2,16 @@
 name = "alfred-cli"
 version.workspace = true
 edition.workspace = true
-description = "alfred 命令行入口（R1：run 雏形；R2：plan-review；R3：治理环 run/decide/status）"
+description = "alfred 编排器状态机驱动库（governance.rs 核心；删 CLI 后供 codux driver 驱动治理环）"
 
-[[bin]]
-name = "alfred"
-path = "src/main.rs"
+[lib]
+name = "alfred_cli"
+path = "src/lib.rs"
 
 [dependencies]
 alfred-core = { workspace = true }
 alfred-executor = { workspace = true }
 alfred-planner = { workspace = true }
 alfred-reviewer = { workspace = true }
-clap = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
