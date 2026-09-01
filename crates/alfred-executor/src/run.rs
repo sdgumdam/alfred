@@ -77,7 +77,12 @@ pub struct RunOutcome {
     pub run_id: String,
     pub task_id: String,
     pub executor_model: String,
+    /// 容器驱动状态（"success" / "error" / "timed_out"）。字段名沿用旧名
+    /// `eval_status`（state.json 兼容，r6d.sh 断言 eval_status == "success"；
+    /// 现承载 driver 状态，非 eval 状态）。
     pub eval_status: String,
+    /// 驱动证据路径（`<work>/driver.done.json`）。字段名沿用旧名 `eval_location`
+    /// （state.json 兼容；现承载 driver done 路径，非 eval 位置）。
     pub eval_location: Option<String>,
     pub artifact: Option<Artifact>,
     pub started_at: String,

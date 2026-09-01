@@ -2,7 +2,7 @@
 name = "alfred-executor"
 version.workspace = true
 edition.workspace = true
-description = "alfred 执行侧：生成 Inspect Task 定义、驱动 inspect eval --detach、ctl 轮询、产物采集"
+description = "alfred 执行侧：生成 Inspect 容器管理驱动（driver.py 非 eval Task）+ compose + spawn/轮询 done 记录 + 产物采集"
 
 [dependencies]
 alfred-core = { workspace = true }

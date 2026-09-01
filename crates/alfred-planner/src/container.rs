@@ -115,9 +115,11 @@ pub struct ContainerRunOutput {
     /// 实际产出的输出文件（容器内路径；converse：/outputs/instructions.json 或
     /// /outputs/reply.txt；maintain：/outputs/session.json）。
     pub produced_file: String,
-    /// 容器驱动状态（"success" / "error" / "timed_out"）。
+    /// 容器驱动状态（"success" / "error" / "timed_out"）。字段名沿用旧名
+    /// `eval_status`（state.json 兼容；现承载 driver 状态，非 eval 状态）。
     pub eval_status: String,
-    /// 驱动证据 location（driver.done.json，审计证据）。
+    /// 驱动证据 location（driver.done.json，审计证据）。字段名沿用旧名
+    /// `eval_location`（state.json 兼容；现承载 driver done 路径，非 eval 位置）。
     pub eval_location: Option<String>,
 }
 
@@ -378,7 +380,7 @@ fn run_planner_container(
     }
 
     // 读产出：容器写 /outputs/<file>（bind mount 即时可见）。converse 两分支时
-    // task.py 已强制恰好一个候选文件被写；宿主按候选集探测产出（多/零都显式报错）。
+    // driver.py 已强制恰好一个候选文件被写；宿主按候选集探测产出（多/零都显式报错）。
     let mut produced: Vec<(&str, String)> = Vec::new();
     for f in output_files {
         let host = outputs_dir.join(

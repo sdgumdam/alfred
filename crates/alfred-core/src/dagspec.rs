@@ -1,6 +1,6 @@
 //! 计划（DagSpec）：规划器产物，计划审查输入（限界上下文 §6.4 DagSpec）。
 //!
-//! R2 实现审查侧：计划审查 eval 用 `OwnerRequest + DagSpec` 判忠实度，
+//! R2 实现审查侧：计划审查容器用 `OwnerRequest + DagSpec` 判忠实度，
 //! 产出 PlanVerdict。DagSpec 是规划器（R2 后续填充）的产物形态，先作为
 //! 跨组件共享实体落在 alfred-core——planner / reviewer / cli 都要引用，
 //! 单一真源（代码质量红线 1）。

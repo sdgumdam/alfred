@@ -24,7 +24,7 @@ pub enum FailureClass {
     /// 机械性失败：环境、工具故障，不是契约或逻辑问题。
     ///
     /// 单 grader 结构不可观测——不由 grader 判；由编排器按执行状态判定
-    /// （eval error/timeout → mechanical，R3 接续）。grading prompt 不列。
+    /// （容器驱动 error/timeout → mechanical，R3 接续）。grading prompt 不列。
     Mechanical,
     /// 契约本身写得有歧义。
     ContractAmbiguity,
@@ -103,8 +103,8 @@ impl ExecVerdict {
 /// 计划审查结论（R2）：计划是否忠实于属主需求。
 ///
 /// pass=true：计划忠实于 OwnerRequest；pass=false：打回重规划（P7 在 R3
-/// 把 reason 转写为属主口吻喂回 planner）。由计划审查 scorer 产出，经
-/// eval log 结构化读取落盘。
+/// 把 reason 转写为属主口吻喂回 planner）。由计划审查容器驱动产出，经
+/// verdict.json 读取落盘。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanVerdict {

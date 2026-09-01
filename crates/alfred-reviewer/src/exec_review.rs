@@ -10,7 +10,7 @@
 //! git 历史 / 隐藏目录判产物——审查者看全量信息防合谋（R6c 验证核心：夹带私货
 //! 用例必须被全量 reviewer 抓到）。
 //!
-//! 治理环接入：R6d 移除 executor 内嵌 scorer（执行 eval 只出产物）；执行审查由
+//! 治理环接入：R6d 移除 executor 内嵌 scorer（执行容器只出产物）；执行审查由
 //! 本驱动在独立 reviewer 容器内完成（governance exec_review_step）。
 
 use std::path::{Path, PathBuf};
@@ -52,7 +52,11 @@ pub struct ExecReviewOutcome {
     pub run_id: String,
     pub request_id: String,
     pub reviewer_model: String,
+    /// 容器驱动状态（"success" / "error" / "timed_out"）。字段名沿用旧名
+    /// `eval_status`（state.json 兼容；现承载 driver 状态，非 eval 状态）。
     pub eval_status: String,
+    /// 驱动证据路径（`<work>/driver.done.json`）。字段名沿用旧名 `eval_location`
+    /// （state.json 兼容；现承载 driver done 路径，非 eval 位置）。
     pub eval_location: Option<String>,
     /// 解析出的执行审查结论（unscored 时为 None）。
     pub verdict: Option<ExecVerdict>,

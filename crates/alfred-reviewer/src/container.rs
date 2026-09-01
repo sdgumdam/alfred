@@ -120,9 +120,11 @@ pub fn resolve_agt_dir() -> Option<PathBuf> {
 pub struct ContainerRunOutput {
     /// 容器产出的原始文本（verdict.json 的 JSON 文本）。
     pub output_text: String,
-    /// 容器驱动状态（"success" / "error" / "timed_out"）。
+    /// 容器驱动状态（"success" / "error" / "timed_out"）。字段名沿用旧名
+    /// `eval_status`（state.json 兼容；现承载 driver 状态，非 eval 状态）。
     pub eval_status: String,
-    /// 驱动证据 location（driver.done.json，审计证据）。
+    /// 驱动证据 location（driver.done.json，审计证据）。字段名沿用旧名
+    /// `eval_location`（state.json 兼容；现承载 driver done 路径，非 eval 位置）。
     pub eval_location: Option<String>,
 }
 
@@ -347,7 +349,7 @@ pub(crate) fn exec_review_inputs(
 
 /// reviewer 容器驱动公共流程。
 ///
-/// 失败路径全部显式 `bail!`（不悄悄放行）：eval 超时/crash/status error 与
+/// 失败路径全部显式 `bail!`（不悄悄放行）：driver 超时/crash/status error 与
 /// 容器未产出 verdict.json 都算失败，调用方据此升级属主。
 #[allow(clippy::too_many_arguments)]
 fn run_reviewer_container(

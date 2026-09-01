@@ -2,7 +2,7 @@
 name = "alfred-reviewer"
 version.workspace = true
 edition.workspace = true
-description = "alfred 审查者（R2）：执行审查 scorer 内嵌 executor eval；计划审查独立 eval（DagSpec vs OwnerRequest 忠实度）"
+description = "alfred 审查者：计划/执行审查都在独立 reviewer 容器内完成（Inspect 容器管理驱动 driver.py 容器 pi，判忠实度/验收）"
 
 [dependencies]
 alfred-core = { workspace = true }

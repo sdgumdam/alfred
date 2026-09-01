@@ -21,7 +21,7 @@ pub struct ExecutorModel {
     pub model: String,
     /// OpenAI 兼容 base_url（mockllm 等内建模型为空串）。
     pub base_url: String,
-    /// provider api_key（只经 env 注入 eval 进程，不进 argv、不进容器）。
+    /// provider api_key（只经 env 注入驱动进程，不进 argv、不进容器）。
     pub api_key: String,
     /// max_tokens（reasoning 模型思考耗 token：1024 实测会被思考吃光致正文空——
 /// 默认 4096，见 R3 验方实测与 R0 报告）。
@@ -93,7 +93,7 @@ pub fn load_reviewer_model() -> Result<ExecutorModel> {
     load_role_model("reviewer")
 }
 
-/// 加载规划器模型配置（roles.planner）。R3 起规划器由宿主 Rust 直调 LLM。
+/// 加载规划器模型配置（roles.planner）。R6b 起规划器为容器内 pi 对话 agent（桥代发 LLM）。
 pub fn load_planner_model() -> Result<ExecutorModel> {
     load_role_model("planner")
 }

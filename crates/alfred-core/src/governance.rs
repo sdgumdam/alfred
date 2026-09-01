@@ -67,11 +67,11 @@ pub enum GovernanceEvent {
     PlanReviewPassed,
     /// 计划审查打回（PlanVerdict.pass=false）。
     PlanReviewRejected,
-    /// 计划审查本身出错（unscored / eval error）→ 必须升级（§六继承项）。
+    /// 计划审查本身出错（unscored / driver error）→ 必须升级（§六继承项）。
     PlanReviewError,
-    /// 执行成功（eval status success，进入执行审查）。
+    /// 执行成功（容器驱动 status success，进入执行审查）。
     ExecutionSucceeded,
-    /// 执行机械失败（eval error/timeout）+ 重跑预算未耗尽 → 留在 Executing。
+    /// 执行机械失败（driver error/timeout）+ 重跑预算未耗尽 → 留在 Executing。
     ExecutionFailedRetry,
     /// 执行机械失败 + 预算耗尽 → 升级。
     ExecutionFailedEscalate,
@@ -104,7 +104,7 @@ pub enum GovernanceEvent {
 pub enum EscalationSource {
     /// 规划侧失败（converse 出错）升级。
     Planning,
-    /// 计划审查本身出错（unscored / eval error）升级。
+    /// 计划审查本身出错（unscored / driver error）升级。
     PlanReview,
     /// 执行 / 执行审查失败升级。
     Execution,
@@ -285,11 +285,11 @@ pub enum OwnerDecision {
 pub struct GovernanceOptions {
     /// 沙箱镜像。
     pub image: String,
-    /// 执行 eval 单样本时间上限（秒）。
+    /// 执行容器驱动单样本时间上限（秒）。
     pub exec_time_limit_secs: u32,
-    /// 计划审查 eval 单样本时间上限（秒）。
+    /// 计划审查容器驱动单样本时间上限（秒）。
     pub review_time_limit_secs: u32,
-    /// 规划（planner 容器）eval 单样本时间上限（秒）。R6b 起 planner 容器化。
+    /// 规划（planner 容器）驱动单样本时间上限（秒）。R6b 起 planner 容器化。
     #[serde(default = "default_planner_time_limit")]
     pub planner_time_limit_secs: u32,
     /// 桥代理端口基数。

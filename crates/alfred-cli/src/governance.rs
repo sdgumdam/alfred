@@ -7,7 +7,7 @@
 //!
 //! 确定性：状态转移全部经 `GovernanceRun.apply()`（alfred-core 状态机），
 //! 每次转移落 audit.jsonl + persist state.json（P3 崩溃恢复显式化）；机械失败
-//! 重跑预算 N=2（§3.3）；审查本身出错（unscored / eval error）→ 升级属主
+//! 重跑预算 N=2（§3.3）；审查本身出错（unscored / driver error）→ 升级属主
 //! （§六继承项，不悄悄放行）。单节点骨架显式拒绝多节点 DAG（P2，不静默截断）。
 use std::path::{Path, PathBuf};
 
@@ -200,7 +200,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<boo
 	}
 }
 
-/// PlanReviewing：独立 eval 判忠实度 → pass/打回/出错升级。
+/// PlanReviewing：reviewer 容器判忠实度 → pass/打回/出错升级。
 fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
     let dagspec = run
         .dagspec
@@ -257,7 +257,7 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
             }
         }
         None => {
-            // §六继承项：审查本身出错（unscored/eval error）→ 必须升级，不悄悄放行。
+            // §六继承项：审查本身出错（unscored/driver error）→ 必须升级，不悄悄放行。
             let reason = outcome
                 .unscored_reason
                 .or(outcome.error)
@@ -331,7 +331,7 @@ fn execution_step(
             Ok(Some(outcome))
         }
         Err(e) => {
-            // 机械失败判定：eval error / timeout / crash（读 exec 子 run 的 state.json）。
+            // 机械失败判定：driver error / timeout / crash（读 exec 子 run 的 state.json）。
             let mechanical = exec_state_is_mechanical(&exec_dir)?;
             if mechanical {
                 if !run.mechanical_exhausted() {
@@ -370,18 +370,18 @@ fn execution_step(
 
 /// ExecReviewing：执行审查改调 reviewer 容器（ws 全量 ro + 对话记录）→ §3.3 路由。
 ///
-/// R6d：不再读执行 eval 内嵌 verdict（scorer 已移除，执行 eval 只出产物）。
+/// R6d：不再读执行容器内嵌 verdict（scorer 已移除，执行容器只出产物）。
 /// 执行审查由 `execute_exec_review`（alfred-reviewer）在独立 reviewer 容器内
 /// 判产物 vs 验收标准——容器挂 **ws 全量 ro**（执行者产物 run/ws，git 基线），
 /// 审查者自己读 ws 全量（含超过旧 scorer 4000B/文件截断的内容）。
-/// 离线回退（ALFRED_OFFLINE=1）：不跑容器（无 docker）——执行 eval 无审查
+/// 离线回退（ALFRED_OFFLINE=1）：不跑容器（无 docker）——执行容器无审查
 /// 结论 → 升级属主（§六继承项，不悄悄放行）。
 fn exec_review_step(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
     pending: &mut Option<alfred_executor::run::RunOutcome>,
 ) -> Result<()> {
-    // 消费执行 outcome（Executing → ExecReviewing 跨态传递；R6d 后执行 eval
+    // 消费执行 outcome（Executing → ExecReviewing 跨态传递；R6d 后执行容器
     // 不携带审查结论，仅保留跨态约束）。
     pending
         .take()
@@ -497,7 +497,7 @@ fn exec_review_step(
     Ok(())
 }
 
-/// 读 exec 子 run 的 state.json，判是否为机械失败（eval_status != success）。
+/// 读 exec 子 run 的 state.json，判是否为机械失败（state.json 的 eval_status 即容器驱动状态，!= success）。
 fn exec_state_is_mechanical(exec_dir: &Path) -> Result<bool> {
     let path = exec_dir.join("state.json");
     let Ok(text) = std::fs::read_to_string(&path) else {

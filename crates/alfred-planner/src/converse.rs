@@ -132,7 +132,7 @@ pub fn converse(
             (outcome, response, true, "offline")
         } else {
             // R6b：容器内 pi 读输入跑 converse（桥代发 LLM），宿主读 /outputs 产出
-            // （/outputs/instructions.json 或 /outputs/reply.txt，task.py 已强制恰好一个）。
+            // （/outputs/instructions.json 或 /outputs/reply.txt，driver.py 已强制恰好一个）。
             let out = crate::container::run_converse_in_container(
                 &opts.container, &opts.model, request, doc, owner_message,
             )?;
