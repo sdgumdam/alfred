@@ -228,18 +228,6 @@ def planner_agent():
                     )
                 ],
             )
-            out = await sbox.exec(["cat", OUTPUT_FILE])
-            if not out.success or not out.stdout.strip():
-                raise RuntimeError(f"planner pi did not write {OUTPUT_FILE}")
-            state.output = ModelOutput(
-                model="planner-output-collector",
-                choices=[
-                    ChatCompletionChoice(
-                        message=ChatMessageAssistant(content=out.stdout),
-                        stop_reason="stop",
-                    )
-                ],
-            )
         return state
 
     return solve
