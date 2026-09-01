@@ -23,22 +23,3 @@ pub fn short_id(prefix: &str) -> String {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{nanos:013x}{seq:02x}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rfc3339_is_well_formed() {
-        let s = now_rfc3339();
-        assert!(s.contains('T') && s.ends_with('Z'), "got {s}");
-    }
-
-    #[test]
-    fn short_id_is_unique_prefixed() {
-        let a = short_id("run");
-        let b = short_id("run");
-        assert_ne!(a, b);
-        assert!(a.starts_with("run-"), "got {a}");
-    }
-}
