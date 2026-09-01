@@ -7,7 +7,8 @@
 #      离线注入忠实计划 + 执行 --time-limit 1 → 机械预算耗尽 → Escalated →
 #      `driver feed --decision abandon`（属主放弃，无消息）→ Abandoned（终态）。
 #   2. 打回续跑闭环（plan_rejected → feed retry → 重规划 → 执行）：
-#      离线注入不忠实计划 → 计划审查打回 → PlanRejected →
+#      planner 离线注入不忠实计划（ALFRED_PLANNER_OFFLINE=1）→ 计划审查容器在线判
+#      不忠实 → 打回 PlanRejected →
 #      `ALFRED_OFFLINE=1 ... driver feed --decision retry`（离线注入忠实计划）→
 #      重规划 → 审查过 → 执行 → 执行审查离线回退 → Escalated（R6d 不悄悄放行）。
 #
@@ -239,8 +240,8 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r4] case2: driver run（离线注入不忠实计划 → 计划审查打回 → PlanRejected） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-unfaithful.json" \
+echo "[r4] case2: driver run（planner 离线注入不忠实计划 → 计划审查容器在线判打回 → PlanRejected） ..."
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-unfaithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE2_DIR/request.json" \
   --run-dir "$CASE2_DIR" \
