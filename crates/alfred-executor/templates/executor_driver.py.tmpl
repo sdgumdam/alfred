@@ -30,6 +30,7 @@ from inspect_ai.util import (
     sandbox,
 )
 from inspect_ai.util._sandbox.docker.docker import DockerSandboxEnvironment
+from inspect_ai.util._sandbox.docker.cleanup import project_cleanup, running_projects
 from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
 from inspect_ai.util._sandbox.context import (
     sandbox_default_context_var,
@@ -161,6 +162,17 @@ async def _drive_pi(proc, prompt: str) -> tuple[bool, int | None]:
     return settled, exit_code
 
 
+async def _cleanup_running_projects() -> None:
+    """兜底清理：把 Inspect 仍登记的 compose 项目逐个 down（须在 shield 内调用）。
+
+    sample_init 被 fail_after 中途取消时，raw_envs 保持 None，但 project_startup
+    已把项目登记进 running_projects()——sample_init 自身 except 里的清理同样被
+    取消传播打断，下不了容器。遍历登记表逐个 compose down，容器不泄漏。
+    """
+    for project in list(running_projects()):
+        await project_cleanup(project, quiet=True)
+
+
 async def _run_container() -> None:
     """起容器（Inspect DockerSandboxEnvironment）+ 桥代发 + 驱动容器内 pi。"""
     raw_envs = None
@@ -205,14 +217,18 @@ async def _run_container() -> None:
     finally:
         # 清理必须 shield：超时取消（fail_after）时，finally 内的 await 会立即抛
         # CancelledError——shield 保证 compose down 跑完，不泄漏容器。
-        if raw_envs is not None:
-            try:
-                with anyio.CancelScope(shield=True):
+        try:
+            with anyio.CancelScope(shield=True):
+                if raw_envs is not None:
                     await DockerSandboxEnvironment.sample_cleanup(
                         TASK_NAME, COMPOSE_FILE, raw_envs, False
                     )
-            except Exception as cleanup_ex:
-                print(f"[alfred-driver] container cleanup failed: {cleanup_ex}")
+                else:
+                    # sample_init 中途被取消：raw_envs 未赋值，但项目已登记进
+                    # running_projects()——兜底遍历登记表逐个 down。
+                    await _cleanup_running_projects()
+        except Exception as cleanup_ex:
+            print(f"[alfred-driver] container cleanup failed: {cleanup_ex}")
 
 
 def _write_done(status: str, error: str | None = None) -> None:
