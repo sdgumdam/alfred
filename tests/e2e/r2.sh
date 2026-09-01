@@ -10,7 +10,7 @@
 #   3. 解析失败 → unscored：已归档（独立 alfred plan-review CLI 已删；等价覆盖见
 #      r6b caseA / r6c tier1c）
 #
-# 模型：默认 glm-4.7（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
+# 模型：默认 glm-5.3-flash（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
 # ALFRED_CONFIG 提供）。可用 ALFRED_EXECUTOR_MODEL / ALFRED_REVIEWER_MODEL
 # 覆盖（config 缺失的模型 id 会沿用基础角色 provider——见 config.rs）。
 # R3 起 `driver run` 是完整治理环：case1/1b 断言读治理环 state.json
@@ -55,9 +55,9 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   fi
 fi
 
-# --- 模型（glm-4.7 省钱；e2e 用 env 覆盖，config 缺失时沿用 zhipucoding provider）---
-export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.2}"
-export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-4.7}"
+# --- 模型（glm-5.3-flash 省钱；e2e 用 env 覆盖，config 缺失时沿用 zhipucoding provider）---
+export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.3-flash}"
+export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-5.3-flash}"
 
 # --- cargo build + test ---
 echo "[r2] cargo build ..."

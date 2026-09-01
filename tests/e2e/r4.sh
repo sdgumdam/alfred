@@ -14,7 +14,7 @@
 # 断言：state.json 状态推进（abandoned / escalated + 可选 hello.txt）。旧决策面板
 #   RPC（panel-session.jsonl extension_ui_request/response）已随 CLI 删除归档。
 #
-# 模型：glm-4.7 省钱（config.yml 或 env 覆盖）。
+# 模型：glm-5.3-flash 省钱（config.yml 或 env 覆盖）。
 # 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
 #   r4 以 `cargo run --bin alfred -- run|feed` 驱动治理环（run 初始化+推进；feed 喂
 #   属主决策 → `governance::feed_owner_message`，Abandon/Retry 消息可选）。
@@ -56,10 +56,10 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   fi
 fi
 
-# --- 模型（glm-4.7 省钱）---
-export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.2}"
-export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-4.7}"
-export ALFRED_PLANNER_MODEL="${ALFRED_PLANNER_MODEL:-glm-4.7}"
+# --- 模型（glm-5.3-flash 省钱）---
+export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.3-flash}"
+export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-5.3-flash}"
+export ALFRED_PLANNER_MODEL="${ALFRED_PLANNER_MODEL:-glm-5.3-flash}"
 
 # --- cargo build + test ---
 echo "[r4] cargo build ..."

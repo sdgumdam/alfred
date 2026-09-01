@@ -13,7 +13,7 @@
 #   4. 多轮会话文档：打回 → 属主补充新需求（driver feed revise）→ converse 引用
 #      会话文档关键结论（从 llm-calls/ 记录断言）→ 执行审查离线回退 → Escalated
 #
-# 模型：默认 glm-4.7（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
+# 模型：默认 glm-5.3-flash（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
 # ALFRED_CONFIG 提供）。可用 ALFRED_EXECUTOR_MODEL / ALFRED_REVIEWER_MODEL /
 # ALFRED_PLANNER_MODEL 覆盖。
 # 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
@@ -57,10 +57,10 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   fi
 fi
 
-# --- 模型（glm-4.7 省钱）---
-export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.2}"
-export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-4.7}"
-export ALFRED_PLANNER_MODEL="${ALFRED_PLANNER_MODEL:-glm-4.7}"
+# --- 模型（glm-5.3-flash 省钱）---
+export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.3-flash}"
+export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-5.3-flash}"
+export ALFRED_PLANNER_MODEL="${ALFRED_PLANNER_MODEL:-glm-5.3-flash}"
 
 # --- cargo build + test ---
 echo "[r3] cargo build ..."
