@@ -439,8 +439,10 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
     match outcome.verdict {
         Some(v) => {
             run.plan_verdicts.push(v.clone());
-            // 维护者 ①：计划审查结论落定后更新会话文档。
-            run.session_doc = maintain(
+            // 维护者 ①：计划审查结论落定后更新会话文档。maintain 失败（如 LLM
+            // 输出格式漂移致解析失败）→ 回退旧 session_doc，不废整条 run；审计
+            // 记 maintain_warning，治理环照常推进（plan_review_passed 照发）。
+            match maintain(
                 &MaintainOptions {
                     run_dir: ctx.run_dir.clone(),
                     model: ctx.planner_model.clone(),
@@ -454,7 +456,20 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                     verdict: v.clone(),
                     plan: dagspec,
                 },
-            )?;
+            ) {
+                Ok(updated) => run.session_doc = updated,
+                Err(e) => {
+                    audit(
+                        &ctx.run_dir,
+                        "maintain_warning",
+                        &serde_json::json!({
+                            "trigger": "plan_reviewed",
+                            "error": format!("{e:#}"),
+                            "fallback": "keep_previous_session_doc",
+                        }),
+                    )?;
+                }
+            }
             if v.pass {
                 audit(
                     &ctx.run_dir,

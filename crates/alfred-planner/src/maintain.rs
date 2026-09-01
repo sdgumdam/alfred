@@ -146,11 +146,50 @@ fn maintain_messages(doc: &SessionDoc, trigger: &MaintainTrigger) -> Vec<ChatMes
 }
 
 /// 从 LLM 输出解析 SessionDoc（容忍 markdown 围栏）。
+///
+/// 对 LLM 输出格式漂移宽容（防单次坏输出废整条 run）：三段数组的元素允许
+/// 非字符串——对象元素按字段候选取字符串（key_file_paths 取 `path`/`file`，
+/// key_conclusions 取 `content`/`text`/`conclusion`，review_summary 取
+/// `content`/`text`/`summary`），取不到则忽略该元素；标量/null 忽略；顶层
+/// 未知字段忽略。字段为单个字符串（非数组）时当单元素数组。
+/// 仍解析失败（如整体非 JSON）→ Err，由调用方（governance）回退旧会话文档。
 pub fn parse_session_doc(text: &str) -> Result<SessionDoc> {
     let cleaned = strip_fences(text);
     let v: serde_json::Value = serde_json::from_str(&cleaned)
         .with_context(|| format!("session doc not JSON: {cleaned}"))?;
-    serde_json::from_value(v).context("session doc schema mismatch")
+    let obj = v.as_object().context("session doc must be a JSON object")?;
+    let mut doc = SessionDoc::new();
+    doc.key_file_paths = tolerant_string_array(obj.get("key_file_paths"), &["path", "file"]);
+    doc.key_conclusions =
+        tolerant_string_array(obj.get("key_conclusions"), &["content", "text", "conclusion"]);
+    doc.review_summary = tolerant_string_array(obj.get("review_summary"), &["content", "text", "summary"]);
+    Ok(doc)
+}
+
+/// 宽松提取字符串数组：字符串直取；对象按候选字段取字符串；标量/null/取不到
+/// 则忽略；字段为单个值（非数组）时当单元素数组。
+fn tolerant_string_array(v: Option<&serde_json::Value>, object_fields: &[&str]) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|e| tolerant_string_element(e, object_fields))
+            .collect(),
+        Some(other) => tolerant_string_element(other, object_fields)
+            .into_iter()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// 单个元素宽松转字符串：字符串直取；对象取候选字段（按序第一个字符串）；其它忽略。
+fn tolerant_string_element(v: &serde_json::Value, object_fields: &[&str]) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(m) => object_fields
+            .iter()
+            .find_map(|f| m.get(*f).and_then(|x| x.as_str()).map(str::to_owned)),
+        _ => None,
+    }
 }
 
 /// 剥 markdown 代码围栏（与审查侧 `_extract_json_text` 同思路）。
