@@ -4,13 +4,14 @@
 # 终端 → feed_owner_message）——真跑
 #
 #   1. 升级闭环（escalated → feed abandon → Abandoned）：
-#      离线注入忠实计划 + 执行 --time-limit 1 → 机械预算耗尽 → Escalated →
-#      `driver feed --decision abandon`（属主放弃，无消息）→ Abandoned（终态）。
+#      planner 离线注入忠实计划（ALFRED_PLANNER_OFFLINE=1，计划审查在线）+ 执行
+#      --time-limit 1 → 机械预算耗尽 → Escalated →
 #   2. 打回续跑闭环（plan_rejected → feed retry → 重规划 → 执行）：
 #      planner 离线注入不忠实计划（ALFRED_PLANNER_OFFLINE=1）→ 计划审查容器在线判
 #      不忠实 → 打回 PlanRejected →
-#      `ALFRED_OFFLINE=1 ... driver feed --decision retry`（离线注入忠实计划）→
-#      重规划 → 审查过 → 执行 → 执行审查离线回退 → Escalated（R6d 不悄悄放行）。
+#      `ALFRED_PLANNER_OFFLINE=1 ALFRED_EXEC_REVIEW_OFFLINE=1 ...
+#      driver feed --decision retry`（离线注入忠实计划）→ 重规划 → 计划审查
+#      容器在线判过 → 执行 → 执行审查离线回退 → Escalated（R6d 不悄悄放行）。
 #
 # 断言：state.json 状态推进（abandoned / escalated + 可选 hello.txt）。旧决策面板
 #   RPC（panel-session.jsonl extension_ui_request/response）已随 CLI 删除归档。
@@ -160,8 +161,8 @@ cat > "$CASE1_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r4] case1: driver run（执行 --time-limit 1 强制机械超时 → Escalated） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1_DIR/plan-faithful.json" \
+echo "[r4] case1: driver run（planner 离线注入忠实计划 → 计划审查在线 → 执行 --time-limit 1 强制机械超时 → Escalated） ..."
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
@@ -251,16 +252,17 @@ cargo run --quiet -p alfred-cli --bin alfred -- run \
 assert_state "$CASE2_DIR" "plan_rejected"
 echo "PASS(case2a): 不忠实计划被计划审查打回 → PlanRejected"
 
-echo "[r4] case2: driver feed retry（属主重跑，离线忠实计划重规划 → 执行） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
+echo "[r4] case2: driver feed retry（属主重跑：planner 离线注入忠实计划 → 计划审查在线判过 → 执行 → 执行审查离线回退） ..."
+ALFRED_PLANNER_OFFLINE=1 ALFRED_EXEC_REVIEW_OFFLINE=1 \
+ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE2_DIR" \
   --decision retry \
   --message ""
 assert_state "$CASE2_DIR" "escalated"
-# R6d：离线 feed retry 走到执行审查时离线回退 → 升级挂起（escalated）——执行
-# eval 只出产物无审查结论，不悄悄放行。执行是否到达取决于离线计划审查模型速度
-# （plan_review.py.tmpl 45s scorer 限）；若执行已跑（产物落
+# R6d：retry 重规划（离线注入忠实计划）→ 计划审查容器在线判过 → 真实执行 →
+# 执行审查离线回退（ALFRED_EXEC_REVIEW_OFFLINE=1）→ 升级挂起（escalated）——
+# 执行审查离线只出产物无审查结论，不悄悄放行。执行已真跑（产物落
 # ws/<workspace_subdirs[0]>），内容须正确。
 HELLO2="$(run_ws_hello "$CASE2_DIR" || true)"
 if [[ -n "$HELLO2" && -f "$HELLO2" ]]; then
