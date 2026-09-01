@@ -296,7 +296,7 @@ pub struct GovernanceOptions {
     pub port_base: u32,
     /// settled 后宽限（秒）。
     pub settle_grace_seconds: f64,
-    /// 是否轮询 `inspect ctl` 观测面。
+    /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
 }
 

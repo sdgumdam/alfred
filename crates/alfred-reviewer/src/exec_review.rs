@@ -1,4 +1,4 @@
-//! 执行审查独立容器（R6c）：eval 内嵌 grader → 独立 reviewer 容器。
+//! 执行审查独立容器（R6c）：内嵌 grader → 独立 reviewer 容器。
 //!
 //! 流程：建 exec-review run 目录 → 写 request.json/contract.json（证据）→
 //! reviewer 容器（挂 ws 全量 ro + 契约全字段 + 对话记录）内 pi 读全量产物判
@@ -10,8 +10,8 @@
 //! git 历史 / 隐藏目录判产物——审查者看全量信息防合谋（R6c 验证核心：夹带私货
 //! 用例必须被全量 reviewer 抓到）。
 //!
-//! 治理环接入：R6c 保留 executor eval 内嵌 scorer（R6d 移除）；本驱动为独立
-//! 容器执行审查路径（`alfred exec-review` 子命令 + 后续治理环接入的落点）。
+//! 治理环接入：R6d 移除 executor 内嵌 scorer（执行 eval 只出产物）；执行审查由
+//! 本驱动在独立 reviewer 容器内完成（governance exec_review_step）。
 
 use std::path::{Path, PathBuf};
 
@@ -124,7 +124,7 @@ pub fn execute_exec_review(
     };
     append_audit(
         run_dir,
-        "exec_review_eval_launched",
+        "exec_review_driver_done",
         &serde_json::json!({ "eval_location": out.eval_location }),
     )?;
 
@@ -143,7 +143,7 @@ pub fn execute_exec_review(
     };
     let eval_error = (out.eval_status != "success").then(|| {
         format!(
-            "exec review container eval finished with status '{}' (location={:?})",
+            "exec review container driver finished with status '{}' (location={:?})",
             out.eval_status, out.eval_location
         )
     });

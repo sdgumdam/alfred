@@ -1,89 +1,42 @@
 //!
-//! R6c：新增 reviewer 容器任务生成（`templates/reviewer_task.py.tmpl`）——
-//! 计划审查/执行审查都走同一容器 pi 模板，差异只在 MODE + SYSTEM/DRIVER prompt。
+//! R6c：reviewer 容器驱动生成（`templates/reviewer_driver.py.tmpl`）——计划审查/
+//! 执行审查都走同一容器 pi 驱动模板，差异只在 MODE + SYSTEM/DRIVER prompt。
+//!
+//! 三容器 Inspect 统一管（属主 08-27）：驱动脚本是非 eval 的 Inspect 容器管理
+//! 驱动（DockerSandboxEnvironment + sandbox_agent_bridge + exec_remote），不再
+//! 生成 `inspect eval` 评测 Task（旧 `plan_review.py.tmpl` eval 路径已移除）。
 
 use anyhow::{Context, Result};
-use alfred_core::dagspec::DagSpec;
-use alfred_core::request::OwnerRequest;
-use alfred_core::session::SessionDoc;
 
-/// 内嵌的计划审查任务模板（见 templates/plan_review.py.tmpl）。
-const PLAN_REVIEW_TEMPLATE: &str = include_str!("../templates/plan_review.py.tmpl");
-/// 内嵌的 reviewer 容器任务模板（见 templates/reviewer_task.py.tmpl）。
-const REVIEWER_TASK_TEMPLATE: &str = include_str!("../templates/reviewer_task.py.tmpl");
+/// 内嵌的 reviewer 容器驱动模板（见 templates/reviewer_driver.py.tmpl）。
+const REVIEWER_DRIVER_TEMPLATE: &str = include_str!("../templates/reviewer_driver.py.tmpl");
 
-/// 生成 plan_review.py 内容。
-///
-/// 审查者全可见（§2.4）：除 OwnerRequest + DagSpec 外，还注入会话文档，供评分器
-/// 对照"属主补充与审查摘要都骗不过审查"。会话文档可为空（如独立
-/// `alfred plan-review` 子命令无治理上下文）。
-pub fn generate_plan_review_py(
-    request: &OwnerRequest,
-    dagspec: &DagSpec,
-    session_doc: Option<&SessionDoc>,
-) -> Result<String> {
-    let mut out = PLAN_REVIEW_TEMPLATE.to_string();
-
-    // 对象经 serde_json::to_string 成 JSON 文本，再经 json() 编码成 Python
-    // 字符串字面量；模板里 json.loads 还原成 dict（值语义一致）。
-    let request_json = serde_json::to_string(request).context("serialize OwnerRequest")?;
-    let dagspec_json = serde_json::to_string(dagspec).context("serialize DagSpec")?;
-    let session_doc_json = match session_doc {
-        Some(doc) => serde_json::to_string(doc).context("serialize SessionDoc")?,
-        None => "null".to_string(),
-    };
-    let inject: &[(&str, String)] = &[
-        ("__OWNER_REQUEST_JSON__", json(&request_json)?),
-        ("__DAGSPEC_JSON__", json(&dagspec_json)?),
-        ("__SESSION_DOC_JSON__", json(&session_doc_json)?),
-        ("__RUN_ID_JSON__", json(&request.id)?),
-    ];
-    for (token, value) in inject {
-        if !out.contains(token) {
-            anyhow::bail!("plan_review template missing token {token}");
-        }
-        out = out.replace(token, value);
-    }
-
-    for token in [
-        "__OWNER_REQUEST_JSON__",
-        "__DAGSPEC_JSON__",
-        "__SESSION_DOC_JSON__",
-        "__RUN_ID_JSON__",
-    ] {
-        if out.contains(token) {
-            anyhow::bail!("plan_review token replacement incomplete: {token}");
-        }
-    }
-
-    Ok(out)
-}
-
-fn json(s: &str) -> Result<String> {
-    serde_json::to_string(s).context("json-encode template value")
-}
-/// reviewer 容器任务生成参数（R6c）。
+/// reviewer 容器驱动生成参数。
 pub struct ReviewerTaskGenParams {
-    /// 沙箱 compose 文件绝对路径。
+    /// 沙箱 compose 文件绝对路径（挂载面矩阵，隔离机制）。
     pub compose_file: String,
     /// "plan_review" | "exec_review"（容器内 pi 的任务模式）。
     pub mode: String,
-    /// 容器侧审查 system prompt（计划忠实度 / 执行判分规则）。
+    /// 容器侧 system prompt（计划审查忠实度 / 执行审查判产物 vs 验收标准）。
     pub system_prompt: String,
-    /// 容器侧 driver prompt（读 /inputs + /workspace → 按 SYSTEM_PROMPT → 写 /outputs/verdict.json）。
+    /// 容器侧 driver prompt（读 /inputs + /workspace → 写 /outputs/verdict.json）。
     pub driver_prompt: String,
-    /// 容器内产出文件绝对路径（"/outputs/verdict.json"）。
+    /// 容器内 verdict 产出文件绝对路径（"/outputs/verdict.json"）。
     pub output_file: String,
     /// AGT 扩展路径（"/tmp/.agt/agt-policy.ts"）；空串 = 不加载。
     pub agt_ext: String,
-    /// AGT 策略路径（"/tmp/.agt/policy.json"）；AGT 未启用时空串。
+    /// AGT 策略文件容器内路径（"/tmp/.agt/policy.json"）；与 `agt_ext` 同空。
     pub agt_policy_path: String,
-    /// AGT 审计路径（"/tmp/.agt/audit/audit.jsonl"）；AGT 未启用时空串。
+    /// AGT 审计文件容器内路径（"/tmp/.agt/audit/audit.jsonl"）；与 `agt_ext` 同空。
     pub agt_audit_path: String,
-    /// 桥代理端口基数（每样本自增）。
-    pub port_base: u32,
+    /// 桥代理端口（每容器一桥，容器内 localhost 互不冲突）。
+    pub port: u32,
     /// pi 模型（provider/model 形态，如 "inspect-bridge/inspect"）。
     pub pi_model: String,
+    /// 宿主侧桥代发模型 id（`inspect/<provider>/<model>`）。
+    pub bridge_model: String,
+    /// 宿主侧模型 max_tokens（桥代发生成配置）。
+    pub max_tokens: u32,
     /// 容器内工作区路径（"/workspace"）。
     pub workspace_dir: String,
     /// 容器内执行用户（"root"）。
@@ -92,11 +45,17 @@ pub struct ReviewerTaskGenParams {
     pub run_id: String,
     /// settled 后的宽限秒数（进程未在 EOF 退出则 kill）。
     pub settle_grace_seconds: f64,
+    /// 驱动总时间上限（秒；anyio.fail_after 包裹整个容器运行）。
+    pub time_limit_secs: u32,
+    /// 宿主侧 done 记录文件绝对路径。
+    pub done_marker: String,
+    /// docker compose 项目名基座（Inspect 加 uuid 后缀）。
+    pub task_name: String,
 }
 
-/// 生成 reviewer 容器 task.py 内容（token 替换，机制与 planner 一致）。
+/// 生成 reviewer 容器 driver.py 内容（token 替换，机制与 planner 一致）。
 pub fn generate_reviewer_task_py(params: &ReviewerTaskGenParams) -> Result<String> {
-    let mut out = REVIEWER_TASK_TEMPLATE.to_string();
+    let mut out = REVIEWER_DRIVER_TEMPLATE.to_string();
 
     let inject: &[(&str, String)] = &[
         ("__COMPOSE_FILE_JSON__", json(&params.compose_file)?),
@@ -107,8 +66,10 @@ pub fn generate_reviewer_task_py(params: &ReviewerTaskGenParams) -> Result<Strin
         ("__AGT_EXT_JSON__", json(&params.agt_ext)?),
         ("__AGT_POLICY_PATH_JSON__", json(&params.agt_policy_path)?),
         ("__AGT_AUDIT_PATH_JSON__", json(&params.agt_audit_path)?),
-        ("__PORT_BASE__", params.port_base.to_string()),
+        ("__PORT__", params.port.to_string()),
         ("__PI_MODEL_JSON__", json(&params.pi_model)?),
+        ("__BRIDGE_MODEL_JSON__", json(&params.bridge_model)?),
+        ("__MAX_TOKENS__", params.max_tokens.to_string()),
         ("__WORKSPACE_DIR_JSON__", json(&params.workspace_dir)?),
         ("__SANDBOX_USER_JSON__", json(&params.sandbox_user)?),
         ("__RUN_ID_JSON__", json(&params.run_id)?),
@@ -116,14 +77,18 @@ pub fn generate_reviewer_task_py(params: &ReviewerTaskGenParams) -> Result<Strin
             "__SETTLE_GRACE_SECONDS__",
             format!("{}", params.settle_grace_seconds),
         ),
+        ("__TIME_LIMIT_SECS__", format!("{}", params.time_limit_secs)),
+        ("__DONE_MARKER_JSON__", json(&params.done_marker)?),
+        ("__TASK_NAME_JSON__", json(&params.task_name)?),
     ];
     for (token, value) in inject {
         if !out.contains(token) {
-            anyhow::bail!("reviewer_task template missing token {token}");
+            anyhow::bail!("reviewer_driver template missing token {token}");
         }
         out = out.replace(token, value);
     }
 
+    // 防呆：替换后不得残留任何 __TOKEN__
     for token in [
         "__COMPOSE_FILE_JSON__",
         "__MODE_JSON__",
@@ -133,17 +98,25 @@ pub fn generate_reviewer_task_py(params: &ReviewerTaskGenParams) -> Result<Strin
         "__AGT_EXT_JSON__",
         "__AGT_POLICY_PATH_JSON__",
         "__AGT_AUDIT_PATH_JSON__",
-        "__PORT_BASE__",
+        "__PORT__",
         "__PI_MODEL_JSON__",
+        "__BRIDGE_MODEL_JSON__",
+        "__MAX_TOKENS__",
         "__WORKSPACE_DIR_JSON__",
         "__SANDBOX_USER_JSON__",
         "__RUN_ID_JSON__",
-        "__SETTLE_GRACE_SECONDS__",
+        "__TIME_LIMIT_SECS__",
+        "__DONE_MARKER_JSON__",
+        "__TASK_NAME_JSON__",
     ] {
         if out.contains(token) {
-            anyhow::bail!("reviewer_task token replacement incomplete: {token}");
+            anyhow::bail!("reviewer_driver token replacement incomplete: {token}");
         }
     }
 
     Ok(out)
+}
+
+fn json(s: &str) -> Result<String> {
+    serde_json::to_string(s).context("json-encode template value")
 }

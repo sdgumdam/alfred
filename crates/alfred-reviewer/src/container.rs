@@ -8,13 +8,16 @@
 //!   1. 输入落盘：request / dagspec（计划审查）/ session（全源，非投影）/
 //!      conversation / contract 写到 `<work>/inputs/`。
 //!   2. 渲染 `reviewer.compose.yaml.tmpl`（ws 全量 ro + 对话记录 + 契约全字段
-//!      + AGT 拦写层 ro + 输出卷 rw）→ 生成 reviewer task.py
-//!      （`templates/reviewer_task.py.tmpl`，token 注入）→ spawn
-//!      `inspect eval --detach`（复用 executor 驱动）→ 轮询 done → 容器内 pi
-//!      读输入 + /workspace（执行审查看全量产物防合谋）→ 写 verdict.json 到
-//!      /outputs 挂载。
+//!      + AGT 拦写层 ro + 输出卷 rw）→ 生成 reviewer driver.py
+//!      （`templates/reviewer_driver.py.tmpl`，token 注入，非 eval Task）→ spawn
+//!      `python3 driver.py`（Inspect 容器管理接口：DockerSandboxEnvironment +
+//!      sandbox_agent_bridge + exec_remote）→ 轮询 done → 容器内 pi 读输入 +
+//!      /workspace（执行审查看全量产物防合谋）→ 写 verdict.json 到 /outputs 挂载。
 //!   3. 宿主读 `/outputs/verdict.json` 得原始 JSON 文本（verdict.rs 做
 //!      Pydantic 等价校验，调用方解析/落盘）。
+//!
+//! 三容器 Inspect 统一管（属主 08-27）：容器管理走 Inspect 容器管理接口，不走
+//! `inspect eval` 评测包装。
 //!
 //! 关键差异（vs 旧投影实现）：旧 grader 只见 `Sample.target`（验收标准 + 产物
 //! 摘要，`_collect_artifact_summary` 截断到 80KB/200 文件/4000B 每文件）；新
@@ -35,7 +38,9 @@ use alfred_core::request::OwnerRequest;
 use alfred_core::session::SessionDoc;
 use alfred_executor::compose_gen::canonicalize_workspace;
 use alfred_executor::config::ExecutorModel;
-use alfred_executor::driver::{poll_until_done, spawn_eval, PollOutcome};
+use alfred_executor::driver::{
+    poll_container_driver, spawn_container_driver, DriverOutcome,
+};
 use anyhow::{bail, Context, Result};
 
 use crate::task_gen::{generate_reviewer_task_py, ReviewerTaskGenParams};
@@ -50,7 +55,7 @@ pub const VERDICT_OUTPUT_FILE: &str = "/outputs/verdict.json";
 /// reviewer 容器选项（R6c；编排器从 `GovernanceOptions` 派生，见 [`from_governance`]）。
 ///
 /// `run_dir` 即 reviewer 工作目录（计划审查 = `<run>/plan-review`，执行审查 =
-/// `<run>/exec-review`）；inputs/outputs/evals 都建在其下。
+/// `<run>/exec-review`）；inputs/outputs 都建在其下。
 #[derive(Debug, Clone)]
 pub struct ReviewerContainerOptions {
     /// reviewer 工作目录（须位于 ~ 之下——E3）。
@@ -59,11 +64,11 @@ pub struct ReviewerContainerOptions {
     pub image: String,
     /// 桥代理端口基数（每样本自增）。
     pub port_base: u32,
-    /// reviewer eval 单样本时间上限（秒）。
+    /// reviewer 容器驱动单样本时间上限（秒）。
     pub time_limit_secs: u32,
     /// settled 后宽限（秒）。
     pub settle_grace_seconds: f64,
-    /// 是否轮询 `inspect ctl` 观测面。
+    /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
     /// AGT 策略 + 扩展目录（源：含 agt-policy.ts + policy.json）。拷贝到
     /// `<work>/agt/`（策略 ro + 审计子目录 rw）挂 `/tmp/.agt`。
@@ -115,9 +120,9 @@ pub fn resolve_agt_dir() -> Option<PathBuf> {
 pub struct ContainerRunOutput {
     /// 容器产出的原始文本（verdict.json 的 JSON 文本）。
     pub output_text: String,
-    /// eval 状态（"success" / "error"）。
+    /// 容器驱动状态（"success" / "error" / "timed_out"）。
     pub eval_status: String,
-    /// eval 日志 location（evals/ 下的 .eval 路径，审计证据）。
+    /// 驱动证据 location（driver.done.json，审计证据）。
     pub eval_location: Option<String>,
 }
 
@@ -358,14 +363,11 @@ fn run_reviewer_container(
     let work = &opts.run_dir;
     let inputs_dir = work.join(INPUTS_DIR);
     let outputs_dir = work.join(OUTPUTS_DIR);
-    let evals_dir = work.join("evals");
 
     std::fs::create_dir_all(&inputs_dir)
         .with_context(|| format!("create reviewer inputs dir {}", inputs_dir.display()))?;
     std::fs::create_dir_all(&outputs_dir)
         .with_context(|| format!("create reviewer outputs dir {}", outputs_dir.display()))?;
-    std::fs::create_dir_all(&evals_dir)
-        .with_context(|| format!("create reviewer evals dir {}", evals_dir.display()))?;
     std::fs::create_dir_all(ws_dir)
         .with_context(|| format!("create reviewer ws dir {}", ws_dir.display()))?;
 
@@ -410,7 +412,8 @@ fn run_reviewer_container(
         ),
         None => (String::new(), String::new(), String::new()),
     };
-    let task_py_path = work.join("task.py");
+    let done_marker = work.join("driver.done.json");
+    let driver_py_path = work.join("driver.py");
     let py = generate_reviewer_task_py(&ReviewerTaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),
         mode: mode.to_string(),
@@ -420,43 +423,48 @@ fn run_reviewer_container(
         agt_ext,
         agt_policy_path,
         agt_audit_path,
-        port_base: opts.port_base,
+        port: opts.port_base,
         pi_model: "inspect-bridge/inspect".to_string(),
+        bridge_model: format!("inspect/{}", model.inspect_model_id()),
+        max_tokens: model.max_tokens,
         workspace_dir: "/workspace".to_string(),
         sandbox_user: "root".to_string(),
         run_id,
         settle_grace_seconds: opts.settle_grace_seconds,
+        time_limit_secs: opts.time_limit_secs,
+        done_marker: done_marker.to_string_lossy().into_owned(),
+        task_name: "alfred-reviewer".to_string(),
     })?;
-    std::fs::write(&task_py_path, py)
-        .with_context(|| format!("write reviewer task {}", task_py_path.display()))?;
+    std::fs::write(&driver_py_path, py)
+        .with_context(|| format!("write reviewer driver {}", driver_py_path.display()))?;
 
-    // spawn `inspect eval --detach`（复用 executor 驱动；桥代发 = sandbox_agent_bridge，
-    // 宿主侧 Inspect 模型 = reviewer provider）。
-    let launch = spawn_eval(&task_py_path, model, None, &evals_dir, opts.time_limit_secs)?;
+    // spawn 宿主侧容器驱动（非 eval；桥代发 = sandbox_agent_bridge，宿主侧
+    // Inspect 模型 = reviewer provider）。
+    let launch = spawn_container_driver(&driver_py_path, model, work)?;
 
     let poll_timeout = opts.time_limit_secs as u64 + 600;
-    let outcome = match poll_until_done(&launch, poll_timeout, opts.ctl_enabled)? {
-        PollOutcome::Done(done) => done,
-        PollOutcome::TimedOut => {
+    let outcome = match poll_container_driver(&launch, poll_timeout)? {
+        DriverOutcome::Done(done) => done,
+        DriverOutcome::TimedOut => {
             bail!(
-                "reviewer container eval timed out after {}s (no done record in {})",
+                "reviewer container driver timed out after {}s (no done record in {})",
                 poll_timeout,
-                launch.output_file.display()
+                launch.done_marker.display()
             )
         }
-        PollOutcome::Crashed => {
+        DriverOutcome::Crashed => {
             bail!(
-                "reviewer container eval crashed (output: {})",
-                launch.output_file.display()
+                "reviewer container driver crashed (done marker: {})",
+                launch.done_marker.display()
             )
         }
     };
 
     if outcome.status != "success" {
         bail!(
-            "reviewer container eval finished with status '{}' (location={})",
+            "reviewer container driver finished with status '{}' (error={:?})",
             outcome.status,
-            outcome.location
+            outcome.error
         );
     }
 
@@ -478,7 +486,7 @@ fn run_reviewer_container(
     Ok(ContainerRunOutput {
         output_text,
         eval_status: outcome.status,
-        eval_location: Some(outcome.location),
+        eval_location: Some(done_marker.to_string_lossy().into_owned()),
     })
 }
 

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Reviewer agent task (R6c) — plan review / exec review in a network-none docker sandbox.
+"""Inspect 容器管理驱动 — reviewer（无 eval 包装）。
 
-Runs pi inside the reviewer sandbox (ws full RO + /inputs ro + /outputs rw) and
-relays its model calls through `sandbox_agent_bridge` to the host-side Inspect
-model (the reviewer provider). The container has no external network and holds
-no real credentials: pi's `~/.pi/agent/models.json` points at the bridge proxy
-with a dummy `sk-none` key.
+依据：属主 08-27「容器统一用 Inspect AI 管理」。本脚本是 Inspect 容器管理接口
+的宿主侧驱动（**非** `inspect eval` 评测任务）：
+  1. `DockerSandboxEnvironment.sample_init` —— docker compose 起容器（挂载面
+     矩阵由 compose 文件决定，本驱动不触碰隔离面）。
+  2. `sandbox_agent_bridge` —— 宿主起 run_model_service + 容器内 exec_remote
+     model_proxy，代发本角色模型（密钥留在宿主）。
+  3. `exec_remote` —— 驱动容器内 pi（断网、models.json 指向容器内桥代理）。
+  4. 容器生命周期（compose up/down）由本脚本经 Inspect 容器管理接口负责；宿主
+     只 spawn 本脚本 + 轮询 done 记录 + 读 bind mount 产物。
 
 MODE == "plan_review": pi reads /inputs/{request.json, dagspec.json, session.json,
   conversation.json, contract.json, sandbox.json}, judges whether the DagSpec
@@ -27,24 +31,24 @@ the deny attempts land on the host — AGT audit trail).
 import json
 import time
 
-from inspect_ai import Task, task
+import anyio
+
 from inspect_ai.agent import sandbox_agent_bridge
-from inspect_ai.dataset import MemoryDataset, Sample
-from inspect_ai.model import (
-    ChatCompletionChoice,
-    ChatMessageAssistant,
-    ModelOutput,
-)
-from inspect_ai.solver import solver
+from inspect_ai.model import GenerateConfig, get_model
 from inspect_ai.util import (
     ExecCompleted,
     ExecRemoteStreamingOptions,
     ExecStdout,
     sandbox,
-    store,
+)
+from inspect_ai.util._sandbox.docker.docker import DockerSandboxEnvironment
+from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
+from inspect_ai.util._sandbox.context import (
+    sandbox_default_context_var,
+    sandbox_environments_context_var,
 )
 
-# ---- alfred-injected configuration (tokens replaced by alfred-reviewer task_gen) ----
+# ---- alfred 注入配置（token 替换，见 alfred-reviewer task_gen.rs）----
 COMPOSE_FILE = __COMPOSE_FILE_JSON__
 MODE = __MODE_JSON__
 SYSTEM_PROMPT = __SYSTEM_PROMPT_JSON__
@@ -53,12 +57,20 @@ OUTPUT_FILE = __OUTPUT_FILE_JSON__
 AGT_EXT = __AGT_EXT_JSON__
 AGT_POLICY_PATH = __AGT_POLICY_PATH_JSON__
 AGT_AUDIT_PATH = __AGT_AUDIT_PATH_JSON__
-PORT_BASE = int(__PORT_BASE__)
+PORT = int(__PORT__)
 PI_MODEL = __PI_MODEL_JSON__
+# 宿主侧 Inspect 模型 id（桥代发目标）：`inspect/<provider>/<model>` 形态。
+BRIDGE_MODEL = __BRIDGE_MODEL_JSON__
+MAX_TOKENS = int(__MAX_TOKENS__)
 WORKSPACE_DIR = __WORKSPACE_DIR_JSON__
 SANDBOX_USER = __SANDBOX_USER_JSON__
 RUN_ID = __RUN_ID_JSON__
 SETTLE_GRACE_SECONDS = float(__SETTLE_GRACE_SECONDS__)
+TIME_LIMIT_SECS = float(__TIME_LIMIT_SECS__)
+# 宿主侧 done 记录路径（驱动写完即通知宿主）。
+DONE_MARKER = __DONE_MARKER_JSON__
+# docker compose 项目名基座（Inspect 加 uuid 后缀，每次运行独立项目）。
+TASK_NAME = __TASK_NAME_JSON__
 
 
 def _models_json(port: int) -> dict:
@@ -97,7 +109,7 @@ async def _write_models_json(sbox, port: int) -> None:
 async def _respond_extension_ui(proc, msg: dict) -> None:
     """Auto-answer pi extension UI dialogs (select/confirm/input/editor).
 
-    Same policy as the planner task: auto-accept — the sandbox has no external
+    Same policy as the old reviewer task: auto-accept — the sandbox has no external
     network and only ws (ro) + /inputs (ro) + /outputs (rw) are mounted, so
     dialogs cannot leak or escalate. AGT tool-permission interception (DenyWrite)
     is handled by pi itself via `-e`.
@@ -169,16 +181,32 @@ async def _drive_pi(proc, prompt: str) -> tuple[bool, int | None]:
     return settled, exit_code
 
 
-@solver
-def reviewer_agent():
-    async def solve(state, generate):
-        # per-sample bridge port (inspect_swe pattern: increment from store)
-        port = store().get("reviewer_model_port", PORT_BASE - 1) + 1
-        store().set("reviewer_model_port", port)
+async def _run_container() -> None:
+    """起容器（Inspect DockerSandboxEnvironment）+ 桥代发 + 驱动容器内 pi。"""
+    raw_envs = None
+    try:
+        raw_envs = await DockerSandboxEnvironment.sample_init(
+            TASK_NAME, COMPOSE_FILE, metadata={}
+        )
+        # exec_remote 依赖 SandboxEnvironmentProxy（事件记录包装，eval 路径同款）
+        envs = {k: SandboxEnvironmentProxy(v) for k, v in raw_envs.items()}
+        sandbox_environments_context_var.set(envs)
+        sandbox_default_context_var.set("default")
 
-        async with sandbox_agent_bridge(port=port) as bridge:
+        # bridge 把 pi 请求的 "inspect" 经 model_aliases 解析到本角色模型
+        # （带 max_tokens 生成配置）；非 "inspect" 请求走 fallback model。
+        async with sandbox_agent_bridge(
+            model=BRIDGE_MODEL,
+            model_aliases={
+                "inspect": get_model(
+                    BRIDGE_MODEL.removeprefix("inspect/"),
+                    config=GenerateConfig(max_tokens=MAX_TOKENS),
+                )
+            },
+            port=PORT,
+        ):
             sbox = sandbox()
-            await _write_models_json(sbox, port)
+            await _write_models_json(sbox, PORT)
 
             env = {"PI_OFFLINE": "1", "HOME": "/root"}
             if AGT_EXT:
@@ -199,33 +227,65 @@ def reviewer_agent():
                 ),
                 stream=True,
             )
-            settled, exit_code = await _drive_pi(proc, SYSTEM_PROMPT + "\n\n" + DRIVER_PROMPT)
+            settled, exit_code = await _drive_pi(
+                proc, SYSTEM_PROMPT + "\n\n" + DRIVER_PROMPT
+            )
             if not settled:
-                raise RuntimeError(f"reviewer pi RPC did not settle (exit_code={exit_code})")
+                raise RuntimeError(
+                    f"reviewer pi RPC did not settle (exit_code={exit_code})"
+                )
 
             # The produced verdict must exist on the /outputs mount; otherwise the
-            # reviewer produced nothing and the eval must fail (not silently pass).
+            # reviewer produced nothing and the driver must fail (not silently pass).
             out = await sbox.exec(["cat", OUTPUT_FILE])
             if not out.success or not out.stdout.strip():
                 raise RuntimeError(f"reviewer pi did not write {OUTPUT_FILE}")
-            state.output = ModelOutput(
-                model="reviewer-output-collector",
-                choices=[
-                    ChatCompletionChoice(
-                        message=ChatMessageAssistant(content=out.stdout),
-                        stop_reason="stop",
+    finally:
+        # 清理必须 shield：超时取消（fail_after）时，finally 内的 await 会立即抛
+        # CancelledError——shield 保证 compose down 跑完，不泄漏容器。
+        if raw_envs is not None:
+            try:
+                with anyio.CancelScope(shield=True):
+                    await DockerSandboxEnvironment.sample_cleanup(
+                        TASK_NAME, COMPOSE_FILE, raw_envs, False
                     )
-                ],
-            )
-        return state
-
-    return solve
+            except Exception as cleanup_ex:
+                print(f"[alfred-driver] container cleanup failed: {cleanup_ex}")
 
 
-@task
-def reviewer_task():
-    return Task(
-        dataset=MemoryDataset([Sample(id=RUN_ID, input=MODE)]),
-        solver=[reviewer_agent()],
-        sandbox=("docker", COMPOSE_FILE),
-    )
+def _write_done(status: str, error: str | None = None) -> None:
+    doc = {"event": "done", "status": status, "run_id": RUN_ID}
+    if error:
+        doc["error"] = error
+    with open(DONE_MARKER, "w") as f:
+        json.dump(doc, f)
+
+
+async def _run_with_timeout() -> None:
+    # fail_after 是 async 上下文管理器（同步 with 会 NoEventLoopError）——包一层
+    # async 函数再交给 anyio.run。超时后 _run_container 的 finally（shield 清理）
+    # 先跑完，再向 main 抛 TimeoutError。
+    with anyio.fail_after(TIME_LIMIT_SECS):
+        await _run_container()
+
+
+def main() -> None:
+    status = "success"
+    error: str | None = None
+    try:
+        anyio.run(_run_with_timeout)
+    except TimeoutError:
+        status = "timed_out"
+        error = f"driver timed out after {TIME_LIMIT_SECS:.0f}s"
+        print(f"[alfred-driver] {error}", flush=True)
+    except Exception as ex:
+        status = "error"
+        error = str(ex)
+        print(f"[alfred-driver] driver failed: {error}", flush=True)
+        raise
+    finally:
+        _write_done(status, error)
+
+
+if __name__ == "__main__":
+    main()

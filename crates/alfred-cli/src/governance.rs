@@ -210,10 +210,9 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
     let opts = PlanReviewOptions {
         run_dir: review_dir.clone(),
         time_limit_secs: run.options.review_time_limit_secs,
-        ctl_enabled: run.options.ctl_enabled,
-        // R6c：reviewer 容器路径（ws 全量 ro + 对话记录）；离线回归
-        // （ALFRED_OFFLINE=1）由 execute_plan_review 内部回退旧 eval 直判。
-        container: Some(ReviewerContainerOptions::from_governance(review_dir, &run.options)),
+        // R6c：reviewer 容器路径（ws 全量 ro + 对话记录）；离线（ALFRED_OFFLINE=1）
+        // 由 execute_plan_review 内部跳过（unscored → 升级属主）。
+        container: ReviewerContainerOptions::from_governance(review_dir, &run.options),
     };
     let outcome = execute_plan_review(
         &opts,
@@ -308,7 +307,7 @@ fn execution_step(
     let opts = RunOptions {
         run_dir: exec_dir.clone(),
         // R6e：执行产物落 run 级单一持久 ws（`<run>/ws`，git 基线），exec-N 只做
-        // 记录（evals/task.py/compose/state.json）不挂产物。
+        // 记录（driver.py/compose/state.json）不挂产物。
         workspace_dir: ctx.run_dir.join("ws"),
         image: run.options.image.clone(),
         assignment,
