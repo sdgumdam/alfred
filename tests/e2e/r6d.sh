@@ -4,21 +4,23 @@
 # 执行审查切 reviewer 容器（离线回退升级属主）
 #
 # 四层：
-#   Tier 0（默认，无外部依赖）：cargo test —— 全量离线单测。R6d 两处核心
-#     断言在单测层已有覆盖：task_gen.rs `generates_valid_python_with_values`
-#     （生成的 executor driver.py 无任何 scorer 残留）+ governance.rs
-#     `exec_review_step_offline_falls_back_without_container`（ALFRED_OFFLINE=1
-#     → 执行审查回退 → Escalated + escalation_source=Execution）。
+#   Tier 0（默认，无外部依赖）：cargo test —— 全量离线单测。R6d 核心断言
+#     在单测层覆盖：task_gen.rs `generates_valid_python_with_values`（生成的
+#     executor driver.py 无任何 scorer 残留）。治理环执行审查离线回退的**黑盒**
+#     覆盖在 Tier1b（细粒度开关 ALFRED_EXEC_REVIEW_OFFLINE=1 → 升级属主）。
 #   Tier 1（离线回归；Tier1a 纯离线，Tier1b 需 docker 但无需真 LLM）：
 #     a) 生成 executor 任务 py，断言不含 exec_verdict_scorer /
 #        _collect_artifact_summary / [BEGIN DATA] / scorer= /
 #        ACCEPTANCE_CRITERIA（R6d 核心验收：执行 eval 只出产物无审查）——
 #        模板静态检查 + task_gen.rs 真实 token 注入生成断言；
-#     b) 治理环 ALFRED_OFFLINE=1 → 计划审查（mock provider 返回 pass）→
-#        真实执行（mockllm，docker 沙箱）→ 执行审查离线回退 →
-#        Escalated + escalation_source=Execution（§六继承项，不悄悄放行），
-#        且 exec-1/driver.py 无 scorer、exec-1/state.json 无 verdict 字段、
-#        不建 exec-review 目录。
+#     b) 治理环 ALFRED_PLANNER_OFFLINE=1（planner 离线注入忠实计划）→
+#        计划审查 reviewer 容器在线（mock provider 驱动容器内 pi 经 write 工具
+#        循环写 /outputs/verdict.json，非宿主直调 reviewer 模型）→ 真实执行
+#        （mockllm，docker 沙箱）→ ALFRED_EXEC_REVIEW_OFFLINE=1（执行审查离线
+#        回退）→ Escalated + escalation_source=Execution（§六继承项，不悄悄
+#        放行），且 exec-1/driver.py 无 scorer、exec-1/state.json 无 verdict
+#        字段、不建 exec-review 目录、plan-review/outputs/verdict.json +
+#        compose.yaml 存在（证明计划审查真走了 reviewer 容器）。
 #   Tier 2（需 docker 沙箱镜像，无需 LLM）：容器可见性实测（对齐 §二.6）——
 #     reviewer 执行审查容器挂载矩阵：ws 全量 ro（写被拒）/ /inputs 文件 ro
 #     （内容不可改）/ /outputs rw（verdict 落宿主）/ AGT 策略 ro + 审计子目录
@@ -34,9 +36,9 @@
 #
 # 模型：
 #   Tier 1a 纯静态（无需模型）；Tier 1b 用 inspect 内建 mockllm（executor，
-#   无需 key）+ 本地 mock OpenAI 兼容 provider（reviewer，返回 {"pass":true}，
-#   无需真 LLM——真 kuaizi 走旧 eval 直判路径会撞 45s scoring 超时，见交付
-#   文档）；Tier 2 无模型；Tier 3 走 config.yml 真实模型。
+#   无需 key）+ 本地 mock OpenAI 兼容 provider（reviewer——计划审查首请求返回
+#   write 工具调用驱动 pi 写 verdict.json，后续请求纯文本收尾；无需真 LLM）；
+#   Tier 2 无模型；Tier 3 走 config.yml 真实模型。
 # 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
 #   r6d 以 `cargo run --bin alfred -- run` 驱动治理环（run 初始化 + 推进）。
 # 验收：cargo test 全绿 + Tier 1 离线回归 PASS（或 inspect/docker 缺失
@@ -100,13 +102,15 @@ elif ! docker image inspect alfred-executor:latest >/dev/null 2>&1; then
 fi
 
 if [[ -n "$TIER1B_SKIP" ]]; then
-  echo "SKIP(Tier1b): $TIER1B_SKIP。治理环离线回退由 Tier0 单测
-    exec_review_step_offline_falls_back_without_container 覆盖。"
+  echo "SKIP(Tier1b): $TIER1B_SKIP。治理环执行审查离线回退的 e2e 覆盖需 docker
+    （本机无环境时跳过）。"
 else
   echo ""
   echo "============================================="
-  echo "R6d Tier 1b：治理环 ALFRED_OFFLINE=1 → 执行审查回退升级属主"
-  echo "  （无需真 LLM：reviewer=mock provider，executor=mockllm）"
+  echo "R6d Tier 1b：治理环 计划审查容器在线 + 执行审查离线回退升级属主"
+  echo "  （ALFRED_PLANNER_OFFLINE=1 规划离线注入忠实计划 + reviewer=mock provider"
+  echo "   驱动容器内 pi 经 write 工具循环写 verdict + executor=mockllm 真实执行"
+  echo "   + ALFRED_EXEC_REVIEW_OFFLINE=1 执行审查离线回退）"
   echo "============================================="
   export ALFRED_INSPECT="$INSPECT"
 
@@ -114,8 +118,9 @@ else
   rm -rf "$T1B"
   mkdir -p "$T1B"
 
-  # mock provider：本地 OpenAI 兼容端点，恒返回 {"pass":true}
-  # （真 kuaizi 走旧 eval 直判会撞 plan_review.py.tmpl 45s scoring 超时，见交付文档）
+  # mock provider：本地 OpenAI 兼容端点。计划审查走 reviewer 容器（pi 在线），
+  # mock 对首请求返回 write 工具调用（pi 经正常工具循环写 /outputs/verdict.json），
+  # 后续请求纯文本收尾——非宿主直调 reviewer 模型。
   MOCK_PORT="${ALFRED_MOCK_PORT:-18731}"
   MOCK_PID=""
   cleanup_mock() {
@@ -193,11 +198,14 @@ JSON
   export ALFRED_CONFIG="$T1B/config.yml"
   export ALFRED_REVIEWER_MODEL="mock-reviewer"
   export ALFRED_EXECUTOR_MODEL="mockllm/model"
-  export ALFRED_PLANNER_MODEL="mockllm/model"
-  export ALFRED_OFFLINE=1
+  # 解耦主开关：planner 离线（注入忠实计划）+ 执行审查离线回退；计划审查在线
+  # （走 reviewer 容器，mock provider 驱动 pi 写 verdict）。主开关 ALFRED_OFFLINE
+  # 不设（否则计划审查也离线，走不到执行审查）。
+  export ALFRED_PLANNER_OFFLINE=1
   export ALFRED_OFFLINE_PLAN_FILE="$T1B/plan-faithful.json"
+  export ALFRED_EXEC_REVIEW_OFFLINE=1
 
-  echo "[r6d] tier1b: driver run（离线规划 → mock 计划审查 PASS → 真实执行 → 执行审查离线回退） ..."
+  echo "[r6d] tier1b: driver run（planner 离线 → 计划审查容器在线（mock 驱动 pi 写 verdict）→ 真实执行 → 执行审查离线回退） ..."
   cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$T1B/request.json" \
     --run-dir "$RUN1B" \
@@ -230,11 +238,16 @@ exec_state = json.load(open(os.path.join(run, "exec-1", "state.json")))
 for field in ("verdict", "unscored_reason", "verdict_unscored_reason"):
     assert field not in exec_state["run"], f"exec-1/state.json 不应含 {field}"
 assert exec_state["run"]["eval_status"] == "success", f"eval_status={exec_state['run']['eval_status']}"
+# 6) 计划审查真走了 reviewer 容器（在线）：outputs/verdict.json + compose.yaml 存在
+pr = os.path.join(run, "plan-review")
+assert os.path.exists(os.path.join(pr, "outputs", "verdict.json")), "计划审查容器 outputs/verdict.json 缺失"
+assert os.path.exists(os.path.join(pr, "compose.yaml")), "计划审查容器 compose.yaml 缺失"
 PY
-  echo "PASS(tier1b): 治理环 ALFRED_OFFLINE=1 执行审查回退升级属主（escalation_source=execution）"
+  echo "PASS(tier1b): 治理环 计划审查容器在线 + 执行审查离线回退升级属主（escalation_source=execution）"
   echo "PASS(tier1b): 执行 eval 只出产物无审查（exec-1/driver.py 无 scorer + state.json 无 verdict）"
+  echo "PASS(tier1b): 计划审查真走了 reviewer 容器（plan-review/outputs/verdict.json + compose.yaml）"
 
-  unset ALFRED_CONFIG ALFRED_REVIEWER_MODEL ALFRED_EXECUTOR_MODEL ALFRED_PLANNER_MODEL ALFRED_OFFLINE ALFRED_OFFLINE_PLAN_FILE
+  unset ALFRED_CONFIG ALFRED_REVIEWER_MODEL ALFRED_EXECUTOR_MODEL ALFRED_PLANNER_OFFLINE ALFRED_OFFLINE_PLAN_FILE ALFRED_EXEC_REVIEW_OFFLINE
   trap - EXIT
   [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
   wait "$MOCK_PID" 2>/dev/null || true
@@ -393,7 +406,7 @@ echo "  Tier 1a: executor 任务 py 只出产物无审查（模板 + 生成断�
 if [[ -n "$TIER1B_SKIP" ]]; then
   echo "  Tier 1b: SKIP（$TIER1B_SKIP）"
 else
-  echo "  Tier 1b: 治理环 ALFRED_OFFLINE=1 执行审查回退升级属主 PASS"
+  echo "  Tier 1b: 计划审查容器在线 + 执行审查离线回退升级属主 PASS"
 fi
 echo "  Tier 2 : 容器可见性实测（挂载矩阵；docker 缺失 SKIP）"
 echo "  Tier 3 : ${R6D_REAL:-0}（R6D_REAL=1 时真容器全链，需 config.yml provider 可达）"
