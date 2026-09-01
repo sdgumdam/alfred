@@ -30,16 +30,18 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 ```
 属主（人）
   └─ alfred CLI（Rust；编排器状态机在 alfred-core 内，进程内调用）
-       ├─ planner：宿主 Rust 直调 LLM（chat_completion），产出建图指令序列 → DagSpec
-       ├─ 执行+执行审查：生成 Inspect Task 定义 → subprocess `inspect eval --detach`
-       │    └─ Inspect AI：起 docker 沙箱（network_mode: none + 只挂 workspace）
+       ├─ planner：容器内 pi 对话 agent（converse 建图 / maintain 会话文档），
+       │    经 sandbox_agent_bridge 桥调模型（容器断网 + 宿主代发）→ 产出 → DagSpec
+       ├─ 执行：生成宿主侧容器驱动脚本（driver.py，非 eval Task）→ spawn `python3 driver.py`
+       │    └─ Inspect 容器管理接口：起 docker 沙箱（network_mode: none + 只挂 workspace）
        │         ├─ sandbox_agent_bridge：容器内 localhost 模型代理 → 宿主 provider
-       │         ├─ 容器内 pi：只拿契约 prompt，经桥调模型（密钥不进容器）
-       │         └─ scorer：model_graded_qa，拿验收标准判产物（只见验收+产物摘要）
-       │    ← `inspect ctl` 轮询 → 读 eval log（Artifact diff + ExecVerdict score）
-       ├─ 计划审查：单独 inspect eval（scorer 判 DagSpec vs OwnerRequest 忠实度）
+       │         └─ 容器内 pi：只拿契约 prompt，经桥调模型（密钥不进容器）
+       │    ← 轮询 `<work>/driver.done.json` done 记录 → 读 bind mount 产物
+       ├─ 计划审查 / 执行审查：同机制独立 reviewer 容器（driver.py 驱动容器内 pi
+       │    判 DagSpec vs OwnerRequest 忠实度 / 产物 vs 验收标准）→ verdict.json
        ├─ 决策面板：pi --mode rpc 会话（extension_ui_request/response 决策卡）
-       └─ 持久层：run-<id>/{state.json, audit.jsonl, llm-calls/, evals/, exec-N/}
+       └─ 持久层：run-<id>/{state.json, audit.jsonl, llm-calls/, exec-N/}（exec-N/ 下
+            driver.done.json + driver.stdout/stderr.log 为驱动证据，替代旧 evals/）
 ```
 
 ### Crate 划分（Cargo workspace，5 crates）
@@ -47,9 +49,9 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 | crate | 职责 |
 |---|---|
 | `alfred-core` | 跨组件共享实体（唯一真源）：OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc + **治理环状态机**（`governance.rs`，§3.3 路由表落码） |
-| `alfred-planner` | 规划器（converse 建图 / maintain 会话文档维护 / 打回伪装 disguise）；宿主直调 LLM，llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
-| `alfred-executor` | 执行侧：生成 Inspect Task 定义（`pi_task.py.tmpl`）、沙箱 compose、spawn/poll eval、产物采集、配置加载 |
-| `alfred-reviewer` | 审查侧：计划审查独立 eval（忠实度判 PlanVerdict）；执行审查 scorer 内嵌 executor 同一 eval（投影物理隔离） |
+| `alfred-planner` | 规划器（converse 建图 / maintain 会话文档维护 / 打回伪装 disguise）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
+| `alfred-executor` | 执行侧：生成 Inspect 容器管理驱动（`driver.py` 非 eval Task）、沙箱 compose、spawn/poll 驱动（done 记录）、产物采集、配置加载 |
+| `alfred-reviewer` | 审查侧：计划/执行审查都在独立 reviewer 容器内完成（driver.py 容器 pi，判忠实度 PlanVerdict / 验收 ExecVerdict） |
 | `alfred-cli` | CLI：`run` / `plan-review` / `decide` / `panel` / `status` |
 
 ---
@@ -95,7 +97,7 @@ env 覆盖：
 alfred run --request <req.json> [--run-dir <dir>] [--time-limit 600]
            [--review-time-limit 300] [--image alfred-executor:latest]
 
-# 计划审查：判 DagSpec 是否忠实于 OwnerRequest（独立 eval，PlanVerdict 落盘）
+# 计划审查：判 DagSpec 是否忠实于 OwnerRequest（reviewer 容器，PlanVerdict 落盘）
 alfred plan-review --request <req.json> --dagspec <dag.json> --run-dir <dir>
 
 # 属主拍板（retry / revise / abandon）并从挂起态续跑
@@ -130,8 +132,8 @@ Planning → PlanReviewing → Executing → ExecReviewing
 | I/P | contract_ambiguity / fidelity_dispute / disagreement | 升级属主 |
 | I/P | contract_fault | 升级属主（预标注建议改契约） |
 
-- **机械失败判定**：执行 eval 状态（success/error/timeout/crash）——eval 非 success → mechanical。
-- **审查本身出错**（unscored / eval error）→ 升级属主，不悄悄放行。
+- **机械失败判定**：执行容器驱动状态（success/error/timed_out/crash）——非 success → mechanical。
+- **审查本身出错**（unscored / driver error）→ 升级属主，不悄悄放行。
 - **打回伪装（P7）**：计划审查打回的 reason 被转写为属主口吻消息（禁词检查：
   reject/verdict/审查/打回 等结构化信号不得出现），再喂给规划器重规划。
 - **会话文档（P6）**：maintain 在 ① 计划审查结论落定、② 属主补充新需求 两时机更新
@@ -146,7 +148,7 @@ Planning → PlanReviewing → Executing → ExecReviewing
 
 | 脚本 | 覆盖 | 模式 |
 |---|---|---|
-| `r1.sh` | 执行侧：容器内 pi 产出 hello.txt 落宿主 + evals/ 证据归档 | 真容器真 LLM |
+| `r1.sh` | 执行侧：容器内 pi 产出 hello.txt 落宿主 + driver.done.json/stdout/stderr 证据归档 | 真容器真 LLM |
 | `r2.sh` | 审查侧四用例：执行审查 C / 部分兑现 P / 注定不忠实计划打回 / 解析失败 unscored | 真 LLM + 离线注入 |
 | `r3.sh` | 治理环闭环四用例：正路径全环 / 机械升级闭环（decide retry 续跑）/ 打回伪装闭环 / 多轮会话文档 | 真 LLM + 离线注入 |
 | `r4.sh` | 决策面板 RPC 两用例：escalated→panel abandon→Abandoned / plan_rejected→panel retry→真重跑→Completed | 离线注入（面板属主会话真 LLM） |
@@ -173,7 +175,7 @@ escape）覆盖"真实执行与审查"；离线注入（r2 case2·3 / r3 case2·
 | 边界 | 机制 | 验证 |
 |---|---|---|
 | 联网默认拒绝 | 沙箱 compose `network_mode: none`（容器内只有 lo） | R0 实验 + r1 沿用 |
-| 密钥不进容器 | 容器内 models.json 哑 key；真实 key 只留宿主 eval 进程（env_clear + 白名单注入） | R0 审计（docker inspect env 零命中） |
+| 密钥不进容器 | 容器内 models.json 哑 key；真实 key 只留宿主 driver 进程（env_clear + 白名单注入） | R0 审计（docker inspect env 零命中） |
 | 越界写拦截 | 只挂 workspace 卷；工作区外路径在容器 overlay，不落宿主 | `tests/e2e/escape.sh`（两向验证 PASS） |
 | 审查隔离 | 执行审查 scorer 只见验收标准+产物摘要，不见 prompt；规划器不感知审查者/执行者 | r2/r3 e2e 断言 |
 | 工具级策略（原型，默认关） | AGT 风格 pi 扩展拦 `tool_call`（rm -rf / sudo / 秘密读取 / 越界写） | `tests/e2e/agt/`（确定性 29 断言 + 实机演示）——启用与否属主定，见 `.plans/AGT评估.md` |
@@ -185,9 +187,9 @@ escape）覆盖"真实执行与审查"；离线注入（r2 case2·3 / r3 case2·
 ```
 crates/
   alfred-core/      实体 + 状态机 + 路由 + GraphBuilder
-  alfred-planner/   converse / maintain / disguise / llm
-  alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/pi_task.py.tmpl
-  alfred-reviewer/  plan_review / task_gen
+  alfred-planner/   converse / maintain / disguise / container / task_gen / llm
+  alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
+  alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
   alfred-cli/       commands/{run, plan_review, decide, panel, status, governance}
 docker/
   Dockerfile        沙箱镜像（inspect 基座 + Node 22 + pi-coding-agent 0.84.3）

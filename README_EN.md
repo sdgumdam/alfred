@@ -37,26 +37,28 @@ documentation sync).
 Owner (human)
   └─ alfred CLI (Rust; the orchestrator state machine lives in alfred-core,
                  called in-process)
-       ├─ planner: host-side Rust direct LLM call (chat_completion) →
-       │            instruction sequence → DagSpec
-       ├─ execution + exec review: generate an Inspect Task definition →
-       │            subprocess `inspect eval --detach`
-       │    └─ Inspect AI: starts a docker sandbox (network_mode: none +
-       │                   workspace-only volume)
+       ├─ planner: in-container pi conversation agent (converse graph-building /
+       │            maintain session-doc), calls the model through the bridge
+       │            (container offline + host relays) → output → DagSpec
+       ├─ execution: generate a host-side container driver script (driver.py,
+       │             not an eval Task) → spawn `python3 driver.py`
+       │    └─ Inspect container-management interface: starts a docker sandbox
+       │            (network_mode: none + workspace-only volume)
        │         ├─ sandbox_agent_bridge: in-container localhost model proxy
        │         │            → host provider
-       │         ├─ in-container pi: sees only the contract prompt, calls the
-       │         │            model through the bridge (no keys in container)
-       │         └─ scorer: model_graded_qa grades the artifact against the
-       │                    acceptance criteria (sees acceptance + summary only)
-       │    ← `inspect ctl` polling → reads the eval log (artifact diff +
-       │                              ExecVerdict score)
-       ├─ plan review: a separate inspect eval (scorer judges DagSpec fidelity
-       │               vs OwnerRequest)
+       │         └─ in-container pi: sees only the contract prompt, calls the
+       │                    model through the bridge (no keys in container)
+       │    ← polls `<work>/driver.done.json` for the done record → reads the
+       │                              bind-mount artifacts
+       ├─ plan review / exec review: same mechanism in a dedicated reviewer
+       │            container (driver.py drives in-container pi to judge DagSpec
+       │            fidelity vs OwnerRequest / artifact vs acceptance) →
+       │            verdict.json
        ├─ decision panel: pi --mode rpc session (extension_ui_request/response
        │                  decision cards)
-       └─ persistence: run-<id>/{state.json, audit.jsonl, llm-calls/, evals/,
-                                  exec-N/}
+       └─ persistence: run-<id>/{state.json, audit.jsonl, llm-calls/, exec-N/}
+                       (driver.done.json + driver.stdout/stderr.log under exec-N/
+                       are the driver evidence, replacing the old evals/)
 ```
 
 ### Crates (Cargo workspace, 5 crates)
@@ -64,9 +66,9 @@ Owner (human)
 | crate | responsibility |
 |---|---|
 | `alfred-core` | Shared cross-crate entities (single source of truth): OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc + the **governance state machine** (`governance.rs`, §3.3 routing table in code) |
-| `alfred-planner` | Planner (converse graph-building / maintain session-doc / disguise rejection); host-direct LLM with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
-| `alfred-executor` | Execution side: generates the Inspect Task definition (`pi_task.py.tmpl`), the sandbox compose, spawn/poll eval, artifact collection, config loading |
-| `alfred-reviewer` | Review side: standalone plan-review eval (fidelity → PlanVerdict); the exec-review scorer is embedded in the same executor eval (projection isolation) |
+| `alfred-planner` | Planner (converse graph-building / maintain session-doc / disguise rejection); in-container pi conversation agent (bridge-relayed LLM) with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
+| `alfred-executor` | Execution side: generates the Inspect container-management driver (`driver.py`, not an eval Task), the sandbox compose, spawn/poll the driver (done record), artifact collection, config loading |
+| `alfred-reviewer` | Review side: plan/exec review both run in a dedicated reviewer container (driver.py in-container pi, judging fidelity → PlanVerdict / acceptance → ExecVerdict) |
 | `alfred-cli` | CLI: `run` / `plan-review` / `decide` / `panel` / `status` |
 
 ---
@@ -117,7 +119,7 @@ alfred run --request <req.json> [--run-dir <dir>] [--time-limit 600]
            [--review-time-limit 300] [--image alfred-executor:latest]
 
 # Plan review: judge whether a DagSpec is faithful to the OwnerRequest
-# (standalone eval, PlanVerdict persisted)
+# (reviewer container, PlanVerdict persisted)
 alfred plan-review --request <req.json> --dagspec <dag.json> --run-dir <dir>
 
 # Owner decision (retry / revise / abandon); resumes from the suspended state
@@ -156,9 +158,9 @@ Tiered routing (§3.3, all six rows in code):
 | I/P | contract_ambiguity / fidelity_dispute / disagreement | escalate to owner |
 | I/P | contract_fault | escalate to owner (suggests a contract change) |
 
-- **Mechanical-failure detection**: execution eval status
-  (success/error/timeout/crash) — eval non-success ⇒ mechanical.
-- **Review errors** (unscored / eval error) escalate to the owner; never silently
+- **Mechanical-failure detection**: execution container-driver status
+  (success/error/timed_out/crash) — non-success ⇒ mechanical.
+- **Review errors** (unscored / driver error) escalate to the owner; never silently
   passed.
 - **Disguised rejection (P7)**: the plan-review reason is rewritten into an
   owner-voice message (a forbidden-signal check rejects review/verdict/否决/打回
@@ -177,7 +179,7 @@ Tiered routing (§3.3, all six rows in code):
 
 | script | coverage | mode |
 |---|---|---|
-| `r1.sh` | execution side: in-container pi produces hello.txt on host + evals/ archive | real container + real LLM |
+| `r1.sh` | execution side: in-container pi produces hello.txt on host + driver.done.json/stdout/stderr evidence archive | real container + real LLM |
 | `r2.sh` | review side, four cases: exec review C / partial P / unfaithful plan bounced / parse-failure unscored | real LLM + offline injection |
 | `r3.sh` | governance loop, four cases: happy path full loop / mechanical-escalation loop (decide retry) / disguised-rejection loop / multi-turn session doc | real LLM + offline injection |
 | `r4.sh` | decision-panel RPC, two cases: escalated→panel abandon→Abandoned / plan_rejected→panel retry→real rerun→Completed | offline injection (panel owner session is a real LLM) |
@@ -206,7 +208,7 @@ land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 | boundary | mechanism | verification |
 |---|---|---|
 | No network by default | sandbox compose `network_mode: none` (only loopback in container) | R0 experiment + carried into r1 |
-| No keys in container | in-container models.json uses a dummy key; real keys stay in the host eval process (`env_clear` + allowlist) | R0 audit (`docker inspect env` zero hits) |
+| No keys in container | in-container models.json uses a dummy key; real keys stay in the host driver process (`env_clear` + allowlist) | R0 audit (`docker inspect env` zero hits) |
 | Out-of-workspace write blocked | workspace-only volume; paths outside it land on the container overlay, not the host | `tests/e2e/escape.sh` (two-way PASS) |
 | Review isolation | exec-review scorer sees acceptance criteria + artifact summary only, not the prompt; planner is unaware of reviewer/executor | r2/r3 e2e assertions |
 | Tool-level policy (prototype, off by default) | AGT-style pi extension intercepts `tool_call` (rm -rf / sudo / secret read / out-of-workspace write) | `tests/e2e/agt/` (24 deterministic assertions + live demo) — owner decides, see `.plans/AGT评估.md` |
@@ -218,9 +220,9 @@ land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 ```
 crates/
   alfred-core/      entities + state machine + routing + GraphBuilder
-  alfred-planner/   converse / maintain / disguise / llm
-  alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/pi_task.py.tmpl
-  alfred-reviewer/  plan_review / task_gen
+  alfred-planner/   converse / maintain / disguise / container / task_gen / llm
+  alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
+  alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
   alfred-cli/       commands/{run, plan_review, decide, panel, status, governance}
 docker/
   Dockerfile        sandbox image (inspect base + Node 22 + pi-coding-agent 0.84.3)
