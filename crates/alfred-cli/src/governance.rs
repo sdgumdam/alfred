@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use alfred_core::conversation::{
     append_to_disk, load_conversation, ConversationRole, ConversationSource,
 };
-use alfred_core::governance::{GovernanceEvent, GovernanceRun};
+use alfred_core::governance::{GovernanceEvent, GovernanceRun, GovernanceState, OwnerDecision};
 use alfred_core::util::now_rfc3339;
 use alfred_executor::config::ExecutorModel;
 use alfred_executor::run::{execute_run, RunOptions};
@@ -117,6 +117,120 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
         // 进程在下一转移前崩溃也能从最新状态续跑（崩溃恢复显式化）。
         persist_governance_run(&ctx.run_dir, run)?;
     }
+}
+
+/// 喂属主消息 → 续跑治理环（库调用方/codux driver 入口，非 CLI 子命令）。
+///
+/// 属主第二句：planner 是容器里能多轮对话的 pi，owner 直接跟它说话——本 API 是
+/// "库调用方喂属主消息"的形式：设置本轮属主消息、维护者②固化关键结论、落对话
+/// 记录、按挂起态路由续跑治理环，返回新状态给调用方（codux 终端显示）。
+///
+/// 语义（复用 decide CLI 的 P1-2 续入机制，非新机制）：
+/// 1. `run.owner_message = message`（下一轮 `planning_step` converse 读它）；
+/// 2. maintain②（`OwnerMessage` → `key_conclusions`，把属主消息固化为关键结论）；
+/// 3. 落 conversation.json（`ConversationSource::OwnerMessage`，属主轮次）；
+/// 4. 挂起态路由 + 续跑 `run_governance_loop`：
+///    - Planning（converse 答复分支停驻）→ 无状态转移，直接续跑（对话继续）；
+///    - PlanRejected/Escalated → 按 `OwnerDecision` 路由：Revise → `OwnerRevise`
+///      （回 Planning 重新规划，喂 owner_message 续 converse）；Retry →
+///      `OwnerRetry`（按升级来源路由：重入执行/重审同一计划/重新规划）；
+///      Abandon → `OwnerAbandon`（终态，不续跑）。
+/// 5. 返回新状态给调用方（planner 答复在 conversation.json 的 converse.reply 轮）。
+pub fn feed_owner_message(
+    run: &mut GovernanceRun,
+    ctx: &GovernanceContext,
+    message: &str,
+    decision: OwnerDecision,
+) -> Result<GovernanceState> {
+    let state = run.state();
+    // P1-2 语义（decide CLI 的 allowed 检查）：挂起态可拍板；Planning 态（converse
+    // 答复后停驻）仅 revise 可续入对话。
+    let allowed = state.is_suspended()
+        || (state == GovernanceState::Planning && decision == OwnerDecision::Revise);
+    if !allowed {
+        bail!(
+            "feed_owner_message: 决策 {:?} 不适用于当前状态 {:?}（仅挂起态可拍板；Planning 态仅 revise 可续入对话）",
+            decision,
+            state
+        );
+    }
+    let message = message.trim();
+    if message.is_empty() {
+        bail!("feed_owner_message: 属主消息为空");
+    }
+
+    // 1. maintain②：属主消息固化为关键结论（先 maintain——喂旧 doc，得新 doc）。
+    run.session_doc = maintain(
+        &MaintainOptions {
+            run_dir: ctx.run_dir.clone(),
+            model: ctx.planner_model.clone(),
+            container: alfred_planner::container::PlannerContainerOptions::from_governance(
+                ctx.run_dir.clone(),
+                &run.options,
+            ),
+        },
+        &run.session_doc,
+        MaintainTrigger::OwnerMessage {
+            message: message.to_string(),
+        },
+    )?;
+
+    // 2. 设置 owner_message（planning_step 下一轮 converse 读它；重规划/改需求语义）。
+    run.owner_message = Some(message.to_string());
+
+    // 3. 落 conversation.json（属主轮次，reviewer 挂载输入数据源，§二.8）。
+    append_to_disk(
+        &ctx.run_dir,
+        &run.run_id,
+        ConversationRole::Owner,
+        message.to_string(),
+        ConversationSource::OwnerMessage,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("append owner.message to conversation.json")?;
+    audit(
+        &ctx.run_dir,
+        "feed_owner_message",
+        &serde_json::json!({
+            "decision": format!("{decision:?}"),
+            "from_state": state_label(state),
+            "message": message,
+        }),
+    )?;
+
+    // 4. 挂起态路由（Planning 态无状态转移——对话继续，直接续跑 planning_step）。
+    if state != GovernanceState::Planning {
+        match decision {
+            OwnerDecision::Revise => run.apply(GovernanceEvent::OwnerRevise)?,
+            OwnerDecision::Retry => {
+                // P1 修复：Escalated+OwnerRetry 按升级来源路由（GovernanceRun::apply
+                // 在升级事件落来源）；attempts 重置——重入执行/重审/重规划都是新周期。
+                run.attempts_used = 0;
+                run.apply(GovernanceEvent::OwnerRetry)?;
+            }
+            OwnerDecision::Abandon => {
+                run.apply(GovernanceEvent::OwnerAbandon)?;
+                persist_governance_run(&ctx.run_dir, run)?;
+                audit(
+                    &ctx.run_dir,
+                    "governance_paused",
+                    &serde_json::json!({ "state": state_label(run.state()) }),
+                )?;
+                return Ok(run.state());
+            }
+        }
+    }
+
+    // 5. 续跑（从新状态推进到下一个挂起/终态）。
+    persist_governance_run(&ctx.run_dir, run)?;
+    run_governance_loop(run, ctx)?;
+    persist_governance_run(&ctx.run_dir, run)?;
+    audit(
+        &ctx.run_dir,
+        "governance_paused",
+        &serde_json::json!({ "state": state_label(run.state()) }),
+    )?;
+    Ok(run.state())
 }
 
 /// Planning：converse（会话文档 + 属主消息 → §2.4 两分支）+ E5 reviewer_models 注入。
