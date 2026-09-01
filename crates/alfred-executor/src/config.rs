@@ -58,7 +58,9 @@ struct Provider {
 struct ModelEntry {
     id: String,
     provider: String,
-    #[serde(default)]
+    /// config.yml 用 `maxTokens`（camelCase）；serde 默认按字段名 `max_tokens`
+    /// 解析会静默吞掉该键（None → 恒落 4096 下限）。alias 同时接受两种拼写。
+    #[serde(default, alias = "maxTokens")]
     max_tokens: Option<u32>,
 }
 
