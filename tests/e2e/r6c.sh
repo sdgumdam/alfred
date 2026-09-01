@@ -150,14 +150,14 @@ import json, os, sys
 run = sys.argv[1]
 state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
-# 计划审查走了旧 eval 路径（离线回退）：plan-review/ 有 plan_review.py（旧模板产物）
+# 离线（ALFRED_OFFLINE=1）确定性直通：不产容器驱动脚本，直接落 verdict.json
+# （真容器 driver.py/driver.done.json 由 Tier3 断言，非本层）
 pr = os.path.join(run, "plan-review")
-assert os.path.exists(os.path.join(pr, "plan_review.py")), "离线回退应产旧 eval 模板 plan_review.py"
 assert os.path.exists(os.path.join(pr, "verdict.json")), "plan-review/verdict.json missing"
 vd = json.load(open(os.path.join(pr, "verdict.json")))
 assert vd["verdict"] is None, f"expected unscored, got {vd['verdict']}"
 PY
-  echo "PASS(tier1c): 离线治理环（container=Some + ALFRED_OFFLINE → 回退旧 eval 路径）"
+  echo "PASS(tier1c): 离线治理环（ALFRED_OFFLINE → 确定性直通 unscored → escalated）"
 
   unset ALFRED_CONFIG
   echo ""
