@@ -52,7 +52,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 | `alfred-planner` | 规划器（converse 建图 / maintain 会话文档维护 / 打回伪装 disguise）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
 | `alfred-executor` | 执行侧：生成 Inspect 容器管理驱动（`driver.py` 非 eval Task）、沙箱 compose、spawn/poll 驱动（done 记录）、产物采集、配置加载 |
 | `alfred-reviewer` | 审查侧：计划/执行审查都在独立 reviewer 容器内完成（driver.py 容器 pi，判忠实度 PlanVerdict / 验收 ExecVerdict） |
-| `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message`，owner 交互经 codux 终端）+ 真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status，消费前置 `--append-system-prompt`） |
+| `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message`，owner 交互经 codux 终端）+ 真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status，消费前置 `--append-system-prompt`，注入的项目上下文追加到 planner pi 系统提示） |
 
 ---
 

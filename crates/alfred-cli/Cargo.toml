@@ -2,7 +2,7 @@
 name = "alfred-cli"
 version.workspace = true
 edition.workspace = true
-description = "alfred 编排器状态机驱动库（governance.rs 核心）+ alfred bin（codux 可调度 CLI driver：run/feed/status，消费前置 --append-system-prompt）"
+description = "alfred 编排器状态机驱动库（governance.rs 核心）+ alfred bin（codux 可调度 CLI driver：run/feed/status，消费前置 --append-system-prompt，注入的项目上下文追加到 planner pi 系统提示）"
 
 [lib]
 name = "alfred_cli"

@@ -68,7 +68,7 @@ Owner (human)
 | `alfred-planner` | Planner (converse graph-building / maintain session-doc / disguise rejection); in-container pi conversation agent (bridge-relayed LLM) with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
 | `alfred-executor` | Execution side: generates the Inspect container-management driver (`driver.py`, not an eval Task), the sandbox compose, spawn/poll the driver (done record), artifact collection, config loading |
 | `alfred-reviewer` | Review side: plan/exec review both run in a dedicated reviewer container (driver.py in-container pi, judging fidelity → PlanVerdict / acceptance → ExecVerdict) |
-| `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal) + real `alfred` bin (codux-schedulable CLI driver: run/feed/status, consumes leading `--append-system-prompt`) |
+| `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal) + real `alfred` bin (codux-schedulable CLI driver: run/feed/status, consumes leading `--append-system-prompt`; the injected project context is appended to the planner pi's system prompt) |
 
 ---
 
