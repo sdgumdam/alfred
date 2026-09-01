@@ -20,8 +20,11 @@
 //! `--message` 优先按文件路径读取（旧 decide --message 语义）；路径不存在时按
 //! 内联文本处理（codux 终端直喂属主原话）。
 //!
-//! 前置消费：codux wrapper 在子命令前注入 `--append-system-prompt <value>`；main()
-//! 取子命令前先剥离任意前置该 flag（接受并丢弃/存 env，绝不 bail）。
+//! 前置消费：codux wrapper 在子命令前注入 `--append-system-prompt <value>`（项目
+//! 上下文）；main() 取子命令前先剥离任意前置该 flag 并存入 `ALFRED_APPEND_SYSTEM_PROMPT`
+//! env（绝不 bail）。`cmd_run`/`cmd_feed` 读该 env → `GovernanceContext` → 追加到
+//! planner pi 的 converse system prompt（容器 + llm-calls 记录，见
+//! alfred-planner::converse 的 `converse_system_prompt`）。P2-1：内存注入端到端生效。
 //! `--help/-h` 与 `--version/-V` 打印后退出 0。输出保持 `[driver] 当前状态` 状态行。
 
 use std::path::{Path, PathBuf};
@@ -58,7 +61,9 @@ fn main() -> Result<()> {
 }
 
 /// 消费任意前置的 `--append-system-prompt <value>`（codux wrapper 前置注入）。
-/// 接受并丢弃/存 env，绝不 bail——值缺失时仅消费 flag 本身继续。
+/// 存入 `ALFRED_APPEND_SYSTEM_PROMPT` env（cmd_run/cmd_feed 读入
+/// `GovernanceContext`，追加到 planner pi 的 system prompt），绝不 bail——
+/// 值缺失时仅消费 flag 本身继续。
 fn strip_append_system_prompt(mut args: Vec<String>) -> Vec<String> {
     let mut appended: Vec<String> = Vec::new();
     while let Some(first) = args.first().map(String::as_str) {
@@ -87,7 +92,7 @@ fn print_help() {
     println!("  feed    喂属主决策（revise|retry|abandon）并从挂起态续跑");
     println!("  status  只读打印当前治理环状态");
     println!();
-    println!("通用 flag: --append-system-prompt <value>（前置注入，接受并丢弃）; -h/--help; -V/--version");
+    println!("通用 flag: --append-system-prompt <value>（前置注入，追加到 planner pi 系统提示）; -h/--help; -V/--version");
 }
 
 /// `run`：初始化治理 run（request.submit 首轮 + ws 基线）→ 推进治理环。
@@ -183,6 +188,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
         planner_model: planner,
         executor_model: executor,
         reviewer_model: reviewer,
+        append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
     };
 
     audit(
@@ -265,6 +271,7 @@ fn cmd_feed(args: &[String]) -> Result<()> {
         planner_model: planner,
         executor_model: executor,
         reviewer_model: reviewer,
+        append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
     };
 
     let state = feed_owner_message(&mut run, &ctx, &message, decision)?;

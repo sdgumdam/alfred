@@ -34,6 +34,10 @@ pub struct GovernanceContext {
     pub planner_model: ExecutorModel,
     pub executor_model: ExecutorModel,
     pub reviewer_model: ExecutorModel,
+    /// codux wrapper 注入的项目上下文（`--append-system-prompt`，经
+    /// `ALFRED_APPEND_SYSTEM_PROMPT` 读入）；追加到 planner pi 的 converse
+    /// system prompt（P2-1：内存注入端到端生效）。空串 = 不注入。
+    pub append_system_prompt: String,
 }
 
 /// 从挂起/初始状态推进治理环，直到挂起态或终态。
@@ -332,6 +336,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<boo
 			ctx.run_dir.clone(),
 			&run.options,
 		),
+		append_system_prompt: ctx.append_system_prompt.clone(),
 	};
 	let outcome = converse(&opts, &run.request, &run.session_doc, &owner_message)?;
 	match outcome {
