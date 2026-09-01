@@ -261,6 +261,12 @@ if [[ "${R6C_REAL:-0}" == "1" ]]; then
   "created_at": "2026-08-28T00:00:00Z"
 }
 JSON
+  # 验证缺口 (a)：converse 不挂 trigger 的直接 compose 级磁盘证明。治理环时序：
+  #   Planning 阶段 converse 渲染 planner/compose.yaml（trigger 注释行）→
+  #   PlanReviewing 通过后 maintain ① 渲染同一路径（trigger 活动行，覆盖 converse 版）。
+  #   磁盘终态是 maintain 渲染；converse 版须在 driver run 期间捕获——后台起 driver，
+  #   轮询到含 converse 不挂 trigger 注释行的 planner/compose.yaml 即其 converse 版。
+  CONVERSE_COMPOSE="$CASE_B/converse.planner.compose.yaml"
   echo "[r6c] tier3b: driver run（真容器 converse → 计划审查容器 → 执行 → 执行审查） ..."
   cargo run --quiet -p alfred-cli --example driver -- run \
     --request "$CASE_B/request.json" \
@@ -268,11 +274,26 @@ JSON
     --time-limit 900 \
     --review-time-limit 300 \
     --planner-time-limit 900 \
-    --image "$IMAGE"
+    --image "$IMAGE" \
+    >"$R6C_RUNS/r6c-tier3b-driver.log" 2>&1 &
+  DRIVER_PID=$!
+  # 轮询捕获 converse 渲染的 planner compose（maintain 覆盖在计划审查通过后，
+  # 早于该时点出现的必是 converse 渲染）；driver 退出仍未捕获 → 后续断言拦。
+  for ((_i=0; _i<1200; _i++)); do
+    if [[ -f "$CASE_B/planner/compose.yaml" ]] \
+      && grep -q 'converse 模式：不挂载 trigger.json' "$CASE_B/planner/compose.yaml" 2>/dev/null; then
+      cp "$CASE_B/planner/compose.yaml" "$CONVERSE_COMPOSE"
+      break
+    fi
+    kill -0 "$DRIVER_PID" 2>/dev/null || break
+    sleep 0.5
+  done
+  wait "$DRIVER_PID"
 
-  python3 - "$CASE_B" <<'PY' || { echo "FAIL(tier3b): 真容器全链未完成" >&2; exit 1; }
+  python3 - "$CASE_B" "$CONVERSE_COMPOSE" <<'PY' || { echo "FAIL(tier3b): 真容器全链未完成" >&2; exit 1; }
 import json, os, sys
 run = sys.argv[1]
+converse_compose = sys.argv[2]
 state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "completed", f"state={state['state_machine']['state']}"
 # 计划审查走了容器：plan-review/inputs/conversation.json（reviewer 独有挂载输入）存在
@@ -280,8 +301,24 @@ pr = os.path.join(run, "plan-review")
 assert os.path.exists(os.path.join(pr, "inputs", "conversation.json")), "容器计划审查缺 conversation.json 输入"
 assert os.path.exists(os.path.join(pr, "outputs", "verdict.json")), "容器计划审查 outputs/verdict.json 缺失"
 assert os.path.exists(os.path.join(pr, "compose.yaml")), "容器计划审查 compose.yaml 缺失"
+
+# 验证缺口 (a)：converse 不挂 trigger 的磁盘级证明（planner compose）
+#   converse 渲染：trigger 注释行（无活动挂载行）；maintain ① 覆盖后：活动挂载行。
+ACTIVE = ":/inputs/trigger.json:ro"
+CONVERSE_COMMENT = "converse 模式：不挂载 trigger.json"
+
+assert os.path.exists(converse_compose), "未捕获 converse 渲染的 planner compose.yaml"
+cc = open(converse_compose, encoding="utf-8").read()
+for line in cc.splitlines():
+    assert not (line.strip().startswith("- ") and ACTIVE in line), \
+        f"converse planner compose 含活动 trigger 挂载：{line}"
+assert CONVERSE_COMMENT in cc, "converse planner compose 缺 converse 不挂 trigger 注释行"
+
+mc = open(os.path.join(run, "planner", "compose.yaml"), encoding="utf-8").read()
+active = [l for l in mc.splitlines() if l.strip().startswith("- ") and ACTIVE in l]
+assert active, "maintain planner compose（磁盘终态）缺活动 trigger 挂载行"
 PY
-  echo "PASS(tier3b): 真容器全链（计划审查容器 + 执行审查）→ Completed"
+  echo "PASS(tier3b): 真容器全链（计划审查容器 + 执行审查）→ Completed（converse compose 无 trigger 挂载 + maintain compose 有）"
 
   unset ALFRED_AGT_DIR
 fi
