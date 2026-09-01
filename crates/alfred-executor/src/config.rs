@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -17,6 +18,11 @@ use serde::Deserialize;
 /// 治本在 ModelEntry `maxTokens` serde 生效（alias 已接）；此下限对冲 config
 /// 未显式配置 maxTokens 的场景。
 const DEFAULT_MAX_TOKENS: u32 = 8192;
+
+/// 同 provider 异构审查警告的进程内去重位：load_config 会被
+/// planner/executor/reviewer 顺序各调一次（alfred-cli main.rs 两个命令入口），
+/// 同一进程同一发现只警告一次，避免 stderr 三连噪音。
+static SAME_PROVIDER_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// 角色模型（provider 映射为 Inspect `openai-api/<provider>/<model>`）。
 #[derive(Debug, Clone)]
@@ -212,7 +218,9 @@ fn load_config() -> Result<ConfigFile> {
 
 /// 结构校验（§3.1 原文三种错误；第三种=模型引用未知 provider 在 load_role_model 报）：
 /// ① roles 引用的模型 id 不在 models 列表（且非 env 覆盖）→ 加载期报错点名；
-/// ② models 列表重复 id → 报错点名。
+/// ② models 列表重复 id → 报错点名；
+/// ③ 异构审查机制位：roles.executor 与 roles.reviewer 解析到同一 provider →
+///    stderr 警告（不阻断加载）——审查者独立防合谋，同 provider 即退化同源审查。
 fn validate_config(cfg: &ConfigFile) -> Result<()> {
     // ② models 列表重复 id → 报错点名
     let mut seen: HashMap<&str, ()> = HashMap::new();
@@ -238,7 +246,40 @@ fn validate_config(cfg: &ConfigFile) -> Result<()> {
             );
         }
     }
+    // ③ 异构审查机制位（施工清单 §3.1）：审查者 provider 必须与执行者不同——
+    // 加载配置发现相同 → stderr 警告（不阻断加载）。env 覆盖生效的角色 config
+    // 引用不参与实际解析（语义同 ①），config 面无法比较，跳过。
+    if let (Some((exec_id, exec_prov)), Some((rev_id, rev_prov))) = (
+        config_role_provider(cfg, "executor"),
+        config_role_provider(cfg, "reviewer"),
+    ) {
+        if exec_prov == rev_prov && !SAME_PROVIDER_WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "warning: config roles.executor ('{exec_id}') and roles.reviewer ('{rev_id}') \
+                 both resolve to provider '{exec_prov}': heterogeneous review degraded to \
+                 same-provider review (施工清单 §3.1 审查独立性机制位; non-fatal)"
+            );
+        }
+    }
     Ok(())
+}
+
+/// roles.<role> 的 config 解析面 `(model id, provider)`：仅当该角色无 env 覆盖
+/// （config 引用参与实际解析，语义同 ①）且 roles.<role> 已配置时返回 Some；
+/// models 列表存在性已由 ① 此前保证（bail 点名），此处 find 不到防御性返回 None。
+fn config_role_provider<'a>(cfg: &'a ConfigFile, role: &'a str) -> Option<(&'a str, &'a str)> {
+    if env_override_model_id(role).is_some() {
+        return None; // env 覆盖生效，config roles.<role> 引用不参与解析
+    }
+    let model_id = match role {
+        "executor" => cfg.roles.executor.as_str(),
+        "reviewer" => cfg.roles.reviewer.as_deref()?,
+        _ => return None,
+    };
+    cfg.models
+        .iter()
+        .find(|m| m.id == model_id)
+        .map(|m| (m.id.as_str(), m.provider.as_str()))
 }
 
 fn role_model_id(cfg: &ConfigFile, role: &str) -> Result<String> {
