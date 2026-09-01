@@ -236,7 +236,7 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
 }
 JSON
 echo "[r3] case2: driver run（执行 --time-limit 1 强制机械超时） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE2_DIR/request.json" \
   --run-dir "$CASE2_DIR" \
@@ -328,7 +328,7 @@ cat > "$CASE3_DIR/plan-faithful.json" <<'JSON'
 }
 JSON
 echo "[r3] case3: driver run（离线注入不忠实计划 → 计划审查打回） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-unfaithful.json" \
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-unfaithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE3_DIR/request.json" \
   --run-dir "$CASE3_DIR" \
@@ -345,7 +345,8 @@ PY
 echo "PASS(case3a): 不忠实计划被计划审查打回 → PlanRejected"
 
 echo "[r3] case3: driver feed retry（伪装消息重规划） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-faithful.json" \
+ALFRED_PLANNER_OFFLINE=1 ALFRED_EXEC_REVIEW_OFFLINE=1 \
+ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE3_DIR" \
   --decision retry
@@ -458,7 +459,7 @@ cat > "$CASE4_DIR/supplement.txt" <<'TXT'
 技术选型：内容必须是英文单词 Hello（大小写敏感），且文件必须位于工作区根目录。
 TXT
 echo "[r3] case4: driver run（打回 → 挂起 PlanRejected） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-unfaithful.json" \
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-unfaithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE4_DIR/request.json" \
   --run-dir "$CASE4_DIR" \
@@ -468,7 +469,8 @@ cargo run --quiet -p alfred-cli --bin alfred -- run \
 assert_state "$CASE4_DIR" "plan_rejected"
 
 echo "[r3] case4: driver feed revise（属主补充新需求） ..."
-ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-faithful.json" \
+ALFRED_PLANNER_OFFLINE=1 ALFRED_EXEC_REVIEW_OFFLINE=1 \
+ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE4_DIR" \
   --decision revise \
