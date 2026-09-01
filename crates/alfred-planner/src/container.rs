@@ -125,19 +125,25 @@ pub struct ContainerRunOutput {
 
 /// converse 容器驱动：会话文档投影 + 属主消息 + request → §2.4 两分支产出
 /// （建图指令 JSON 或 属主答复；produced_file 区分）。
+///
+/// `append_system_prompt`：codux 注入的项目上下文（P2-1），经
+/// [`crate::converse::converse_system_prompt`] 追加到 planner pi 的 system prompt；
+/// 空串 = 不追加（基础建图 schema）。
 pub fn run_converse_in_container(
     opts: &PlannerContainerOptions,
     model: &ExecutorModel,
     request: &OwnerRequest,
     doc: &SessionDoc,
     owner_message: &str,
+    append_system_prompt: &str,
 ) -> Result<ContainerRunOutput> {
     let inputs = converse_inputs(request, doc, owner_message)?;
+    let system_prompt = crate::converse::converse_system_prompt(append_system_prompt);
     run_planner_container(
         opts,
         model,
         "converse",
-        crate::converse::CONVERSE_SYSTEM_PROMPT,
+        &system_prompt,
         CONVERSE_DRIVER_PROMPT,
         &[CONVERSE_OUTPUT_FILE, CONVERSE_REPLY_FILE],
         inputs,

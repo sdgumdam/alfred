@@ -77,6 +77,24 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 - 计划必须忠实反映属主需求，不要做属主没要求的事。
 - 答复属主时用自然语言直接、清晰，不要夹带建图指令。"#;
 
+/// 合成 converse 的 system prompt（基础建图 schema + codux 注入的项目上下文）。
+///
+/// codux wrapper 每轮注入 `--append-system-prompt <memory>`（项目上下文）；P2-1
+/// 方案 A 真正透传：追加到 planner pi 的 system prompt——容器驱动
+/// （`container::run_converse_in_container`）与 llm-calls 审计记录
+/// （`build_messages`）共用同一份。空注入 = 原样返回基础 schema（行为不变）。
+pub(crate) fn converse_system_prompt(append_system_prompt: &str) -> String {
+    let append = append_system_prompt.trim();
+    if append.is_empty() {
+        CONVERSE_SYSTEM_PROMPT.to_string()
+    } else {
+        format!(
+            "{}\n\n附加的项目上下文（codux 注入）：\n{}",
+            CONVERSE_SYSTEM_PROMPT, append
+        )
+    }
+}
+
 /// converse 选项。
 #[derive(Debug, Clone)]
 pub struct ConverseOptions {
@@ -84,6 +102,10 @@ pub struct ConverseOptions {
     pub model: ExecutorModel,
     /// R6b：planner 容器驱动选项（起容器跑 converse；桥代发 LLM）。
     pub container: crate::container::PlannerContainerOptions,
+    /// codux wrapper 注入的项目上下文（`--append-system-prompt`，经
+    /// `ALFRED_APPEND_SYSTEM_PROMPT` 读入）；追加到 planner pi 的 converse
+    /// system prompt（P2-1：内存注入端到端生效）。空串 = 不追加。
+    pub append_system_prompt: String,
 }
 
 impl ConverseOptions {
@@ -92,6 +114,7 @@ impl ConverseOptions {
             run_dir,
             model,
             container: crate::container::PlannerContainerOptions::default(),
+            append_system_prompt: String::new(),
         }
     }
 }
@@ -124,7 +147,7 @@ pub fn converse(
     doc: &SessionDoc,
     owner_message: &str,
 ) -> Result<ConverseOutcome> {
-    let messages = build_messages(request, doc, owner_message);
+    let messages = build_messages(request, doc, owner_message, &opts.append_system_prompt);
     let (outcome, response, offline, transport) =
         if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1") {
             // 离线模式保留：不经容器（现状直通）；两分支由注入文件二选一。
@@ -134,7 +157,12 @@ pub fn converse(
             // R6b：容器内 pi 读输入跑 converse（桥代发 LLM），宿主读 /outputs 产出
             // （/outputs/instructions.json 或 /outputs/reply.txt，driver.py 已强制恰好一个）。
             let out = crate::container::run_converse_in_container(
-                &opts.container, &opts.model, request, doc, owner_message,
+                &opts.container,
+                &opts.model,
+                request,
+                doc,
+                owner_message,
+                &opts.append_system_prompt,
             )?;
             let outcome = match out.produced_file.as_str() {
                 crate::container::CONVERSE_OUTPUT_FILE => {
@@ -177,15 +205,16 @@ pub fn converse(
     })
 }
 
-/// 构建提示词（会话文档 + 属主本轮消息）。
+/// 构建提示词（会话文档 + 属主本轮消息 + codux 注入的项目上下文）。
 pub fn build_messages(
     request: &OwnerRequest,
     doc: &SessionDoc,
     owner_message: &str,
+    append_system_prompt: &str,
 ) -> Vec<ChatMessage> {
     // 方案B：喂给规划器的是投影（第三段 owner_feedback + 内容中性化），磁盘真源不变。
     let session = serde_json::to_string_pretty(&project_session_doc(doc)).unwrap_or_default();
-    let system = CONVERSE_SYSTEM_PROMPT.to_string();
+    let system = converse_system_prompt(append_system_prompt);
     let user = format!(
         "需求 id：{}\n\n会话文档（记忆）：\n{session}\n\n属主本轮消息：\n{owner_message}",
         request.id
