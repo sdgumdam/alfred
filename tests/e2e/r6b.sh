@@ -29,6 +29,9 @@
 #   caseD P2a/P2b Planning 态 Abandon（converse 答复停驻 → feed abandon 无消息、
 #         planner 不可用也能弃 → 终态 Abandoned；不跑 maintain②/不落 owner.message 轮）
 #   caseE Retry 消息可选（feed retry 无 --message → 按来源重审 → 再升级挂起）
+#   caseG P2-1 append 透传（--append-system-prompt <memory> → planner converse
+#         system prompt：llm-calls 记录的 converse system prompt 含注入内存 + 基础
+#         建图 schema 仍在；run 与 feed 各验一轮）
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -528,6 +531,116 @@ assert dec_turns and dec_turns[-1]["content"] == "重跑（retry）", \
     f"panel.decision={[t['content'] for t in dec_turns]}"
 PY
   echo "PASS(caseF): PlanRejected+Retry 伪装重规划（无否决词）+ panel.decision 轮"
+
+  # ---- Case G：P2-1 append 透传（--append-system-prompt <memory> → planner converse
+  # system prompt）----
+  # S2P2ReReview 审出：P2-1 的 append 透传路径无任何自动化测试覆盖（全仓无测试用
+  # --append-system-prompt / ALFRED_APPEND_SYSTEM_PROMPT），此前"空转"正是无测试掩护
+  # 所致。黑盒断言（只读 llm-calls 产物，不掏内部实现）：codux 注入的内存经
+  # `--append-system-prompt` 进 planner converse system prompt（llm-calls 记录与容器
+  # 驱动同源），基础建图 schema 仍在。G1: driver run 透传；G2: driver feed revise
+  # 透传（同 run 续跑，新一轮 converse 同样注入）。
+  CASE_G="$R6B_RUNS/run-r6b-append-passthrough"
+  rm -rf "$CASE_G"
+  mkdir -p "$CASE_G"
+  cat > "$CASE_G/request.json" <<'JSON'
+{
+  "id": "req-r6b-c6",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+  "created_at": "2026-09-01T00:00:00Z"
+}
+JSON
+  cat > "$CASE_G/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r6b-c6",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
+  # 注入内存标记（codux wrapper 每轮注入的项目上下文；断言它出现在 planner converse system prompt）
+  APPEND_MEMORY="MEMORY-PROJECT-CTX：项目核心引擎用 Rust 实现，关键路径禁止同步 IO"
+  echo "[r6b] caseG1: driver run（--append-system-prompt 透传 → planner converse system prompt） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_G/plan-faithful.json" \
+  cargo run --quiet -p alfred-cli --bin alfred -- \
+    --append-system-prompt "$APPEND_MEMORY" \
+    run \
+    --request "$CASE_G/request.json" \
+    --run-dir "$CASE_G" \
+    --time-limit 60 \
+    --review-time-limit 60 \
+    --planner-time-limit 60
+
+  python3 - "$CASE_G" "$APPEND_MEMORY" <<'PY' || { echo "FAIL(caseG1): run append 透传断言" >&2; exit 1; }
+import json, os, sys
+run, memory = sys.argv[1], sys.argv[2]
+# 黑盒只读产物：llm-calls 记录的 converse system prompt（与容器驱动同源）
+recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
+assert recs, "llm-calls/ empty"
+rec = json.load(open(os.path.join(run, "llm-calls", recs[0])))
+assert rec["role"] == "converse", f"role={rec['role']}"
+assert rec["offline"] is True and rec["transport"] == "offline", \
+    f"offline={rec['offline']} transport={rec['transport']}"
+system = rec["messages"][0]["content"]
+assert system.startswith("你是治理系统的规划器"), "基础建图 schema 不在 system prompt"
+assert "附加的项目上下文（codux 注入）" in system, "append 段落头缺失"
+assert memory in system, f"注入内存标记未透传到 converse system prompt: {system!r}"
+# 注入不透传不破坏治理环：run 照常推进到升级挂起（mockllm 审查 unscored）
+state = json.load(open(os.path.join(run, "state.json")))
+assert state["state_machine"]["state"] == "escalated", \
+    f"state={state['state_machine']['state']}"
+PY
+  echo "PASS(caseG1): run --append-system-prompt → converse system prompt 含注入内存 + 基础 schema"
+
+  echo "[r6b] caseG2: driver feed revise（--append-system-prompt 透传 → 新一轮 converse system prompt） ..."
+  cat > "$CASE_G/owner-msg.txt" <<'TXT'
+继续，技术选型用 Rust。
+TXT
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_G/plan-faithful.json" \
+  cargo run --quiet -p alfred-cli --bin alfred -- \
+    --append-system-prompt "$APPEND_MEMORY" \
+    feed \
+    --run-dir "$CASE_G" \
+    --decision revise \
+    --message "$CASE_G/owner-msg.txt"
+
+  python3 - "$CASE_G" "$APPEND_MEMORY" <<'PY' || { echo "FAIL(caseG2): feed append 透传断言" >&2; exit 1; }
+import json, os, sys
+run, memory = sys.argv[1], sys.argv[2]
+recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
+# G1 run 一轮 + G2 feed 续跑一轮 = 至少 2 条 converse 记录（都带同一注入）
+converse = [r for r in recs
+            if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "converse"]
+assert len(converse) >= 2, f"期望 run+feed 两条 converse 记录，实际 {converse}"
+for r in converse:
+    rec = json.load(open(os.path.join(run, "llm-calls", r)))
+    assert rec["offline"] is True and rec["transport"] == "offline", \
+        f"{r}: offline={rec['offline']} transport={rec['transport']}"
+    system = rec["messages"][0]["content"]
+    assert system.startswith("你是治理系统的规划器"), f"{r}: 基础建图 schema 不在 system prompt"
+    assert "附加的项目上下文（codux 注入）" in system, f"{r}: append 段落头缺失"
+    assert memory in system, f"{r}: 注入内存标记未透传: {system!r}"
+PY
+  echo "PASS(caseG2): feed --append-system-prompt → 新一轮 converse system prompt 含注入内存 + 基础 schema"
+
+  unset ALFRED_CONFIG
 
   unset ALFRED_CONFIG
 
