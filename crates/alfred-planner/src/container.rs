@@ -9,17 +9,19 @@
 //!      `<run_dir>/planner/inputs/`（R6a 模板约定：`/inputs/request.json`、
 //!      `/inputs/session.json`、`/inputs/owner_message.txt`、`/inputs/contract.json`）。
 //!   2. 渲染 `planner.compose.yaml.tmpl`（占位符 → canonicalize 后绝对路径，
-//!      实施计划 E1/E3）→ 生成 planner task.py（`templates/planner_task.py.tmpl`，
-//!      token 注入）→ spawn `inspect eval --detach`（复用 executor 驱动）→ 轮询
-//!      done → 容器内 pi 读输入、按 system prompt（照搬 converse.rs / maintain.rs
-//!      的 schema prompt）产建图指令/会话文档 JSON → 写 `/outputs/` 挂载。
+//!      实施计划 E1/E3）→ 生成 planner driver.py（`templates/planner_driver.py.tmpl`，
+//!      token 注入，非 eval Task）→ spawn `python3 driver.py`（Inspect 容器管理
+//!      接口：DockerSandboxEnvironment + sandbox_agent_bridge + exec_remote）→
+//!      轮询 done → 容器内 pi 读输入、按 system prompt（照搬 converse.rs /
+//!      maintain.rs 的 schema prompt）产建图指令/会话文档 JSON → 写 `/outputs/` 挂载。
 //!   3. 宿主读 `/outputs/<file>` 得原始输出文本（调用方解析/校验/落 llm-calls）。
 //!
-//! 桥模式选型（交付记录）：**复用 executor 的 sandbox_agent_bridge**（inspect eval
-//! 内），不独立起桥。理由：独立桥需重实现 inspect `sandbox_service` 的 RPC 通道
-//! （docker exec stdin/stdout 透传 + 容器内 model_proxy），数百行脆弱协议代码；
-//! executor 桥 R0 已验证（network-none 容器内经桥调通 zhipu），三角色统一断网 +
-//! 宿主代发。D4 的"直接 docker run 直驱"待属主拍板（见 R6b 交付文档）。
+//! 桥模式选型（交付记录）：**复用 executor 的 sandbox_agent_bridge**（Inspect
+//! 容器管理接口），不独立起桥。理由：独立桥需重实现 inspect `sandbox_service` 的
+//! RPC 通道（docker exec stdin/stdout 透传 + 容器内 model_proxy），数百行脆弱
+//! 协议代码；executor 桥 R0 已验证（network-none 容器内经桥调通 zhipu），三角色
+//! 统一断网 + 宿主代发。三容器 Inspect 统一管（属主 08-27）：容器管理走 Inspect
+//! 容器管理接口，不走 `inspect eval` 评测包装。
 
 use std::path::{Path, PathBuf};
 
@@ -27,7 +29,9 @@ use alfred_core::request::OwnerRequest;
 use alfred_core::session::SessionDoc;
 use alfred_executor::compose_gen::canonicalize_workspace;
 use alfred_executor::config::ExecutorModel;
-use alfred_executor::driver::{poll_until_done, spawn_eval, PollOutcome};
+use alfred_executor::driver::{
+    poll_container_driver, spawn_container_driver, DriverOutcome,
+};
 use anyhow::{bail, Context, Result};
 
 use crate::maintain::MaintainTrigger;
@@ -55,11 +59,11 @@ pub struct PlannerContainerOptions {
     pub image: String,
     /// 桥代理端口基数（每样本自增）。
     pub port_base: u32,
-    /// planner eval 单样本时间上限（秒）。
+    /// planner 容器驱动单样本时间上限（秒）。
     pub time_limit_secs: u32,
     /// settled 后宽限（秒）。
     pub settle_grace_seconds: f64,
-    /// 是否轮询 `inspect ctl` 观测面。
+    /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
     /// AGT 策略 + 扩展目录（挂 `/tmp/.agt` ro；含 policy.json + agt-policy.ts）。
     /// None = 不挂 AGT、不加载扩展（测试/最小环境）。
@@ -111,9 +115,9 @@ pub struct ContainerRunOutput {
     /// 实际产出的输出文件（容器内路径；converse：/outputs/instructions.json 或
     /// /outputs/reply.txt；maintain：/outputs/session.json）。
     pub produced_file: String,
-    /// eval 状态（"success" / "error"）。
+    /// 容器驱动状态（"success" / "error" / "timed_out"）。
     pub eval_status: String,
-    /// eval 日志 location（evals/ 下的 .eval 路径，审计证据）。
+    /// 驱动证据 location（driver.done.json，审计证据）。
     pub eval_location: Option<String>,
 }
 
@@ -229,7 +233,7 @@ fn maintain_inputs(doc: &SessionDoc, trigger: &MaintainTrigger) -> Result<Vec<(S
 
 ///
 /// `output_files`：容器内候选产出文件（converse 两分支 = [instructions, reply]；
-/// maintain = [session]）。task.py 强制恰好一个被写（多/零都报错）；宿主按候选集
+/// maintain = [session]）。驱动脚本强制恰好一个被写（多/零都报错）；宿主按候选集
 /// 探测产出（`ContainerRunOutput::produced_file` 区分分支）。
 #[allow(clippy::too_many_arguments)]
 fn run_planner_container(
@@ -245,7 +249,6 @@ fn run_planner_container(
     let work = run_dir.join(PLANNER_WORK_DIR);
     let inputs_dir = work.join(INPUTS_DIR);
     let outputs_dir = work.join(OUTPUTS_DIR);
-    let evals_dir = work.join("evals");
     // ws 持久目录（矩阵 §1.1 planner 行：ws 全量 ro 挂载源；R6b 先建空目录，
     // 持久 ws 语义见对齐方案 §二.7 后续工作）。
     let ws_dir = run_dir.join("ws");
@@ -254,8 +257,6 @@ fn run_planner_container(
         .with_context(|| format!("create planner inputs dir {}", inputs_dir.display()))?;
     std::fs::create_dir_all(&outputs_dir)
         .with_context(|| format!("create planner outputs dir {}", outputs_dir.display()))?;
-    std::fs::create_dir_all(&evals_dir)
-        .with_context(|| format!("create planner evals dir {}", evals_dir.display()))?;
     std::fs::create_dir_all(&ws_dir)
         .with_context(|| format!("create planner ws dir {}", ws_dir.display()))?;
 
@@ -319,7 +320,8 @@ fn run_planner_container(
         ),
         None => (String::new(), String::new(), String::new()),
     };
-    let task_py_path = work.join("task.py");
+    let done_marker = work.join("driver.done.json");
+    let driver_py_path = work.join("driver.py");
     let py = generate_planner_task_py(&PlannerTaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),
         mode: mode.to_string(),
@@ -330,43 +332,48 @@ fn run_planner_container(
         agt_ext,
         agt_policy_path,
         agt_audit_path,
-        port_base: opts.port_base,
+        port: opts.port_base,
         pi_model: "inspect-bridge/inspect".to_string(),
+        bridge_model: format!("inspect/{}", model.inspect_model_id()),
+        max_tokens: model.max_tokens,
         workspace_dir: "/workspace".to_string(),
         sandbox_user: "root".to_string(),
         run_id,
         settle_grace_seconds: opts.settle_grace_seconds,
+        time_limit_secs: opts.time_limit_secs,
+        done_marker: done_marker.to_string_lossy().into_owned(),
+        task_name: "alfred-planner".to_string(),
     })?;
-    std::fs::write(&task_py_path, py)
-        .with_context(|| format!("write planner task {}", task_py_path.display()))?;
+    std::fs::write(&driver_py_path, py)
+        .with_context(|| format!("write planner driver {}", driver_py_path.display()))?;
 
-    // spawn `inspect eval --detach`（复用 executor 驱动；桥代发 = sandbox_agent_bridge，
-    // 宿主侧 Inspect 模型 = planner provider——桥服务调用日志即审计源，见 llm.rs）。
-    let launch = spawn_eval(&task_py_path, model, None, &evals_dir, opts.time_limit_secs)?;
+    // spawn 宿主侧容器驱动（非 eval；桥代发 = sandbox_agent_bridge，宿主侧 Inspect
+    // 模型 = planner provider——桥服务调用日志即审计源，见 llm.rs）。
+    let launch = spawn_container_driver(&driver_py_path, model, &work)?;
 
     let poll_timeout = opts.time_limit_secs as u64 + 600;
-    let outcome = match poll_until_done(&launch, poll_timeout, opts.ctl_enabled)? {
-        PollOutcome::Done(done) => done,
-        PollOutcome::TimedOut => {
+    let outcome = match poll_container_driver(&launch, poll_timeout)? {
+        DriverOutcome::Done(done) => done,
+        DriverOutcome::TimedOut => {
             bail!(
-                "planner container eval timed out after {}s (no done record in {})",
+                "planner container driver timed out after {}s (no done record in {})",
                 poll_timeout,
-                launch.output_file.display()
+                launch.done_marker.display()
             )
         }
-        PollOutcome::Crashed => {
+        DriverOutcome::Crashed => {
             bail!(
-                "planner container eval crashed (output: {})",
-                launch.output_file.display()
+                "planner container driver crashed (done marker: {})",
+                launch.done_marker.display()
             )
         }
     };
 
     if outcome.status != "success" {
         bail!(
-            "planner container eval finished with status '{}' (location={})",
+            "planner container driver finished with status '{}' (error={:?})",
             outcome.status,
-            outcome.location
+            outcome.error
         );
     }
 
@@ -387,10 +394,10 @@ fn run_planner_container(
     let (produced_file, output_text) = match produced.as_slice() {
         [(f, text)] => ((*f).to_string(), text.clone()),
         [] => bail!(
-            "planner container produced none of {} (eval_status={}, location={})",
+            "planner container produced none of {} (status={}, error={:?})",
             output_files.join(", "),
             outcome.status,
-            outcome.location
+            outcome.error
         ),
         _ => bail!(
             "planner container produced multiple outputs ({}): 两分支只能二选一",
@@ -405,7 +412,7 @@ fn run_planner_container(
         output_text,
         produced_file,
         eval_status: outcome.status,
-        eval_location: Some(outcome.location),
+        eval_location: Some(done_marker.to_string_lossy().into_owned()),
     })
 }
 

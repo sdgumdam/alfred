@@ -7,7 +7,7 @@
 //! 本模块只保留调用记录的**落盘**：每次 converse/maintain 调用（桥代发或离线
 //! 确定性直通）由调用方构造 [`LlmCallRecord`] 并经 [`log_llm_call`] 写到
 //! `run_dir/llm-calls/<seq>.json`（P9 / §五 S0 验收证据）。宿主侧桥服务的调用
-//! 日志（evals/ 下的 inspect 记录）即实际 LLM HTTP 调用的审计源；llm-calls/
+//! 宿主侧桥服务的调用日志（driver.stdout/stderr.log）即实际 LLM HTTP 调用的审计源；llm-calls/
 //! 记录承载语义轮次（messages + response），供 e2e 从记录断言会话文档/伪装消息。
 
 use std::path::{Path, PathBuf};

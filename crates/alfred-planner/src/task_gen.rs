@@ -1,16 +1,16 @@
-//! planner Inspect Task 定义生成（Rust 生成 Python 文件）。
+//! planner Inspect 容器驱动定义生成（Rust 生成 Python 文件，非 eval Task）。
 //!
 //! 复用 executor 的 token 替换机制：字符串值经 JSON 编码注入（值语义一致），
-//! 数字 token 注入裸数字。模板见 templates/planner_task.py.tmpl。
+//! 数字 token 注入裸数字。模板见 templates/planner_driver.py.tmpl。
 
 use anyhow::{Context, Result};
 
-/// 内嵌的 planner pi 任务模板（见 templates/planner_task.py.tmpl）。
-const PLANNER_TASK_TEMPLATE: &str = include_str!("../templates/planner_task.py.tmpl");
+/// 内嵌的 planner 容器驱动模板（见 templates/planner_driver.py.tmpl）。
+const PLANNER_DRIVER_TEMPLATE: &str = include_str!("../templates/planner_driver.py.tmpl");
 
 /// 生成参数（全部经 token 替换注入模板）。
 pub struct PlannerTaskGenParams {
-    /// 沙箱 compose 文件绝对路径。
+    /// 沙箱 compose 文件绝对路径（挂载面矩阵，隔离机制）。
     pub compose_file: String,
     /// "converse" | "maintain"（容器内 pi 的任务模式）。
     pub mode: String,
@@ -29,10 +29,14 @@ pub struct PlannerTaskGenParams {
     pub agt_policy_path: String,
     /// AGT 审计文件容器内路径（"/tmp/.agt/audit/audit.jsonl"）；与 `agt_ext` 同空。
     pub agt_audit_path: String,
-    /// 桥代理端口基数（每样本自增）。
-    pub port_base: u32,
+    /// 桥代理端口（每容器一桥，容器内 localhost 互不冲突）。
+    pub port: u32,
     /// pi 模型（provider/model 形态，如 "inspect-bridge/inspect"）。
     pub pi_model: String,
+    /// 宿主侧桥代发模型 id（`inspect/<provider>/<model>`）。
+    pub bridge_model: String,
+    /// 宿主侧模型 max_tokens（桥代发生成配置）。
+    pub max_tokens: u32,
     /// 容器内工作区路径（"/workspace"）。
     pub workspace_dir: String,
     /// 容器内执行用户（"root"）。
@@ -41,11 +45,17 @@ pub struct PlannerTaskGenParams {
     pub run_id: String,
     /// settled 后的宽限秒数（进程未在 EOF 退出则 kill）。
     pub settle_grace_seconds: f64,
+    /// 驱动总时间上限（秒；anyio.fail_after 包裹整个容器运行）。
+    pub time_limit_secs: u32,
+    /// 宿主侧 done 记录文件绝对路径。
+    pub done_marker: String,
+    /// docker compose 项目名基座（Inspect 加 uuid 后缀）。
+    pub task_name: String,
 }
 
-/// 生成 task.py 内容。
+/// 生成 driver.py 内容。
 pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String> {
-    let mut out = PLANNER_TASK_TEMPLATE.to_string();
+    let mut out = PLANNER_DRIVER_TEMPLATE.to_string();
 
     let inject: &[(&str, String)] = &[
         ("__COMPOSE_FILE_JSON__", json(&params.compose_file)?),
@@ -57,8 +67,10 @@ pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String>
         ("__AGT_EXT_JSON__", json(&params.agt_ext)?),
         ("__AGT_POLICY_PATH_JSON__", json(&params.agt_policy_path)?),
         ("__AGT_AUDIT_PATH_JSON__", json(&params.agt_audit_path)?),
-        ("__PORT_BASE__", params.port_base.to_string()),
+        ("__PORT__", params.port.to_string()),
         ("__PI_MODEL_JSON__", json(&params.pi_model)?),
+        ("__BRIDGE_MODEL_JSON__", json(&params.bridge_model)?),
+        ("__MAX_TOKENS__", params.max_tokens.to_string()),
         ("__WORKSPACE_DIR_JSON__", json(&params.workspace_dir)?),
         ("__SANDBOX_USER_JSON__", json(&params.sandbox_user)?),
         ("__RUN_ID_JSON__", json(&params.run_id)?),
@@ -66,10 +78,13 @@ pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String>
             "__SETTLE_GRACE_SECONDS__",
             format!("{}", params.settle_grace_seconds),
         ),
+        ("__TIME_LIMIT_SECS__", format!("{}", params.time_limit_secs)),
+        ("__DONE_MARKER_JSON__", json(&params.done_marker)?),
+        ("__TASK_NAME_JSON__", json(&params.task_name)?),
     ];
     for (token, value) in inject {
         if !out.contains(token) {
-            anyhow::bail!("planner_task template missing token {token}");
+            anyhow::bail!("planner_driver template missing token {token}");
         }
         out = out.replace(token, value);
     }
@@ -85,15 +100,19 @@ pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String>
         "__AGT_EXT_JSON__",
         "__AGT_POLICY_PATH_JSON__",
         "__AGT_AUDIT_PATH_JSON__",
-        "__PORT_BASE__",
+        "__PORT__",
         "__PI_MODEL_JSON__",
+        "__BRIDGE_MODEL_JSON__",
+        "__MAX_TOKENS__",
         "__WORKSPACE_DIR_JSON__",
         "__SANDBOX_USER_JSON__",
         "__RUN_ID_JSON__",
-        "__SETTLE_GRACE_SECONDS__",
+        "__TIME_LIMIT_SECS__",
+        "__DONE_MARKER_JSON__",
+        "__TASK_NAME_JSON__",
     ] {
         if out.contains(token) {
-            anyhow::bail!("planner_task token replacement incomplete: {token}");
+            anyhow::bail!("planner_driver token replacement incomplete: {token}");
         }
     }
 
