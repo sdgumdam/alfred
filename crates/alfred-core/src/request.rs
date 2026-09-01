@@ -6,8 +6,7 @@ use crate::util::now_rfc3339;
 
 /// 属主（人）提交的原始需求：需求文字 + 验收标准。
 ///
-/// R1 中由 `alfred run --request <request.json>` 读取；R2 起由规划器
-/// 从本实体拆解出任务节点与契约。
+/// 治理环起点读取（request.json）；规划器从本实体拆解出任务节点与契约。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerRequest {

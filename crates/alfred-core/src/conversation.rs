@@ -31,10 +31,10 @@ pub enum ConversationRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationSource {
-    /// 初始需求提交（`alfred run` 读 request.json 时）。
+    /// 初始需求提交（治理环起点读 request.json 时）。
     #[serde(rename = "request.submit")]
     RequestSubmit,
-    /// 属主补充消息 / 计划打回伪装消息（decide revise / decide retry-伪装）。
+    /// 属主补充消息 / 计划打回伪装消息（revise / retry-伪装）。
     #[serde(rename = "owner.message")]
     OwnerMessage,
     /// converse 产出/答复（planning_step 落定后）。

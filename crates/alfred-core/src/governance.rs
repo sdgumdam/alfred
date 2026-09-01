@@ -9,7 +9,7 @@
 //! 2. **分级路由（§3.3 表）**：`route()` 纯函数，六行全落码。执行审查
 //!    结论（ExecVerdict）→ 路由决策。不存在表外第四种出口。
 //! 3. **持久化**：`GovernanceRun` 落 state.json（状态机 + attempts +
-//!    verdict 历史 + 会话文档 + 运行选项），供 `alfred decide` 续跑。
+//!    verdict 历史 + 会话文档 + 运行选项），供库调用方（codux driver）续跑。
 
 use serde::{Deserialize, Serialize};
 
