@@ -117,6 +117,9 @@ assert(d13.decision === "deny" && d13.rule === "bad-re", "非法正则 → 按�
 console.log("== planner-policy.json 语义（target_path 拦写） ==");
 const plannerPolicy = parsePolicy(readFileSync(path.join(here, "planner-policy.json"), "utf8"));
 
+// §2.4 两分支产出：instructions.json（Instructions 接管）与 reply.txt（Reply 对话继续）都经 /outputs → allow
+const p1 = evaluateToolCall(plannerPolicy, write("/outputs/instructions.json"));
+assert(p1.decision === "allow" && p1.rule === "allow-write-to-outputs", `planner write /outputs/instructions.json → allow(${p1.rule})`);
 // §2.4 答复分支：写 /outputs/reply.txt（两分支答复侧产出）同样 allow
 const p1b = evaluateToolCall(plannerPolicy, write("/outputs/reply.txt"));
 assert(p1b.decision === "allow" && p1b.rule === "allow-write-to-outputs", `planner write /outputs/reply.txt → allow(${p1b.rule})`);
