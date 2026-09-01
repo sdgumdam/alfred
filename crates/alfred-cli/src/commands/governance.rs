@@ -56,7 +56,8 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                     Ok(false) => {
                         println!(
                             "[alfred] 规划器已答复属主（state=Planning，对话继续）。\n\
-                             \x20 对话记录见 conversation.json；继续对话经属主入口喂入下一轮消息。",
+                             \x20 对话记录见 conversation.json；继续对话运行 `alfred decide --run-dir {} --decision revise --message <回答文件>` 喂入下一轮消息。",
+                            ctx.run_dir.display()
                         );
                         return Ok(());
                     }
@@ -121,7 +122,8 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
 ///
 /// 返回 `Ok(true)` = 产出计划（已 apply PlanProduced → PlanReviewing，编排环继续）；
 /// `Ok(false)` = 规划器答复了属主（纯文本答复，不产计划——对话继续，状态仍
-/// Planning，编排环返回调用方等属主下一轮消息）。
+/// Planning，编排环返回调用方；属主经 `alfred decide --decision revise --message`
+/// 续入下一轮消息（P1-2）。
 fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<bool> {
 	let owner_message = match &run.owner_message {
 		Some(m) => m.clone(),

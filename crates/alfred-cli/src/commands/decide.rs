@@ -1,10 +1,10 @@
-//! `alfred decide` 子命令（R3：属主拍板后从挂起态续跑）。
+//! `alfred decide` 子命令（R3：属主拍板后从挂起态续跑；P1-2：Planning 态续入对话）。
 //!
+//! - PlanRejected + retry → 伪装消息重规划；+ revise → 改需求重新规划；+ abandon → 终止；
 //! - Escalated + retry → 按升级来源路由（P1 修复：Execution → 重入执行；
-//!   PlanReview → 重审同一计划；Planning → 重新规划）；
-//! - 任一 + abandon → 终止。
-//! - Escalated + retry → 重入执行循环（重跑预算重置）；
-//! - 任一 + abandon → 终止。
+//!   PlanReview → 重审同一计划；Planning → 重新规划）；+ revise → 改需求重新规划；+ abandon → 终止；
+//! - Planning + revise → 属主答复规划器（对话继续入口，P1-2）：设 owner_message →
+//!   maintain② → planning_step 续跑（复用 revise 机制）。
 //!
 //! 续跑从 state.json 恢复状态机；模型配置（planner/executor/reviewer）在
 //! decide 时重新从 config/env 读取（config 是全局唯一真源，非 run 局部）。
@@ -94,14 +94,19 @@ pub fn decide(args: DecideArgs) -> Result<()> {
     }
 
     let state = run.state();
-    if !state.is_suspended() {
+    let decision: OwnerDecision = args.decision.into();
+
+    // P1-2：Planning 态（规划器答复属主、对话继续）允许 revise 续入下一轮消息
+    // （复用挂起态 revise 机制）；挂起态（PlanRejected/Escalated）允许全部拍板选项。
+    let allowed = state.is_suspended()
+        || (state == GovernanceState::Planning && decision == OwnerDecision::Revise);
+    if !allowed {
         bail!(
-            "decide {} 不适用于当前状态 {:?}（仅挂起态可拍板）",
+            "decide {} 不适用于当前状态 {:?}（仅挂起态可拍板；Planning 态仅 revise 可续入对话）",
             choice_label(args.decision),
             state
         );
     }
-    let decision: OwnerDecision = args.decision.into();
 
     // 属主拍板（§3.2 环节 3/6）。
     match (state, decision) {
@@ -136,7 +141,8 @@ pub fn decide(args: DecideArgs) -> Result<()> {
             println!("[alfred] 伪装消息: {}", truncate(&disguised, 200));
         }
         (GovernanceState::PlanRejected, OwnerDecision::Revise)
-        | (GovernanceState::Escalated, OwnerDecision::Revise) => {
+        | (GovernanceState::Escalated, OwnerDecision::Revise)
+        | (GovernanceState::Planning, OwnerDecision::Revise) => {
             let msg_path = args
                 .message
                 .as_ref()
@@ -162,7 +168,11 @@ pub fn decide(args: DecideArgs) -> Result<()> {
                 MaintainTrigger::OwnerMessage { message: msg.clone() },
             )?;
             run.owner_message = Some(msg.clone());
-            run.apply(alfred_core::governance::GovernanceEvent::OwnerRevise)?;
+            // P1-2：挂起态经 OwnerRevise 回 Planning；Planning 态本就在 Planning
+            // （对话继续）——无状态转移，直接续跑 planning_step 喂下一轮消息。
+            if state != GovernanceState::Planning {
+                run.apply(alfred_core::governance::GovernanceEvent::OwnerRevise)?;
+            }
             audit(
                 run_dir,
                 "decide_revise",
@@ -178,7 +188,14 @@ pub fn decide(args: DecideArgs) -> Result<()> {
             )
             .map_err(anyhow::Error::msg)
             .context("append owner.message to conversation.json")?;
-            println!("[alfred] 属主拍板：改需求重新规划。");
+            println!(
+                "[alfred] 属主拍板：{}。",
+                if state == GovernanceState::Planning {
+                    "继续对话（补充消息 → 重新规划）"
+                } else {
+                    "改需求重新规划"
+                }
+            );
         }
         (GovernanceState::PlanRejected, OwnerDecision::Abandon)
         | (GovernanceState::Escalated, OwnerDecision::Abandon) => {
@@ -219,7 +236,7 @@ pub fn decide(args: DecideArgs) -> Result<()> {
                 source, dest
             );
         }
-        _ => unreachable!("suspended state matched above"),
+        _ => unreachable!("suspended states / Planning+revise matched above"),
     }
 
     // 续跑（从新状态推进到下一个挂起/终态）。
