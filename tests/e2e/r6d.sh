@@ -6,7 +6,7 @@
 # 四层：
 #   Tier 0（默认，无外部依赖）：cargo test —— 全量离线单测。R6d 两处核心
 #     断言在单测层已有覆盖：task_gen.rs `generates_valid_python_with_values`
-#     （生成的 executor task.py 无任何 scorer 残留）+ governance.rs
+#     （生成的 executor driver.py 无任何 scorer 残留）+ governance.rs
 #     `exec_review_step_offline_falls_back_without_container`（ALFRED_OFFLINE=1
 #     → 执行审查回退 → Escalated + escalation_source=Execution）。
 #   Tier 1（离线回归；Tier1a 纯离线，Tier1b 需 docker 但无需真 LLM）：
@@ -17,7 +17,7 @@
 #     b) 治理环 ALFRED_OFFLINE=1 → 计划审查（mock provider 返回 pass）→
 #        真实执行（mockllm，docker 沙箱）→ 执行审查离线回退 →
 #        Escalated + escalation_source=Execution（§六继承项，不悄悄放行），
-#        且 exec-1/task.py 无 scorer、exec-1/state.json 无 verdict 字段、
+#        且 exec-1/driver.py 无 scorer、exec-1/state.json 无 verdict 字段、
 #        不建 exec-review 目录。
 #   Tier 2（需 docker 沙箱镜像，无需 LLM）：容器可见性实测（对齐 §二.6）——
 #     reviewer 执行审查容器挂载矩阵：ws 全量 ro（写被拒）/ /inputs 文件 ro
@@ -72,7 +72,7 @@ echo "R6d Tier 1a：executor 任务 py 只出产物无审查（静态，纯离�
 echo "============================================="
 
 # --- 1a-1：模板单源静态检查（生成器源码不得含任何 scorer/验收标准残留） ---
-TMPL="crates/alfred-executor/templates/pi_task.py.tmpl"
+TMPL="crates/alfred-executor/templates/executor_driver.py.tmpl"
 for residue in "exec_verdict_scorer" "_collect_artifact_summary" "[BEGIN DATA]" "scorer=" "ACCEPTANCE_CRITERIA"; do
   if grep -Fq "$residue" "$TMPL"; then
     echo "FAIL(tier1a): 模板含 scorer 残留: $residue" >&2
@@ -217,12 +217,12 @@ assert "exec_review_error_escalated" in audit, "audit 缺 exec_review_error_esca
 # 3) 执行审查离线回退不跑容器：不得建 exec-review 目录
 assert not os.path.exists(os.path.join(run, "exec-review")), "离线回退不应创建 exec-review 目录"
 # 4) R6d 核心验收：真实生成的 executor 任务 py 只出产物，无任何审查/scorer 残留
-task_py = os.path.join(run, "exec-1", "task.py")
-assert os.path.exists(task_py), "exec-1/task.py 缺失"
-text = open(task_py, encoding="utf-8").read()
+driver_py = os.path.join(run, "exec-1", "driver.py")
+assert os.path.exists(driver_py), "exec-1/driver.py 缺失"
+text = open(driver_py, encoding="utf-8").read()
 for residue in ["exec_verdict_scorer", "_collect_artifact_summary", "[BEGIN DATA]",
                 "scorer=", "ACCEPTANCE_CRITERIA", "get_model(role="]:
-    assert residue not in text, f"executor task.py 含 scorer 残留: {residue}"
+    assert residue not in text, f"executor driver.py 含 scorer 残留: {residue}"
 # 5) 执行 eval 只出产物：exec-1/state.json 无 verdict/unscored_reason 字段
 exec_state = json.load(open(os.path.join(run, "exec-1", "state.json")))
 for field in ("verdict", "unscored_reason", "verdict_unscored_reason"):
@@ -230,7 +230,7 @@ for field in ("verdict", "unscored_reason", "verdict_unscored_reason"):
 assert exec_state["run"]["eval_status"] == "success", f"eval_status={exec_state['run']['eval_status']}"
 PY
   echo "PASS(tier1b): 治理环 ALFRED_OFFLINE=1 执行审查回退升级属主（escalation_source=execution）"
-  echo "PASS(tier1b): 执行 eval 只出产物无审查（exec-1/task.py 无 scorer + state.json 无 verdict）"
+  echo "PASS(tier1b): 执行 eval 只出产物无审查（exec-1/driver.py 无 scorer + state.json 无 verdict）"
 
   unset ALFRED_CONFIG ALFRED_REVIEWER_MODEL ALFRED_EXECUTOR_MODEL ALFRED_PLANNER_MODEL ALFRED_OFFLINE ALFRED_OFFLINE_PLAN_FILE
   trap - EXIT
