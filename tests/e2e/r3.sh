@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-# R3 e2e：治理环全链回归（真规划 / 离线注入 / 属主决策 feed 续跑）
+# R3 e2e：治理环全链回归（离线计划注入 / 属主决策 feed 续跑）
 #
-#   1. 正路径全环：driver run（真规划 → 计划审查 → 执行 → 验收 C → Completed）
+#   1. 正路径全环：driver run（离线忠实计划 → 计划审查 → 执行 → 验收 C → Completed；
+#      真规划正路径全环由 r6c.sh Tier3b / r6d.sh Tier3 覆盖）
 #   2. 失败升级闭环：driver run（离线忠实计划 + 执行 --time-limit 1 → 机械重跑2次 →
 #      预算耗尽 → Escalated）；case2b 已归档（旧 decide retry --time-limit 覆盖续跑，
 #      driver feed / feed_owner_message 用 run.options 持久配置，无覆盖参数）
@@ -120,7 +121,8 @@ PY
 }
 
 # ============================================================================
-# Case 1：正路径全环（真规划 → 审查过 → 执行 → 验收 C → Completed）
+# Case 1：正路径全环（离线忠实计划 → 计划审查 → 执行 → 验收 C → Completed；
+#   真规划正路径全环见 r6c.sh Tier3b / r6d.sh Tier3）
 # ============================================================================
 CASE1_DIR="$R3_RUNS/run-r3-case1"
 rm -rf "$CASE1_DIR"
@@ -134,7 +136,35 @@ cat > "$CASE1_DIR/request.json" <<'JSON'
   "created_at": "2026-08-26T00:00:00Z"
 }
 JSON
-echo "[r3] case1: driver run（真规划 → 计划审查 → 执行 → 验收） ..."
+# 离线注入忠实计划（ALFRED_PLANNER_OFFLINE=1：规划器离线确定性直通，省真规划不稳定
+#   ——glm-4.7 对 "hello.txt 在 ws 根" 偶发 workspace_subdirs/根目录错位致
+#   plan_rejected / planning escalated，R6f §四 规划质量边界；计划审查/执行/执行
+#   审查仍在线真模型）。contract 用请求中性原文（无"根目录/绝对路径"措辞）。
+cat > "$CASE1_DIR/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r3-c1",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
+echo "[r3] case1: driver run（离线忠实计划 → 计划审查 → 执行 → 验收） ..."
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
@@ -163,7 +193,7 @@ if ! ls "$CASE1_DIR"/llm-calls/0000.json >/dev/null 2>&1; then
   echo "FAIL(case1): llm-calls/0000.json missing" >&2
   exit 1
 fi
-echo "PASS(case1): 正路径全环 Completed + 执行审查 C"
+echo "PASS(case1): 离线忠实计划 → 计划审查 → 执行 → 验收 C → Completed"
 
 # ============================================================================
 # Case 2：失败升级闭环（机械失败 → 重跑2次 → Escalated → case2b 归档）
@@ -485,7 +515,7 @@ echo "PASS(case4): 打回→属主补充→converse 引用会话文档关键结�
 echo ""
 echo "============================================="
 echo "R3 e2e 全部通过：用例真跑 PASS（case2b 归档 SKIP）"
-echo "  case1 正路径全环      : $CASE1_DIR/state.json"
+echo "  case1 正路径全环（离线忠实计划注入；真规划全环见 r6c.sh Tier3b / r6d.sh Tier3）: $CASE1_DIR/state.json"
 echo "  case2 机械升级闭环    : $CASE2_DIR/state.json（case2b 归档：decide retry --time-limit 覆盖已删）"
 echo "  case3 打回伪装闭环    : $CASE3_DIR/state.json"
 echo "  case4 多轮会话文档    : $CASE4_DIR/state.json"

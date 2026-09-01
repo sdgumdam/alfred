@@ -6,7 +6,10 @@
 #   1. 定位 inspect CLI（ALFRED_INSPECT，或 .plans/r0-lab/venv，或 PATH）
 #   2. 确保沙箱镜像 alfred-executor:latest（无则 tag r0-lab-pi / docker build）
 #   3. cargo build
-#   4. 写 OwnerRequest（创建 hello.txt，内容 Hello）
+#   4. 写 OwnerRequest（创建 hello.txt，内容 Hello）+ 离线忠实计划注入
+#      （ALFRED_PLANNER_OFFLINE=1：规划器离线确定性直通，避免真规划对
+#      "hello.txt 在 ws 根" 偶发 workspace_subdirs/根目录错位致 plan_rejected /
+#      planning escalated——R6f §四 规划质量边界；计划审查/执行/执行审查仍在线）
 #   5. cargo run --bin alfred -- run ...   （R3 起为完整治理环：规划→计划审查→
 #      执行→执行审查；执行产物/证据在最新 exec-N/ 下）
 #
@@ -107,9 +110,37 @@ cat > "$REQUEST" <<'JSON'
 }
 JSON
 echo "[r1] request      : $REQUEST"
+# 离线注入忠实计划（ALFRED_PLANNER_OFFLINE=1：规划器离线确定性直通，省真规划不稳定
+#   ——glm-4.7 对 "hello.txt 在 ws 根" 偶发 workspace_subdirs/根目录错位致
+#   plan_rejected / planning escalated，R6f §四 规划质量边界；计划审查/执行/执行
+#   审查仍在线真模型）。contract 用请求中性原文（无"根目录/绝对路径"措辞）。
+cat > "$RUN_DIR/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r1-hello",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
 
 # --- 5. 真跑 ---
-echo "[r1] driver run ..."
+echo "[r1] driver run（离线忠实计划 → 计划审查 → 执行 → 执行审查） ..."
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$RUN_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$REQUEST" \
   --run-dir "$RUN_DIR" \
@@ -154,7 +185,7 @@ fi
 echo "[r1] driver evidence : driver.done.json x${#DONE_FILES[@]}, driver.stdout.log x${#STDOUT_FILES[@]}, driver.stderr.log x${#STDERR_FILES[@]}"
 
 echo ""
-echo "PASS: 容器内 pi 完成小需求，产物落宿主 run 目录"
+echo "PASS: 容器内 pi 完成小需求，产物落宿主 run 目录（离线忠实计划注入 → 计划审查 → 执行 → 执行审查）"
 echo "  exec_dir: $EXEC_DIR"
 echo "  ws_hello: $WS_HELLO"
 echo "  content : $CONTENT"

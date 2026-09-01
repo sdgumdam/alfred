@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
-#   1. 执行审查正路径：driver run（pi 真容器 + reviewer 容器判 C）
+#   1. 执行审查正路径：driver run（ALFRED_PLANNER_OFFLINE=1 离线忠实计划注入 →
+#      计划审查在线 → pi 真容器执行 + reviewer 容器判 C）
 #   1b. 计划审查离线升级：driver run（ALFRED_OFFLINE=1 主开关 → 计划审查不跑容器、
 #       无 verdict → plan_review_error_escalated → §3.3 升级挂起 escalated，
 #       escalation_source=plan_review）。执行审查离线回退的覆盖已移交 r6d Tier1b
@@ -103,7 +104,8 @@ PY
 }
 
 # ============================================================================
-# Case 1：执行审查正路径（scorer 判 C）
+# Case 1：正路径全环（离线忠实计划 → 计划审查 → 执行 → 执行审查 C → Completed；
+#   真规划正路径全环见 r6c.sh Tier3b / r6d.sh Tier3）
 # ============================================================================
 CASE1_DIR="$R2_RUNS/run-r2-exec"
 rm -rf "$CASE1_DIR"
@@ -117,7 +119,35 @@ cat > "$CASE1_DIR/request.json" <<'JSON'
   "created_at": "2026-08-26T00:00:00Z"
 }
 JSON
-echo "[r2] case1: driver run (exec review, scorer 判 C) ..."
+# 离线注入忠实计划（ALFRED_PLANNER_OFFLINE=1：规划器离线确定性直通，省真规划不稳定
+#   ——glm-4.7 对 "hello.txt 在 ws 根" 偶发 workspace_subdirs/根目录错位致
+#   plan_rejected / planning escalated，R6f §四 规划质量边界；计划审查/执行/执行
+#   审查仍在线真模型）。contract 用请求中性原文（无"根目录/绝对路径"措辞）。
+cat > "$CASE1_DIR/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r2-exec",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
+echo "[r2] case1: driver run（离线忠实计划 → 计划审查 → 执行 → 执行审查判 C） ..."
+ALFRED_PLANNER_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
@@ -142,7 +172,7 @@ v = vs[-1]
 assert v["value"] == "C", f"expected C, got {v['value']} ({v})"
 assert v.get("failure_class") is None, f"C must have failure_class None, got {v.get('failure_class')}"
 PY
-echo "PASS(case1): exec review 正路径 scorer 判 C"
+echo "PASS(case1): 离线忠实计划 → 计划审查 → 执行 → 执行审查 C → Completed"
 
 # ============================================================================
 # Case 1b：计划审查离线升级（诚实重述，非执行审查回退）
@@ -230,7 +260,7 @@ echo "[r2] case3: 归档 SKIP（独立 plan-review CLI 已删；等价覆盖见 
 echo ""
 echo "============================================="
 echo "R2 e2e 全部通过：两用例真跑 PASS + 两用例归档 SKIP"
-echo "  case1  执行审查 C  : $CASE1_DIR/state.json"
+echo "  case1  正路径全环（离线忠实计划注入）: $CASE1_DIR/state.json"
   echo "  case1b 计划审查离线升级 : $CASE1B_DIR/state.json"
 echo "  case2  归档（独立 plan-review CLI 已删，等价覆盖见 r3 case3）"
 echo "  case3  归档（独立 plan-review CLI 已删，等价覆盖见 r6b caseA / r6c tier1c）"
