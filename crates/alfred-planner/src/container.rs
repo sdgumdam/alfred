@@ -428,10 +428,13 @@ fn render_planner_compose(
         .replace("{session_path}", &inputs_abs.join("session.json").display().to_string())
         .replace("{contract_path}", &contract_abs.display().to_string())
         .replace("{outputs_dir}", &outputs_abs.display().to_string())
-                // P1 修复：属主本轮消息挂载（converse 对话面输入 /inputs/owner_message.txt；
+        // P1 修复：属主本轮消息挂载（converse 对话面输入 /inputs/owner_message.txt；
         // 缺此挂载容器读不到属主消息，多轮对话容器模式失效）。
         .replace("{owner_message_path}", &inputs_abs.join("owner_message.txt").display().to_string())
-.replace(
+        // P2 修复：maintain 触发事件挂载（/inputs/trigger.json；缺此挂载容器读不到
+        // MaintainTrigger，真实模式 PlanReviewed/OwnerMessage 两触发时机失效）。
+        .replace("{trigger_path}", &inputs_abs.join("trigger.json").display().to_string())
+        .replace(
             "image: \"alfred-executor:latest\"",
             &format!("image: \"{}\"", opts.image),
         );
@@ -526,6 +529,7 @@ mod tests {
         std::fs::create_dir_all(&outputs).unwrap();
         std::fs::write(inputs.join("request.json"), "{}").unwrap();
         std::fs::write(inputs.join("session.json"), "{}").unwrap();
+        std::fs::write(inputs.join("trigger.json"), "{}").unwrap();
         let ws = o.run_dir.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let contract = o.run_dir.join("contract.json");
@@ -561,6 +565,15 @@ mod tests {
                 inputs.canonicalize().unwrap().join("owner_message.txt").display()
             )),
             "owner_message.txt ro mount missing:\n{yaml}"
+        );
+        // P2：maintain 触发事件 ro 挂载（真实模式 maintain 读 /inputs/trigger.json；
+        // 缺此容器读不到 MaintainTrigger，PlanReviewed/OwnerMessage 两触发时机失效）
+        assert!(
+            yaml.contains(&format!(
+                "{}:/inputs/trigger.json:ro",
+                inputs.canonicalize().unwrap().join("trigger.json").display()
+            )),
+            "trigger.json ro mount missing:\n{yaml}"
         );
         // outputs rw
         assert!(

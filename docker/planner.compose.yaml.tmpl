@@ -16,6 +16,7 @@
 #   {request_path}  → {run_dir}/request.json
 #   {session_path}  → {run_dir}/session.json（投影后会话文档）
 #   {owner_message_path} → {run_dir}/planner/inputs/owner_message.txt（属主本轮消息）
+#   {trigger_path}  → {run_dir}/planner/inputs/trigger.json（maintain 触发事件）
 #   {contract_path} → {run_dir}/contract.json（planner 自己写的契约，只读回看）
 #   {agt_dir}       → AGT 策略 + 扩展目录（挂到 /tmp/.agt，ro）
 #   {outputs_dir}   → 容器产出挂载（建图指令/答复/DagSpec 写 /outputs，rw）
@@ -33,6 +34,7 @@ services:
     - {request_path}:/inputs/request.json:ro
     - {session_path}:/inputs/session.json:ro
     - {owner_message_path}:/inputs/owner_message.txt:ro
+    - {trigger_path}:/inputs/trigger.json:ro
     - {contract_path}:/inputs/contract.json:ro
     - {agt_dir}:/tmp/.agt:ro
     - {outputs_dir}:/outputs
