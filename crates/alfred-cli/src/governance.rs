@@ -125,17 +125,20 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
 /// "库调用方喂属主消息"的形式：设置本轮属主消息、维护者②固化关键结论、落对话
 /// 记录、按挂起态路由续跑治理环，返回新状态给调用方（codux 终端显示）。
 ///
-/// 语义（复用 decide CLI 的 P1-2 续入机制，非新机制）：
-/// 1. `run.owner_message = message`（下一轮 `planning_step` converse 读它）；
-/// 2. maintain②（`OwnerMessage` → `key_conclusions`，把属主消息固化为关键结论）；
-/// 3. 落 conversation.json（`ConversationSource::OwnerMessage`，属主轮次）；
-/// 4. 挂起态路由 + 续跑 `run_governance_loop`：
+/// 1. **Abandon 前置路由（P2b）**：`decision=Abandon` 不要求消息、不跑 maintain②、
+///    不落 owner.message 轮——直接 `apply(OwnerAbandon)` 进终态。属主放弃恒可选：
+///    即使 run 已坏（planner 容器故障/不可用）也拦不住属主放弃。
+/// 2. 有消息 → `run.owner_message = message`（下一轮 `planning_step` converse 读它）、
+///    maintain②（`OwnerMessage` → `key_conclusions`，把属主消息固化为关键结论）、
+///    落 conversation.json（`ConversationSource::OwnerMessage`，属主轮次）。
+///    Retry 消息可选（重跑不必然带新指令）；Revise 需非空消息（喂 planner 新指令）。
+/// 3. 挂起态路由 + 续跑 `run_governance_loop`：
 ///    - Planning（converse 答复分支停驻）→ 无状态转移，直接续跑（对话继续）；
 ///    - PlanRejected/Escalated → 按 `OwnerDecision` 路由：Revise → `OwnerRevise`
 ///      （回 Planning 重新规划，喂 owner_message 续 converse）；Retry →
 ///      `OwnerRetry`（按升级来源路由：重入执行/重审同一计划/重新规划）；
 ///      Abandon → `OwnerAbandon`（终态，不续跑）。
-/// 5. 返回新状态给调用方（planner 答复在 conversation.json 的 converse.reply 轮）。
+/// 4. 返回新状态给调用方（planner 答复在 conversation.json 的 converse.reply 轮）。
 pub fn feed_owner_message(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
@@ -143,51 +146,83 @@ pub fn feed_owner_message(
     decision: OwnerDecision,
 ) -> Result<GovernanceState> {
     let state = run.state();
-    // P1-2 语义（decide CLI 的 allowed 检查）：挂起态可拍板；Planning 态（converse
-    // 答复后停驻）仅 revise 可续入对话。
+    // P2a 修复：挂起态可拍板；Planning 态（converse 答复后停驻）可 revise（续入对话）
+    // 或 abandon（放弃——属主放弃恒可选，Skeleton §3.2 三选一）。
     let allowed = state.is_suspended()
-        || (state == GovernanceState::Planning && decision == OwnerDecision::Revise);
+        || (state == GovernanceState::Planning
+            && matches!(
+                decision,
+                OwnerDecision::Revise | OwnerDecision::Abandon
+            ));
     if !allowed {
         bail!(
-            "feed_owner_message: 决策 {:?} 不适用于当前状态 {:?}（仅挂起态可拍板；Planning 态仅 revise 可续入对话）",
+            "feed_owner_message: 决策 {:?} 不适用于当前状态 {:?}（仅挂起态可拍板；Planning 态仅 revise/abandon 可操作）",
             decision,
             state
         );
     }
-    let message = message.trim();
-    if message.is_empty() {
-        bail!("feed_owner_message: 属主消息为空");
+
+    // P2b：Abandon 前置路由——不要求消息、不跑 maintain②、不落 owner.message 轮。
+    // decision=Abandon 直接 apply(OwnerAbandon) 进终态，不触碰 planner（run 已坏也
+    // 能弃）。Planning 态无 (Planning, OwnerAbandon) 转移会在这里显式报错。
+    if decision == OwnerDecision::Abandon {
+        audit(
+            &ctx.run_dir,
+            "feed_owner_message",
+            &serde_json::json!({
+                "decision": format!("{decision:?}"),
+                "from_state": state_label(state),
+            }),
+        )?;
+        run.apply(GovernanceEvent::OwnerAbandon)?;
+        persist_governance_run(&ctx.run_dir, run)?;
+        audit(
+            &ctx.run_dir,
+            "governance_paused",
+            &serde_json::json!({ "state": state_label(run.state()) }),
+        )?;
+        return Ok(run.state());
     }
 
-    // 1. maintain②：属主消息固化为关键结论（先 maintain——喂旧 doc，得新 doc）。
-    run.session_doc = maintain(
-        &MaintainOptions {
-            run_dir: ctx.run_dir.clone(),
-            model: ctx.planner_model.clone(),
-            container: alfred_planner::container::PlannerContainerOptions::from_governance(
-                ctx.run_dir.clone(),
-                &run.options,
-            ),
-        },
-        &run.session_doc,
-        MaintainTrigger::OwnerMessage {
-            message: message.to_string(),
-        },
-    )?;
+    // Retry 消息可选（重跑不必然带新指令）；Revise 需非空消息（喂 planner 新指令）。
+    let message = message.trim();
+    if message.is_empty() && decision == OwnerDecision::Revise {
+        bail!("feed_owner_message: revise 决策需要非空属主消息");
+    }
 
-    // 2. 设置 owner_message（planning_step 下一轮 converse 读它；重规划/改需求语义）。
-    run.owner_message = Some(message.to_string());
+    // 有消息 → maintain② + 设 owner_message + 落对话轮；无消息（Retry）→ 跳过消息轮。
+    if !message.is_empty() {
+        // 1. maintain②：属主消息固化为关键结论（先 maintain——喂旧 doc，得新 doc）。
+        run.session_doc = maintain(
+            &MaintainOptions {
+                run_dir: ctx.run_dir.clone(),
+                model: ctx.planner_model.clone(),
+                container: alfred_planner::container::PlannerContainerOptions::from_governance(
+                    ctx.run_dir.clone(),
+                    &run.options,
+                ),
+            },
+            &run.session_doc,
+            MaintainTrigger::OwnerMessage {
+                message: message.to_string(),
+            },
+        )?;
 
-    // 3. 落 conversation.json（属主轮次，reviewer 挂载输入数据源，§二.8）。
-    append_to_disk(
-        &ctx.run_dir,
-        &run.run_id,
-        ConversationRole::Owner,
-        message.to_string(),
-        ConversationSource::OwnerMessage,
-    )
-    .map_err(anyhow::Error::msg)
-    .context("append owner.message to conversation.json")?;
+        // 2. 设置 owner_message（planning_step 下一轮 converse 读它；重规划/改需求语义）。
+        run.owner_message = Some(message.to_string());
+
+        // 3. 落 conversation.json（属主轮次，reviewer 挂载输入数据源，§二.8）。
+        append_to_disk(
+            &ctx.run_dir,
+            &run.run_id,
+            ConversationRole::Owner,
+            message.to_string(),
+            ConversationSource::OwnerMessage,
+        )
+        .map_err(anyhow::Error::msg)
+        .context("append owner.message to conversation.json")?;
+    }
+
     audit(
         &ctx.run_dir,
         "feed_owner_message",
@@ -208,15 +243,9 @@ pub fn feed_owner_message(
                 run.attempts_used = 0;
                 run.apply(GovernanceEvent::OwnerRetry)?;
             }
+            // P2b：Abandon 已在前面前置处理返回，到不了这里（防御：显式报错不静默）。
             OwnerDecision::Abandon => {
-                run.apply(GovernanceEvent::OwnerAbandon)?;
-                persist_governance_run(&ctx.run_dir, run)?;
-                audit(
-                    &ctx.run_dir,
-                    "governance_paused",
-                    &serde_json::json!({ "state": state_label(run.state()) }),
-                )?;
-                return Ok(run.state());
+                bail!("feed_owner_message: Abandon 应已前置处理（内部状态不一致）")
             }
         }
     }

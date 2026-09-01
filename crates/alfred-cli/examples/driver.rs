@@ -196,12 +196,18 @@ fn cmd_feed(args: &[String]) -> Result<()> {
         other => bail!("driver feed: 未知决策 {other:?}（revise|retry|abandon）"),
     };
     // --message 优先按文件路径读取（旧 decide 语义）；路径不存在按内联文本。
+    // P2b：Retry/Abandon 消息可选（Abandon 不需要消息；Retry 可不带新指令重跑）；Revise 必填。
     let message = match &message {
         Some(m) if Path::new(m).is_file() => {
             std::fs::read_to_string(m).with_context(|| format!("read message {}", m))?
         }
         Some(m) => m.clone(),
-        None => bail!("driver feed: 需要 --message <文本|文件路径>"),
+        None => match decision {
+            OwnerDecision::Revise => {
+                bail!("driver feed: revise 决策需要 --message <文本|文件路径>")
+            }
+            OwnerDecision::Retry | OwnerDecision::Abandon => String::new(),
+        },
     };
 
     let mut run = load_governance_run(&run_dir)?;

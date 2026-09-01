@@ -189,6 +189,9 @@ fn transition(
     let next = match (from, event) {
         (Planning, PlanProduced) => PlanReviewing,
         (Planning, PlanningError) => Escalated,
+        // P2a 修复：Planning 态属主放弃恒可选——converse Reply 分支停驻 Planning
+        // 等属主下一轮消息时，属主可 Abandon 终止 run（Skeleton §3.2 三选一）。
+        (Planning, OwnerAbandon) => Abandoned,
         (PlanReviewing, PlanReviewPassed) => Executing,
         (PlanReviewing, PlanReviewRejected) => PlanRejected,
         (PlanReviewing, PlanReviewError) => Escalated,
