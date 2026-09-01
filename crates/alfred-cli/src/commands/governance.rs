@@ -18,7 +18,7 @@ use alfred_core::governance::{GovernanceEvent, GovernanceRun};
 use alfred_core::util::now_rfc3339;
 use alfred_executor::config::ExecutorModel;
 use alfred_executor::run::{execute_run, RunOptions};
-use alfred_planner::converse::{converse, ConverseOptions};
+use alfred_planner::converse::{converse, ConverseOptions, ConverseOutcome};
 use alfred_planner::maintain::{maintain, MaintainOptions, MaintainTrigger};
 use alfred_reviewer::exec_review::{execute_exec_review, ExecReviewOptions};
 use alfred_reviewer::plan_review::{execute_plan_review, PlanReviewOptions};
@@ -49,20 +49,32 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
             alfred_core::governance::GovernanceState::Planning => {
                 // P3 修复：规划侧失败（converse 出错）→ 升级属主（不悄悄放行），
                 // 落盘后可恢复（decide retry/revise/abandon 续跑）。
-                if let Err(e) = planning_step(run, ctx) {
-                    audit(
-                        &ctx.run_dir,
-                        "planning_error_escalated",
-                        &serde_json::json!({ "error": format!("{e:#}") }),
-                    )?;
-                    run.apply(GovernanceEvent::PlanningError)?;
-                    persist_governance_run(&ctx.run_dir, run)?;
-                    println!(
-                        "[alfred] 规划失败已升级属主（state=Escalated，挂起）。\n\
-                         \x20 运行 `alfred decide --run-dir {} --decision retry|revise|abandon` 续跑。",
-                        ctx.run_dir.display()
-                    );
-                    return Ok(());
+                // §2.4 两分支：planning_step 返回 Ok(false) = 规划器答复了属主
+                // （对话继续，不产计划）——停止编排环，等属主下一轮消息。
+                match planning_step(run, ctx) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        println!(
+                            "[alfred] 规划器已答复属主（state=Planning，对话继续）。\n\
+                             \x20 对话记录见 conversation.json；继续对话经属主入口喂入下一轮消息。",
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        audit(
+                            &ctx.run_dir,
+                            "planning_error_escalated",
+                            &serde_json::json!({ "error": format!("{e:#}") }),
+                        )?;
+                        run.apply(GovernanceEvent::PlanningError)?;
+                        persist_governance_run(&ctx.run_dir, run)?;
+                        println!(
+                            "[alfred] 规划失败已升级属主（state=Escalated，挂起）。\n\
+                             \x20 运行 `alfred decide --run-dir {} --decision retry|revise|abandon` 续跑。",
+                            ctx.run_dir.display()
+                        );
+                        return Ok(());
+                    }
                 }
             }
             alfred_core::governance::GovernanceState::PlanReviewing => {
@@ -105,57 +117,85 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
     }
 }
 
-/// Planning：converse（会话文档 + 属主消息 → DagSpec）+ E5 reviewer_models 注入。
-fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
-    let owner_message = match &run.owner_message {
-        Some(m) => m.clone(),
-        None => alfred_planner::format_request_message(&run.request),
-    };
-    let opts = ConverseOptions {
-        run_dir: ctx.run_dir.clone(),
-        model: ctx.planner_model.clone(),
-        container: alfred_planner::container::PlannerContainerOptions::from_governance(
-            ctx.run_dir.clone(),
-            &run.options,
-        ),
-    };
-    let outcome = converse(&opts, &run.request, &run.session_doc, &owner_message)?;
-    // R6a：对话记录——converse 落定后 append（reviewer 挂载输入数据源，§二.8）。
-    // M4-a：conversation.json 只承载语义轮次——落 planner 的语义回复（计划摘要），
-    // 不落原始建图指令 JSON（中间指令属实现细节，已在 llm-calls/ 审计）。
-    append_to_disk(
-        &ctx.run_dir,
-        &run.run_id,
-        ConversationRole::Planner,
-        format_plan_reply(&outcome.dagspec),
-        ConversationSource::ConverseReply,
-    )
-    .map_err(anyhow::Error::msg)
-    .context("append converse.reply to conversation.json")?;
-    let mut dagspec = outcome.dagspec;
-    // E5：reviewer_models 由系统从 config roles.reviewer 注入（规划器不感知审查者）。
-    for node in &mut dagspec.nodes {
-        node.contract.reviewer_models = vec![ctx.reviewer_model.model.clone()];
-    }
-    write_dagspec(&ctx.run_dir, &dagspec)?;
-    let node_summaries: Vec<String> = dagspec
-        .nodes
-        .iter()
-        .map(|n| format!("{}:{}", n.id, n.summary))
-        .collect();
-    audit(
-        &ctx.run_dir,
-        "planning_done",
-        &serde_json::json!({
-            "request_id": dagspec.request_id,
-            "node_count": dagspec.nodes.len(),
-            "nodes": node_summaries,
-            "record": outcome.record_path,
-        }),
-    )?;
-    run.dagspec = Some(dagspec);
-    run.apply(GovernanceEvent::PlanProduced)?;
-    Ok(())
+/// Planning：converse（会话文档 + 属主消息 → §2.4 两分支）+ E5 reviewer_models 注入。
+///
+/// 返回 `Ok(true)` = 产出计划（已 apply PlanProduced → PlanReviewing，编排环继续）；
+/// `Ok(false)` = 规划器答复了属主（纯文本答复，不产计划——对话继续，状态仍
+/// Planning，编排环返回调用方等属主下一轮消息）。
+fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<bool> {
+	let owner_message = match &run.owner_message {
+		Some(m) => m.clone(),
+		None => alfred_planner::format_request_message(&run.request),
+	};
+	let opts = ConverseOptions {
+		run_dir: ctx.run_dir.clone(),
+		model: ctx.planner_model.clone(),
+		container: alfred_planner::container::PlannerContainerOptions::from_governance(
+			ctx.run_dir.clone(),
+			&run.options,
+		),
+	};
+	let outcome = converse(&opts, &run.request, &run.session_doc, &owner_message)?;
+	match outcome {
+		// ---- §2.4 建图指令分支：DagSpec 交编排器接管（计划审查 → 执行） ----
+		ConverseOutcome::Instructions { dagspec, record_path } => {
+			// R6a：对话记录——converse 落定后 append（reviewer 挂载输入数据源，§二.8）。
+			// M4-a：conversation.json 只承载语义轮次——落 planner 的语义回复（计划摘要），
+			// 不落原始建图指令 JSON（中间指令属实现细节，已在 llm-calls/ 审计）。
+			append_to_disk(
+				&ctx.run_dir,
+				&run.run_id,
+				ConversationRole::Planner,
+				format_plan_reply(&dagspec),
+				ConversationSource::ConverseReply,
+			)
+			.map_err(anyhow::Error::msg)
+			.context("append converse.reply to conversation.json")?;
+			let mut dagspec = dagspec;
+			// E5：reviewer_models 由系统从 config roles.reviewer 注入（规划器不感知审查者）。
+			for node in &mut dagspec.nodes {
+				node.contract.reviewer_models = vec![ctx.reviewer_model.model.clone()];
+			}
+			write_dagspec(&ctx.run_dir, &dagspec)?;
+			let node_summaries: Vec<String> = dagspec
+				.nodes
+				.iter()
+				.map(|n| format!("{}:{}", n.id, n.summary))
+				.collect();
+			audit(
+				&ctx.run_dir,
+				"planning_done",
+				&serde_json::json!({
+					"request_id": dagspec.request_id,
+					"node_count": dagspec.nodes.len(),
+					"nodes": node_summaries,
+					"record": record_path,
+				}),
+			)?;
+			run.dagspec = Some(dagspec);
+			run.apply(GovernanceEvent::PlanProduced)?;
+			Ok(true)
+		}
+		// ---- §2.4 答复分支：纯文本答复给属主，不强制产 DagSpec（对话继续） ----
+		ConverseOutcome::Reply { reply, record_path } => {
+			// M4-a：conversation.json 落规划器原话答复（语义轮次），不产计划。
+			append_to_disk(
+				&ctx.run_dir,
+				&run.run_id,
+				ConversationRole::Planner,
+				reply,
+				ConversationSource::ConverseReply,
+			)
+			.map_err(anyhow::Error::msg)
+			.context("append converse.reply (reply branch) to conversation.json")?;
+			audit(
+				&ctx.run_dir,
+				"converse_reply",
+				&serde_json::json!({ "record": record_path }),
+			)?;
+			Ok(false)
+		}
+	}
 }
 
 /// PlanReviewing：独立 eval 判忠实度 → pass/打回/出错升级。
