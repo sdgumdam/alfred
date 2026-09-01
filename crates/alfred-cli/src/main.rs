@@ -13,7 +13,7 @@
 //!     推进到挂起/终态。
 //! - `feed`   --run-dir <dir> --decision revise|retry|abandon
 //!             [--message <文本|文件路径>]
-//!     喂属主消息 → `feed_owner_message`（续跑治理环，返回新状态给调用方显示）。
+//!     喂属主消息 → `feed_owner_message`（续跑治理环，返回新状态 + 规划器答复给调用方显示）。
 //! - `status` --run-dir <dir>
 //!     打印当前状态（state/attempts/owner_message）。
 //!
@@ -196,13 +196,21 @@ fn cmd_run(args: &[String]) -> Result<()> {
         "governance_started",
         &serde_json::json!({ "request_id": run.request.id }),
     )?;
-    run_governance_loop(&mut run, &ctx)?;
+    let pending_reply = run_governance_loop(&mut run, &ctx)?;
     persist_governance_run(&run_dir, &run)?;
     audit(
         &run_dir,
         "governance_paused",
         &serde_json::json!({ "state": state_label(run.state()) }),
     )?;
+    if let Some(reply) = &pending_reply {
+        // P2-2：规划器答复 surface 给 owner 终端（Reply 分支不产计划，对话继续）。
+        println!("[pi] {reply}");
+        println!(
+            "[alfred] 规划器已答复属主（state=Planning，对话继续）。run_dir: {}；等待属主界面喂入下一轮消息。",
+            run_dir.display()
+        );
+    }
     println!(
         "[driver] 当前状态 : {}（attempts={}/{}）",
         state_label(run.state()),
@@ -274,10 +282,18 @@ fn cmd_feed(args: &[String]) -> Result<()> {
         append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
     };
 
-    let state = feed_owner_message(&mut run, &ctx, &message, decision)?;
+    let outcome = feed_owner_message(&mut run, &ctx, &message, decision)?;
+    if let Some(reply) = &outcome.reply {
+        // P2-2：规划器答复 surface 给 owner 终端（Planning 态续入对话后 planner 再答复）。
+        println!("[pi] {reply}");
+        println!(
+            "[alfred] 规划器已答复属主（state=Planning，对话继续）。run_dir: {}；等待属主界面喂入下一轮消息。",
+            run_dir.display()
+        );
+    }
     println!(
         "[driver] 当前状态 : {}（attempts={}/{}）",
-        state_label(state),
+        state_label(outcome.state),
         run.attempts_used,
         run.mechanical_budget
     );
