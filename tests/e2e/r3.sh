@@ -21,6 +21,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+# --- 容器驱动 Python（P1）：ALFRED_PYTHON 优先，否则本仓 venv（Rust python_binary() 兜底 PATH） ---
+if [[ -z "${ALFRED_PYTHON:-}" && -x "$REPO_ROOT/.plans/r0-lab/venv/bin/python" ]]; then
+  export ALFRED_PYTHON="$REPO_ROOT/.plans/r0-lab/venv/bin/python"
+fi
 
 # --- inspect CLI ---
 if [[ -n "${ALFRED_INSPECT:-}" ]]; then

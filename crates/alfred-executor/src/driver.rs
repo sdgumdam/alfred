@@ -31,9 +31,25 @@ use serde_json::Value;
 
 use crate::config::ExecutorModel;
 
-/// 宿主侧 Python 解析：`ALFRED_PYTHON` 环境变量优先，否则 PATH 上的 `python3`。
+/// 宿主侧 Python 解析链（P1 恢复）：`ALFRED_PYTHON` 环境变量优先，其次本仓
+/// venv `.plans/r0-lab/venv/bin/python`（相对当前目录存在时），再 PATH 上的
+/// `python3`。
+///
+/// 返回绝对路径或裸命令名。venv 分支经 `current_dir()` 拼绝对路径——spawn 时
+/// 子进程 cwd 是 run_dir（`~/.local/state/alfred/runs/...`），相对 `.plans/...`
+/// 会在 run_dir 下解析而 miss。裸 `python3` 由 spawn 时父进程 PATH 解析，不受
+/// 子进程 cwd 影响。
 pub fn python_binary() -> String {
-    std::env::var("ALFRED_PYTHON").unwrap_or_else(|_| "python3".to_string())
+    if let Ok(p) = std::env::var("ALFRED_PYTHON") {
+        return p;
+    }
+    let venv_python = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".plans/r0-lab/venv/bin/python");
+    if venv_python.is_file() {
+        return venv_python.to_string_lossy().into_owned();
+    }
+    "python3".to_string()
 }
 
 /// 容器驱动进程的 launch 记录。
