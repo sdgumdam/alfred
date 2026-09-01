@@ -18,8 +18,11 @@ pub struct PlannerTaskGenParams {
     pub system_prompt: String,
     /// 容器侧 driver prompt（读 /inputs → 按 SYSTEM_PROMPT 规则 → 写 /outputs/<file>）。
     pub driver_prompt: String,
-    /// 容器内产出文件绝对路径（"/outputs/instructions.json" 或 "/outputs/session.json"）。
+    /// 容器内主产出文件绝对路径（"/outputs/instructions.json" 或 "/outputs/session.json"）。
     pub output_file: String,
+    /// 容器内次产出文件绝对路径（converse §2.4 两分支答复侧 "/outputs/reply.txt"）；
+    /// 空串 = 单文件（maintain）。
+    pub output_file_alt: String,
     /// AGT 扩展路径（"/tmp/.agt/agt-policy.ts"）；空串 = 不加载。
     pub agt_ext: String,
     /// AGT 策略文件容器内路径（"/tmp/.agt/policy.json"）；与 `agt_ext` 同空。
@@ -50,6 +53,7 @@ pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String>
         ("__SYSTEM_PROMPT_JSON__", json(&params.system_prompt)?),
         ("__DRIVER_PROMPT_JSON__", json(&params.driver_prompt)?),
         ("__OUTPUT_FILE_JSON__", json(&params.output_file)?),
+        ("__OUTPUT_FILE_ALT_JSON__", json(&params.output_file_alt)?),
         ("__AGT_EXT_JSON__", json(&params.agt_ext)?),
         ("__AGT_POLICY_PATH_JSON__", json(&params.agt_policy_path)?),
         ("__AGT_AUDIT_PATH_JSON__", json(&params.agt_audit_path)?),
@@ -77,6 +81,7 @@ pub fn generate_planner_task_py(params: &PlannerTaskGenParams) -> Result<String>
         "__SYSTEM_PROMPT_JSON__",
         "__DRIVER_PROMPT_JSON__",
         "__OUTPUT_FILE_JSON__",
+        "__OUTPUT_FILE_ALT_JSON__",
         "__AGT_EXT_JSON__",
         "__AGT_POLICY_PATH_JSON__",
         "__AGT_AUDIT_PATH_JSON__",
@@ -110,6 +115,7 @@ mod tests {
             system_prompt: "system 规则：建图指令序列。".into(),
             driver_prompt: "读 /inputs，写 /outputs/instructions.json".into(),
             output_file: "/outputs/instructions.json".into(),
+            output_file_alt: "/outputs/reply.txt".into(),
             agt_ext: "/tmp/.agt/agt-policy.ts".into(),
             agt_policy_path: "/tmp/.agt/policy.json".into(),
             agt_audit_path: "/tmp/.agt/audit/audit.jsonl".into(),
@@ -130,7 +136,8 @@ mod tests {
         assert!(py.contains(r#"RUN_ID = "run-planner-test""#));
         assert!(py.contains(r#"PORT_BASE = int(13200)"#));
         assert!(py.contains(r#"PI_MODEL = "inspect-bridge/inspect""#));
-        assert!(py.contains(r#"OUTPUT_FILE = "/outputs/instructions.json""#));
+        assert!(py.contains(r#"OUTPUT_FILE_ALT = "/outputs/reply.txt""#));
+        assert!(py.contains(r#"AGT_EXT = "/tmp/.agt/agt-policy.ts""#));
         assert!(py.contains(r#"AGT_EXT = "/tmp/.agt/agt-policy.ts""#));
         assert!(py.contains(r#"AGT_POLICY_PATH = "/tmp/.agt/policy.json""#));
         assert!(py.contains(r#"AGT_AUDIT_PATH = "/tmp/.agt/audit/audit.jsonl""#));
@@ -153,9 +160,11 @@ mod tests {
         p.agt_policy_path = "".into();
         p.agt_audit_path = "".into();
         p.output_file = "/outputs/session.json".into();
+        p.output_file_alt = "".into();
         let py = generate_planner_task_py(&p).unwrap();
         assert!(py.contains(r#"MODE = "maintain""#));
         assert!(py.contains(r#"OUTPUT_FILE = "/outputs/session.json""#));
+        assert!(py.contains(r#"OUTPUT_FILE_ALT = """#));
         assert!(py.contains(r#"AGT_EXT = """#));
         assert!(py.contains(r#"AGT_POLICY_PATH = """#));
         assert!(py.contains(r#"AGT_AUDIT_PATH = """#));

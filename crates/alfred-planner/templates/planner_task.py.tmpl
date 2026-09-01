@@ -7,7 +7,12 @@ model (the planner provider). The container has no external network and holds
 no real credentials: pi's `~/.pi/agent/models.json` points at the bridge proxy
 with a dummy `sk-none` key.
 
-MODE == "converse": pi reads /inputs/{request.json, session.json, owner_message.txt},
+  follows the converse schema prompt (two-branch: graph-building instruction
+  sequence or owner reply, copied verbatim from alfred-planner converse.rs) and
+  writes EITHER the build-instruction JSON array to /outputs/instructions.json
+  OR the owner reply text to /outputs/reply.txt (exactly one).
+MODE == "maintain": pi reads /inputs/session.json + /inputs/trigger.json and
+  writes the updated session doc JSON to /outputs/session.json.
   follows the converse schema prompt (graph-building instruction sequence, copied
   verbatim from alfred-planner converse.rs) and writes the build-instruction JSON
   array to /outputs/instructions.json.
@@ -45,6 +50,7 @@ MODE = __MODE_JSON__
 SYSTEM_PROMPT = __SYSTEM_PROMPT_JSON__
 DRIVER_PROMPT = __DRIVER_PROMPT_JSON__
 OUTPUT_FILE = __OUTPUT_FILE_JSON__
+OUTPUT_FILE_ALT = __OUTPUT_FILE_ALT_JSON__
 AGT_EXT = __AGT_EXT_JSON__
 AGT_POLICY_PATH = __AGT_POLICY_PATH_JSON__
 AGT_AUDIT_PATH = __AGT_AUDIT_PATH_JSON__
@@ -194,12 +200,34 @@ def planner_agent():
                 ),
                 stream=True,
             )
-            settled, exit_code = await _drive_pi(proc, SYSTEM_PROMPT + "\n\n" + DRIVER_PROMPT)
-            if not settled:
-                raise RuntimeError(f"planner pi RPC did not settle (exit_code={exit_code})")
-
-            # The produced output must exist on the /outputs mount; otherwise the
-            # planner produced nothing and the eval must fail (not silently pass).
+            # converse two-branch: exactly one of [instructions.json, reply.txt]
+            # must be written (both/neither is an error).
+            output_candidates = [OUTPUT_FILE]
+            if OUTPUT_FILE_ALT:
+                output_candidates.append(OUTPUT_FILE_ALT)
+            produced_path = None
+            produced_text = None
+            for p in output_candidates:
+                out = await sbox.exec(["cat", p])
+                if out.success and out.stdout.strip():
+                    if produced_path is not None:
+                        raise RuntimeError(
+                            f"planner pi wrote both {produced_path} and {p} (两分支只能二选一)"
+                        )
+                    produced_path, produced_text = p, out.stdout
+            if produced_path is None:
+                raise RuntimeError(
+                    f"planner pi did not write any of {', '.join(output_candidates)}"
+                )
+            state.output = ModelOutput(
+                model="planner-output-collector",
+                choices=[
+                    ChatCompletionChoice(
+                        message=ChatMessageAssistant(content=produced_text),
+                        stop_reason="stop",
+                    )
+                ],
+            )
             out = await sbox.exec(["cat", OUTPUT_FILE])
             if not out.success or not out.stdout.strip():
                 raise RuntimeError(f"planner pi did not write {OUTPUT_FILE}")

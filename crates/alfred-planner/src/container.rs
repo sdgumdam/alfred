@@ -41,6 +41,8 @@ pub const INPUTS_DIR: &str = "inputs";
 pub const OUTPUTS_DIR: &str = "outputs";
 /// converse 产出文件名（容器内写 `/outputs/instructions.json`）。
 pub const CONVERSE_OUTPUT_FILE: &str = "/outputs/instructions.json";
+/// converse 答复产出文件名（§2.4 两分支答复侧，容器内写 `/outputs/reply.txt`）。
+pub const CONVERSE_REPLY_FILE: &str = "/outputs/reply.txt";
 /// maintain 产出文件名（容器内写 `/outputs/session.json`）。
 pub const MAINTAIN_OUTPUT_FILE: &str = "/outputs/session.json";
 
@@ -104,15 +106,19 @@ pub fn resolve_agt_dir() -> Option<PathBuf> {
 /// planner 容器运行结果（宿主侧读取）。
 #[derive(Debug, Clone)]
 pub struct ContainerRunOutput {
-    /// 容器产出的原始文本（converse：建图指令 JSON 数组；maintain：会话文档 JSON）。
+    /// 容器产出的原始文本（converse：建图指令 JSON 数组 或 属主答复；maintain：会话文档 JSON）。
     pub output_text: String,
+    /// 实际产出的输出文件（容器内路径；converse：/outputs/instructions.json 或
+    /// /outputs/reply.txt；maintain：/outputs/session.json）。
+    pub produced_file: String,
     /// eval 状态（"success" / "error"）。
     pub eval_status: String,
     /// eval 日志 location（evals/ 下的 .eval 路径，审计证据）。
     pub eval_location: Option<String>,
 }
 
-/// converse 容器驱动：会话文档投影 + 属主消息 + request → 建图指令 JSON 文本。
+/// converse 容器驱动：会话文档投影 + 属主消息 + request → §2.4 两分支产出
+/// （建图指令 JSON 或 属主答复；produced_file 区分）。
 pub fn run_converse_in_container(
     opts: &PlannerContainerOptions,
     model: &ExecutorModel,
@@ -127,7 +133,7 @@ pub fn run_converse_in_container(
         "converse",
         crate::converse::CONVERSE_SYSTEM_PROMPT,
         CONVERSE_DRIVER_PROMPT,
-        CONVERSE_OUTPUT_FILE,
+        &[CONVERSE_OUTPUT_FILE, CONVERSE_REPLY_FILE],
         inputs,
     )
 }
@@ -146,21 +152,23 @@ pub fn run_maintain_in_container(
         "maintain",
         crate::maintain::MAINTAIN_SYSTEM_PROMPT,
         MAINTAIN_DRIVER_PROMPT,
-        MAINTAIN_OUTPUT_FILE,
+        &[MAINTAIN_OUTPUT_FILE],
         inputs,
     )
 }
 
 /// converse 容器侧 driver prompt：读 /inputs → 按 SYSTEM_PROMPT 规则 → 写 /outputs。
-pub const CONVERSE_DRIVER_PROMPT: &str = r#"你的任务：把建图指令序列产出为文件，而不是聊天回复。
+pub const CONVERSE_DRIVER_PROMPT: &str = r#"你的任务：按两分支规则决定产出——建图指令序列 或 给属主的答复，写为文件，而不是聊天回复。
 
 请按顺序读取输入文件：
 - /inputs/request.json —— 属主请求（JSON 对象，含 id/title/description/acceptance_criteria）
 - /inputs/session.json —— 会话文档（记忆，JSON 对象：key_file_paths / key_conclusions / owner_feedback）
 - /inputs/owner_message.txt —— 属主本轮消息（文本）
 
-按上面 SYSTEM_PROMPT 的规则，把建图指令序列（JSON 数组）写入 /outputs/instructions.json。
-只写这一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
+按上面 SYSTEM_PROMPT 的规则二选一（只产其中一种）：
+- 若产出建图指令序列：把 JSON 数组写入 /outputs/instructions.json。
+- 若产出给属主的答复：把答复文本写入 /outputs/reply.txt。
+只能写其中一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
 写完即结束。"#;
 
 /// maintain 容器侧 driver prompt：读 /inputs → 按 SYSTEM_PROMPT 规则 → 写 /outputs。
@@ -219,10 +227,10 @@ fn maintain_inputs(doc: &SessionDoc, trigger: &MaintainTrigger) -> Result<Vec<(S
     ])
 }
 
-/// planner 容器驱动公共流程。
 ///
-/// 失败路径全部显式 `bail!`（不悄悄放行）：eval 超时/crash/status error 与
-/// 容器未产出输出文件都算失败，调用方（converse/maintain）据此升级属主。
+/// `output_files`：容器内候选产出文件（converse 两分支 = [instructions, reply]；
+/// maintain = [session]）。task.py 强制恰好一个被写（多/零都报错）；宿主按候选集
+/// 探测产出（`ContainerRunOutput::produced_file` 区分分支）。
 #[allow(clippy::too_many_arguments)]
 fn run_planner_container(
     opts: &PlannerContainerOptions,
@@ -230,7 +238,7 @@ fn run_planner_container(
     mode: &str,
     system_prompt: &str,
     driver_prompt: &str,
-    output_file: &str,
+    output_files: &[&str],
     inputs: Vec<(String, String)>,
 ) -> Result<ContainerRunOutput> {
     let run_dir = &opts.run_dir;
@@ -317,7 +325,8 @@ fn run_planner_container(
         mode: mode.to_string(),
         system_prompt: system_prompt.to_string(),
         driver_prompt: driver_prompt.to_string(),
-        output_file: output_file.to_string(),
+        output_file: output_files[0].to_string(),
+        output_file_alt: output_files.get(1).copied().unwrap_or("").to_string(),
         agt_ext,
         agt_policy_path,
         agt_audit_path,
@@ -361,20 +370,40 @@ fn run_planner_container(
         );
     }
 
-    // 读产出：容器写 /outputs/<file>（bind mount 即时可见）。
-    let output_host = outputs_dir.join(
-        output_file
-            .trim_start_matches("/outputs/")
-            .trim_start_matches('/'),
-    );
-    let output_text = std::fs::read_to_string(&output_host)
-        .with_context(|| format!("read planner output {}", output_host.display()))?;
+    // 读产出：容器写 /outputs/<file>（bind mount 即时可见）。converse 两分支时
+    // task.py 已强制恰好一个候选文件被写；宿主按候选集探测产出（多/零都显式报错）。
+    let mut produced: Vec<(&str, String)> = Vec::new();
+    for f in output_files {
+        let host = outputs_dir.join(
+            f.trim_start_matches("/outputs/")
+                .trim_start_matches('/'),
+        );
+        if let Ok(text) = std::fs::read_to_string(&host) {
+            if !text.trim().is_empty() {
+                produced.push((f, text));
+            }
+        }
+    }
+    let (produced_file, output_text) = match produced.as_slice() {
+        [(f, text)] => ((*f).to_string(), text.clone()),
+        [] => bail!(
+            "planner container produced none of {} (eval_status={}, location={})",
+            output_files.join(", "),
+            outcome.status,
+            outcome.location
+        ),
+        _ => bail!(
+            "planner container produced multiple outputs ({}): 两分支只能二选一",
+            produced.iter().map(|(f, _)| *f).collect::<Vec<_>>().join(", ")
+        ),
+    };
     if output_text.trim().is_empty() {
-        bail!("planner container produced empty output in {}", output_host.display());
+        bail!("planner container produced empty output in {produced_file}");
     }
 
     Ok(ContainerRunOutput {
         output_text,
+        produced_file,
         eval_status: outcome.status,
         eval_location: Some(outcome.location),
     })
@@ -399,7 +428,10 @@ fn render_planner_compose(
         .replace("{session_path}", &inputs_abs.join("session.json").display().to_string())
         .replace("{contract_path}", &contract_abs.display().to_string())
         .replace("{outputs_dir}", &outputs_abs.display().to_string())
-        .replace(
+                // P1 修复：属主本轮消息挂载（converse 对话面输入 /inputs/owner_message.txt；
+        // 缺此挂载容器读不到属主消息，多轮对话容器模式失效）。
+        .replace("{owner_message_path}", &inputs_abs.join("owner_message.txt").display().to_string())
+.replace(
             "image: \"alfred-executor:latest\"",
             &format!("image: \"{}\"", opts.image),
         );
@@ -522,17 +554,14 @@ mod tests {
             yaml.contains(&format!("{}:/workspace:ro", ws.canonicalize().unwrap().display())),
             "ws ro mount missing:\n{yaml}"
         );
-        // request/session/contract ro
-        for (host, name) in [
-            (inputs.canonicalize().unwrap().join("request.json"), "request.json"),
-            (inputs.canonicalize().unwrap().join("session.json"), "session.json"),
-            (contract.canonicalize().unwrap(), "contract.json"),
-        ] {
-            assert!(
-                yaml.contains(&format!("{}:/inputs/{}:ro", host.display(), name)),
-                "{name} ro mount missing:\n{yaml}"
-            );
-        }
+        // P1：属主本轮消息 ro 挂载（converse 对话面输入；缺此容器读不到属主消息）
+        assert!(
+            yaml.contains(&format!(
+                "{}:/inputs/owner_message.txt:ro",
+                inputs.canonicalize().unwrap().join("owner_message.txt").display()
+            )),
+            "owner_message.txt ro mount missing:\n{yaml}"
+        );
         // outputs rw
         assert!(
             yaml.contains(&format!("{}:/outputs", outputs.canonicalize().unwrap().display())),
@@ -564,6 +593,7 @@ mod tests {
         std::fs::create_dir_all(&outputs).unwrap();
         std::fs::write(inputs.join("request.json"), "{}").unwrap();
         std::fs::write(inputs.join("session.json"), "{}").unwrap();
+        std::fs::write(inputs.join("owner_message.txt"), "属主：继续").unwrap();
         let ws = o.run_dir.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let contract = o.run_dir.join("contract.json");
