@@ -17,6 +17,12 @@
 #   直通、executor 不触发，因此不需要 docker 与真实 provider。
 # 验收：cargo test 全绿 + Tier 1 离线回归 PASS（或 inspect 缺失 SKIP）。
 # ============================================================================
+#
+# Tier 1 用例：
+#   caseA 离线 converse（run → 计划 → mockllm 审查 unscored → 升级挂起）
+#   caseB 离线 maintain②（decide revise 属主补充 → key_conclusions 更新）
+#   caseC P1-2 Reply 多轮续入（规划器答复 → state=Planning → decide revise
+#         续入属主答复 → 重规划 → 升级挂起）
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -169,7 +175,107 @@ assert state["owner_message"] == "技术选型用 Rust", "owner_message not upda
 # 注：maintain 离线路径（ALFRED_OFFLINE）是确定性更新，不写 llm-calls（与 R3 一致）。
 # 只断言会话文档更新成功。
 PY
-  echo "PASS(caseB): 离线 maintain（decide revise）更新 key_conclusions"
+  # ---- Case C：P1-2 Reply 多轮续入（规划器答复 → state=Planning → decide revise 续入 → 重规划）----
+  # 规划器第一轮先答复属主（不产计划，§2.4 Reply 分支）→ 状态停 Planning（对话继续）；
+  # 属主经 `alfred decide --decision revise --message <回答>` 从 Planning 态续入下一轮
+  # 消息（设 owner_message → maintain② → planning_step 复用 revise 机制）→ 重规划
+  # → 计划审查（mockllm unscored）→ 升级挂起。多轮对话端到端闭环。
+  CASE_C="$R6B_RUNS/run-r6b-reply-continue"
+  rm -rf "$CASE_C"
+  mkdir -p "$CASE_C"
+  cat > "$CASE_C/request.json" <<'JSON'
+{
+  "id": "req-r6b-c3",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+  "created_at": "2026-09-01T00:00:00Z"
+}
+JSON
+  cat > "$CASE_C/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r6b-c3",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
+  # 规划器答复（第一轮：先问属主确认技术选型，不产计划）
+  cat > "$CASE_C/reply.txt" <<'TXT'
+收到需求。技术选型确认一下：内容用 Rust 实现，可以吗？
+TXT
+  # 属主答复（第二轮：确认，作为 decide revise 的 --message）
+  cat > "$CASE_C/answer.txt" <<'TXT'
+可以，技术选型用 Rust。
+TXT
+  echo "[r6b] caseC: alfred run（离线 Reply 分支 → state=Planning，对话继续） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_C/reply.txt" \
+  cargo run --quiet -p alfred-cli -- run \
+    --request "$CASE_C/request.json" \
+    --run-dir "$CASE_C" \
+    --time-limit 60 \
+    --review-time-limit 60 \
+    --planner-time-limit 60
+
+  python3 - "$CASE_C" <<'PY' || { echo "FAIL(caseC): Reply 分支产物断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+# 规划器答复后：状态仍 Planning（对话继续，不产计划）
+state = json.load(open(os.path.join(run, "state.json")))
+assert state["state_machine"]["state"] == "planning", f"state={state['state_machine']['state']}"
+assert not os.path.exists(os.path.join(run, "dagspec.json")), "Reply 分支不应产 dagspec"
+# conversation.json：request.submit + converse.reply（规划器答复原文）
+conv = json.load(open(os.path.join(run, "conversation.json")))
+sources = [t["source"] for t in conv["turns"]]
+assert sources == ["request.submit", "converse.reply"], f"sources={sources}"
+assert "技术选型确认" in conv["turns"][1]["content"], f"reply content={conv['turns'][1]['content']}"
+PY
+  echo "PASS(caseC1): Reply 分支 → Planning（对话继续）"
+
+  echo "[r6b] caseC: alfred decide revise（Planning 态续入属主答复 → 重规划） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_C/plan-faithful.json" \
+  cargo run --quiet -p alfred-cli -- decide \
+    --run-dir "$CASE_C" \
+    --decision revise \
+    --message "$CASE_C/answer.txt"
+
+  python3 - "$CASE_C" <<'PY' || { echo "FAIL(caseC): Planning 态 decide revise 续入断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+# 续入后推进：重规划 → 计划审查（mockllm unscored）→ 升级挂起
+assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
+# owner_message = 属主答复（decide revise 设入）
+assert state["owner_message"] == "可以，技术选型用 Rust。", f"owner_message={state['owner_message']}"
+# maintain②：属主答复进了 key_conclusions
+assert any("技术选型用 Rust" in c for c in state["session_doc"]["key_conclusions"]), \
+    f"key_conclusions={state['session_doc']['key_conclusions']}"
+# conversation.json：request.submit → converse.reply(规划器提问) → owner.message(属主答复) → converse.reply(重规划)
+conv = json.load(open(os.path.join(run, "conversation.json")))
+sources = [t["source"] for t in conv["turns"]]
+assert sources == ["request.submit", "converse.reply", "owner.message", "converse.reply"], \
+    f"sources={sources}"
+assert conv["turns"][2]["role"] == "owner", "turns[2] 应为属主答复"
+assert "可以，技术选型用 Rust" in conv["turns"][2]["content"], f"owner turn={conv['turns'][2]['content']}"
+# 续入后产出了 dagspec（重规划成功）
+assert os.path.exists(os.path.join(run, "dagspec.json")), "decide revise 后续入未产 dagspec"
+PY
+  echo "PASS(caseC): Planning 态 decide revise 续入 → 重规划 → 升级挂起（多轮闭环）"
 
   unset ALFRED_CONFIG
   echo ""
