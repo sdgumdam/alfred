@@ -17,7 +17,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 - [核心架构](#核心架构)
 - [构建与测试](#构建与测试)
 - [配置](#配置)
-- [命令](#命令)
+- [库 API 与 alfred bin](#库-api-与-alfred-binowner-交互走-codux-终端)
 - [治理环流程](#治理环流程)
 - [端到端测试](#端到端测试)
 - [安全边界](#安全边界)
@@ -52,7 +52,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 | `alfred-planner` | 规划器（converse 建图 / maintain 会话文档维护 / 打回伪装 disguise）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
 | `alfred-executor` | 执行侧：生成 Inspect 容器管理驱动（`driver.py` 非 eval Task）、沙箱 compose、spawn/poll 驱动（done 记录）、产物采集、配置加载 |
 | `alfred-reviewer` | 审查侧：计划/执行审查都在独立 reviewer 容器内完成（driver.py 容器 pi，判忠实度 PlanVerdict / 验收 ExecVerdict） |
-| `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message`，owner 交互经 codux 终端）；test-only 库驱动示例 `examples/driver.rs`（run/feed/status，e2e 黑盒跑治理环） |
+| `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message`，owner 交互经 codux 终端）+ 真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status，消费前置 `--append-system-prompt`） |
 
 ---
 
@@ -90,9 +90,10 @@ env 覆盖：
 
 ---
 
-## 库 API 与库驱动（owner 交互走 codux 终端，非 CLI）
+## 库 API 与 alfred bin（owner 交互走 codux 终端）
 
-alfred 删 CLI 后只出库 API（编排器状态机驱动）：
+alfred 出库 API（编排器状态机驱动）+ 真实 `alfred` bin（codux 终端 wrapper
+可调度的 CLI driver，照 omp.rs 范式，不发明面板）：
 
 - `governance::run_governance_loop(&mut GovernanceRun, &GovernanceContext)`：
   初始化 / 从当前状态推进治理环，直到挂起态（PlanRejected / Escalated）或终态
@@ -102,20 +103,20 @@ alfred 删 CLI 后只出库 API（编排器状态机驱动）：
   对话）、maintain② 固化关键结论、落 conversation.json，按挂起态路由续跑，返回
   新状态给调用方显示。`decision` ∈ retry | revise | abandon（retry/abandon 消息可选）。
 
-test-only 库驱动示例 `crates/alfred-cli/examples/driver.rs`（e2e 黑盒跑治理环）：
+真实 `alfred` bin（`crates/alfred-cli/src/main.rs`，codux 可调度 CLI driver）驱动治理环：
 
 ```bash
 # 运行治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 分级路由 → 挂起/完成）
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request <req.json> [--run-dir <dir>] [--time-limit 600] [--review-time-limit 300] \
   [--image alfred-executor:latest]
 
 # 喂属主决策（retry / revise / abandon）并从挂起态续跑
-cargo run --quiet -p alfred-cli --example driver -- feed \
+cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir <dir> --decision retry|revise|abandon [--message <文本|文件>]
 
 # 只读查看治理环状态
-cargo run --quiet -p alfred-cli --example driver -- status --run-dir <dir>
+cargo run --quiet -p alfred-cli --bin alfred -- status --run-dir <dir>
 ```
 
 `run` / `feed` 的续跑模型：state.json 存状态机（`GovernanceRun`），`feed` 是 signal
@@ -198,7 +199,7 @@ crates/
   alfred-planner/   converse / maintain / disguise / container / task_gen / llm
   alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
   alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
-  alfred-cli/       commands/{run, plan_review, decide, panel, status, governance}
+  alfred-cli/       src/{main.rs (alfred bin: run/feed/status), governance.rs, lib.rs}
 docker/
   Dockerfile        沙箱镜像（inspect 基座 + Node 22 + pi-coding-agent 0.84.3）
   pi-sandbox.compose.yaml  零挂载参考基座（network none）

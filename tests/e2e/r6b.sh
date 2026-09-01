@@ -15,9 +15,9 @@
 #
 # 模型：Tier 1 用 mockllm（inspect 内建，无需 key）做计划审查——planner 离线
 #   直通、executor 不触发，因此不需要 docker 与真实 provider。
-# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r6b 以
-#   `cargo run --example driver -- run|feed` 驱动治理环——run 初始化 + 推进；
-#   feed 喂属主消息 → `governance::feed_owner_message` 续跑）。非 CLI 子命令。
+# 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
+#   r6b 以 `cargo run --bin alfred -- run|feed` 驱动治理环（run 初始化 + 推进；
+#   feed 喂属主消息 → `governance::feed_owner_message` 续跑）。
 # 验收：cargo test 全绿 + Tier 1 离线回归 PASS（或 inspect 缺失 SKIP）。
 # ============================================================================
 #
@@ -126,7 +126,7 @@ JSON
 JSON
   echo "[r6b] caseA: driver run（离线规划 → mockllm 审查 unscored → escalated） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_A/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_A/request.json" \
     --run-dir "$CASE_A" \
     --time-limit 60 \
@@ -169,7 +169,7 @@ PY
 技术选型用 Rust
 TXT
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_A/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli --example driver -- feed \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
     --run-dir "$CASE_A" \
     --decision revise \
     --message "$MSG_FILE"
@@ -235,7 +235,7 @@ TXT
 TXT
   echo "[r6b] caseC: driver run（离线 Reply 分支 → state=Planning，对话继续） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_C/reply.txt" \
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_C/request.json" \
     --run-dir "$CASE_C" \
     --time-limit 60 \
@@ -259,7 +259,7 @@ PY
 
   echo "[r6b] caseC: driver feed revise（Planning 态续入属主答复 → 重规划） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_C/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli --example driver -- feed \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
     --run-dir "$CASE_C" \
     --decision revise \
     --message "$CASE_C/answer.txt"
@@ -331,7 +331,7 @@ JSON
 TXT
   echo "[r6b] caseD: driver run（离线 Reply 分支 → state=Planning，对话继续） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_D/reply.txt" \
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_D/request.json" \
     --run-dir "$CASE_D" \
     --time-limit 60 \
@@ -350,7 +350,7 @@ PY
   # （planner）会失败；前置路由应让 Abandon 不触碰 planner 直接进终态。
   echo "[r6b] caseD: driver feed abandon（无 --message；planner 不可用也能弃） ..."
   env -u ALFRED_OFFLINE -u ALFRED_OFFLINE_PLAN_FILE -u ALFRED_OFFLINE_REPLY_FILE \
-  cargo run --quiet -p alfred-cli --example driver -- feed \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
     --run-dir "$CASE_D" \
     --decision abandon
 
@@ -383,7 +383,7 @@ PY
   # PlanReviewing 重审同一计划（ALFRED_OFFLINE=1 离线跳过 → unscored → 再升级挂起）。
   echo "[r6b] caseE: driver feed retry（无 --message → 按来源重审 → 再升级） ..."
   ALFRED_OFFLINE=1 \
-  cargo run --quiet -p alfred-cli --example driver -- feed \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
     --run-dir "$CASE_C" \
     --decision retry
 
@@ -469,7 +469,7 @@ JSON
 JSON
   echo "[r6b] caseF: driver run（离线空 workspace_subdirs → 计划审查结构闸门打回 → PlanRejected） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_F/plan-unfaithful.json" \
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_F/request.json" \
     --run-dir "$CASE_F" \
     --time-limit 60 \
@@ -489,7 +489,7 @@ PY
 
   echo "[r6b] caseF: driver feed retry（无消息 → 伪装消息驱动重规划） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_F/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli --example driver -- feed \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
     --run-dir "$CASE_F" \
     --decision retry
 
@@ -569,7 +569,7 @@ if [[ "${R6B_REAL:-0}" == "1" ]]; then
 }
 JSON
   echo "[r6b] caseT: driver run（真容器 planner converse → 真计划审查/执行） ..."
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_T/request.json" \
     --run-dir "$CASE_T" \
     --time-limit 900 \

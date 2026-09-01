@@ -12,8 +12,8 @@
 # 覆盖（config 缺失的模型 id 会沿用基础角色 provider——见 config.rs）。
 # R3 起 `driver run` 是完整治理环：case1/1b 断言读治理环 state.json
 # （state_machine/exec_verdicts），执行产物在 exec-N/workspace/。
-# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r2 以
-#   `cargo run --example driver -- run` 驱动治理环）。非 CLI 子命令。
+# 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
+#   r2 以 `cargo run --bin alfred -- run` 驱动治理环。
 # 验收：cargo test 全绿 + 本脚本两用例 PASS + 两用例归档 SKIP。
 # ============================================================================
 set -euo pipefail
@@ -116,7 +116,7 @@ cat > "$CASE1_DIR/request.json" <<'JSON'
 }
 JSON
 echo "[r2] case1: driver run (exec review, scorer 判 C) ..."
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
   --time-limit "${R2_TIME_LIMIT:-900}" \
@@ -186,7 +186,7 @@ cat > "$CASE1B_DIR/plan-faithful.json" <<'JSON'
 JSON
 echo "[r2] case1b: driver run (offline 忠实计划 → 执行部分兑现 → 执行审查离线回退 → §3.3 升级挂起) ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1B_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1B_DIR/request.json" \
   --run-dir "$CASE1B_DIR" \
   --time-limit "${R2_TIME_LIMIT:-900}" \

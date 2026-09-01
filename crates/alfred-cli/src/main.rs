@@ -1,9 +1,9 @@
-//! alfred-cli 库驱动示例（test-only）：替代已删 alfred CLI 的 run/decide。
+//! alfred CLI driver bin（codux 可调度的 run/feed/status）。
 //!
-//! 属主 08-31 删 alfred CLI 六命令后，owner 交互走 codux 终端；alfred 只出库
-//! API（`governance::run_governance_loop` / `governance::feed_owner_message`）。
-//! 本示例是库调用方（codux driver）的替身，供 r6b.sh 黑盒测试以库驱动方式
-//! 跑治理环（非 CLI 子命令）。
+//! 属主 08-31：删/回滚 alfred CLI 六命令（run/decide/status/plan-review/exec-review/
+//! panel 不再作为 owner 交互入口）；alfred 保留编排器状态机为库，并出真实 `alfred`
+//! bin 作为 codux 终端 wrapper 可调度的 CLI driver（照 omp.rs 范式，不发明面板）。
+//! owner 在 codux 终端与 pi 对话；wrapper 调度本 bin 驱动治理环。
 //!
 //! 子命令：
 //! - `run`    --request <request.json> --run-dir <dir>
@@ -19,6 +19,10 @@
 //!
 //! `--message` 优先按文件路径读取（旧 decide --message 语义）；路径不存在时按
 //! 内联文本处理（codux 终端直喂属主原话）。
+//!
+//! 前置消费：codux wrapper 在子命令前注入 `--append-system-prompt <value>`；main()
+//! 取子命令前先剥离任意前置该 flag（接受并丢弃/存 env，绝不 bail）。
+//! `--help/-h` 与 `--version/-V` 打印后退出 0。输出保持 `[driver] 当前状态` 状态行。
 
 use std::path::{Path, PathBuf};
 
@@ -35,13 +39,55 @@ use anyhow::{bail, Context, Result};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = strip_append_system_prompt(args);
     let cmd = args.first().map(String::as_str).unwrap_or("");
     match cmd {
         "run" => cmd_run(&args[1..]),
         "feed" => cmd_feed(&args[1..]),
         "status" => cmd_status(&args[1..]),
-        other => bail!("driver: 未知子命令 {other:?}（run|feed|status）"),
+        "-h" | "--help" => {
+            print_help();
+            Ok(())
+        }
+        "-V" | "--version" => {
+            println!("alfred {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        other => bail!("alfred: 未知子命令 {other:?}（run|feed|status；--help 查看用法）"),
     }
+}
+
+/// 消费任意前置的 `--append-system-prompt <value>`（codux wrapper 前置注入）。
+/// 接受并丢弃/存 env，绝不 bail——值缺失时仅消费 flag 本身继续。
+fn strip_append_system_prompt(mut args: Vec<String>) -> Vec<String> {
+    let mut appended: Vec<String> = Vec::new();
+    while let Some(first) = args.first().map(String::as_str) {
+        if first != "--append-system-prompt" {
+            break;
+        }
+        args.remove(0);
+        if let Some(value) = args.first().cloned() {
+            appended.push(value);
+            args.remove(0);
+        }
+    }
+    if !appended.is_empty() {
+        std::env::set_var("ALFRED_APPEND_SYSTEM_PROMPT", appended.join("\n"));
+    }
+    args
+}
+
+fn print_help() {
+    println!("alfred {} — codux 可调度的治理环 CLI driver", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("用法: alfred [--append-system-prompt <value>] <子命令> [参数]");
+    println!();
+    println!("子命令:");
+    println!("  run     初始化治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 路由）");
+    println!("  feed    喂属主决策（revise|retry|abandon）并从挂起态续跑");
+    println!("  status  只读打印当前治理环状态");
+    println!();
+    println!("通用 flag: --append-system-prompt <value>（前置注入，接受并丢弃）; -h/--help; -V/--version");
 }
 
 /// `run`：初始化治理 run（request.submit 首轮 + ws 基线）→ 推进治理环。
@@ -63,7 +109,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
                 i += 1;
                 let val = args
                     .get(i)
-                    .with_context(|| format!("driver run: {flag} 缺值"))?
+                    .with_context(|| format!("alfred run: {flag} 缺值"))?
                     .clone();
                 match flag {
                     "--request" => request_path = Some(PathBuf::from(val)),
@@ -80,11 +126,11 @@ fn cmd_run(args: &[String]) -> Result<()> {
                 }
             }
             "--no-ctl" => no_ctl = true,
-            other => bail!("driver run: 未知参数 {other:?}"),
+            other => bail!("alfred run: 未知参数 {other:?}"),
         }
         i += 1;
     }
-    let request_path = request_path.context("driver run: 需要 --request <request.json>")?;
+    let request_path = request_path.context("alfred run: 需要 --request <request.json>")?;
 
     let text = std::fs::read_to_string(&request_path)
         .with_context(|| format!("read request {}", request_path.display()))?;
@@ -174,7 +220,7 @@ fn cmd_feed(args: &[String]) -> Result<()> {
                 i += 1;
                 let val = args
                     .get(i)
-                    .with_context(|| format!("driver feed: {flag} 缺值"))?
+                    .with_context(|| format!("alfred feed: {flag} 缺值"))?
                     .clone();
                 match flag {
                     "--run-dir" => run_dir = Some(PathBuf::from(val)),
@@ -183,17 +229,17 @@ fn cmd_feed(args: &[String]) -> Result<()> {
                     _ => unreachable!(),
                 }
             }
-            other => bail!("driver feed: 未知参数 {other:?}"),
+            other => bail!("alfred feed: 未知参数 {other:?}"),
         }
         i += 1;
     }
-    let run_dir = run_dir.context("driver feed: 需要 --run-dir <dir>")?;
-    let decision = decision.context("driver feed: 需要 --decision revise|retry|abandon")?;
+    let run_dir = run_dir.context("alfred feed: 需要 --run-dir <dir>")?;
+    let decision = decision.context("alfred feed: 需要 --decision revise|retry|abandon")?;
     let decision = match decision.as_str() {
         "revise" => OwnerDecision::Revise,
         "retry" => OwnerDecision::Retry,
         "abandon" => OwnerDecision::Abandon,
-        other => bail!("driver feed: 未知决策 {other:?}（revise|retry|abandon）"),
+        other => bail!("alfred feed: 未知决策 {other:?}（revise|retry|abandon）"),
     };
     // --message 优先按文件路径读取（旧 decide 语义）；路径不存在按内联文本。
     // P2b：Retry/Abandon 消息可选（Abandon 不需要消息；Retry 可不带新指令重跑）；Revise 必填。
@@ -204,7 +250,7 @@ fn cmd_feed(args: &[String]) -> Result<()> {
         Some(m) => m.clone(),
         None => match decision {
             OwnerDecision::Revise => {
-                bail!("driver feed: revise 决策需要 --message <文本|文件路径>")
+                bail!("alfred feed: revise 决策需要 --message <文本|文件路径>")
             }
             OwnerDecision::Retry | OwnerDecision::Abandon => String::new(),
         },
@@ -241,15 +287,15 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 i += 1;
                 run_dir = Some(PathBuf::from(
                     args.get(i)
-                        .with_context(|| "driver status: --run-dir 缺值")?
+                        .with_context(|| "alfred status: --run-dir 缺值")?
                         .clone(),
                 ));
             }
-            other => bail!("driver status: 未知参数 {other:?}"),
+            other => bail!("alfred status: 未知参数 {other:?}"),
         }
         i += 1;
     }
-    let run_dir = run_dir.context("driver status: 需要 --run-dir <dir>")?;
+    let run_dir = run_dir.context("alfred status: 需要 --run-dir <dir>")?;
     let run = load_governance_run(&run_dir)?;
     println!(
         "[driver] 当前状态 : {}（attempts={}/{}）",

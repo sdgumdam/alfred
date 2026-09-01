@@ -22,8 +22,8 @@
 #     b) driver run 真容器全链（converse → 计划审查容器 → 执行 → 执行审查）。
 #     默认关闭（留给验方）。
 #
-# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r6c 以
-#   `cargo run --example driver -- run` 驱动治理环）。非 CLI 子命令。
+# 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
+#   r6c 以 `cargo run --bin alfred -- run` 驱动治理环。
 # 模型：Tier 1 用 mockllm（inspect 内建，无需 key）做计划审查——planner 离线
 #   直通、executor 不触发，因此不需要 docker 与真实 provider。
 # 验收：cargo test 全绿 + Tier 1 离线回归 PASS（或 inspect 缺失 SKIP）+
@@ -138,7 +138,7 @@ JSON
 JSON
   echo "[r6c] tier1c: driver run（离线规划 → mockllm 审查 unscored → escalated） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_C/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_C/request.json" \
     --run-dir "$CASE_C" \
     --time-limit 60 \
@@ -268,7 +268,7 @@ JSON
   #   轮询到含 converse 不挂 trigger 注释行的 planner/compose.yaml 即其 converse 版。
   CONVERSE_COMPOSE="$CASE_B/converse.planner.compose.yaml"
   echo "[r6c] tier3b: driver run（真容器 converse → 计划审查容器 → 执行 → 执行审查） ..."
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_B/request.json" \
     --run-dir "$CASE_B" \
     --time-limit 900 \

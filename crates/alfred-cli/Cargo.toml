@@ -2,11 +2,15 @@
 name = "alfred-cli"
 version.workspace = true
 edition.workspace = true
-description = "alfred 编排器状态机驱动库（governance.rs 核心；删 CLI 后供 codux driver 驱动治理环）"
+description = "alfred 编排器状态机驱动库（governance.rs 核心）+ alfred bin（codux 可调度 CLI driver：run/feed/status，消费前置 --append-system-prompt）"
 
 [lib]
 name = "alfred_cli"
 path = "src/lib.rs"
+
+[[bin]]
+name = "alfred"
+path = "src/main.rs"
 
 [dependencies]
 alfred-core = { workspace = true }

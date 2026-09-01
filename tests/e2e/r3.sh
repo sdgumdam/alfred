@@ -15,9 +15,9 @@
 # 模型：默认 glm-4.7（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
 # ALFRED_CONFIG 提供）。可用 ALFRED_EXECUTOR_MODEL / ALFRED_REVIEWER_MODEL /
 # ALFRED_PLANNER_MODEL 覆盖。
-# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r3 以
-#   `cargo run --example driver -- run|feed` 驱动治理环——run 初始化+推进；feed 喂
-#   属主消息 → `governance::feed_owner_message` 续跑）。非 CLI 子命令。
+# 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
+#   r3 以 `cargo run --bin alfred -- run|feed` 驱动治理环（run 初始化+推进；feed 喂
+#   属主消息 → `governance::feed_owner_message` 续跑）。
 # 验收：cargo test 全绿 + 本脚本用例 PASS（case2b 归档 SKIP）。
 # ============================================================================
 set -euo pipefail
@@ -135,7 +135,7 @@ cat > "$CASE1_DIR/request.json" <<'JSON'
 }
 JSON
 echo "[r3] case1: driver run（真规划 → 计划审查 → 执行 → 验收） ..."
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
   --time-limit "$EXEC_TL" \
@@ -207,7 +207,7 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
 JSON
 echo "[r3] case2: driver run（执行 --time-limit 1 强制机械超时） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE2_DIR/request.json" \
   --run-dir "$CASE2_DIR" \
   --time-limit 1 \
@@ -299,7 +299,7 @@ cat > "$CASE3_DIR/plan-faithful.json" <<'JSON'
 JSON
 echo "[r3] case3: driver run（离线注入不忠实计划 → 计划审查打回） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-unfaithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE3_DIR/request.json" \
   --run-dir "$CASE3_DIR" \
   --time-limit "$EXEC_TL" \
@@ -316,7 +316,7 @@ echo "PASS(case3a): 不忠实计划被计划审查打回 → PlanRejected"
 
 echo "[r3] case3: driver feed retry（伪装消息重规划） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- feed \
+cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE3_DIR" \
   --decision retry
 # （--message "" = Retry 消息可选：feed_owner_message 无消息跳过消息轮，不做
@@ -429,7 +429,7 @@ cat > "$CASE4_DIR/supplement.txt" <<'TXT'
 TXT
 echo "[r3] case4: driver run（打回 → 挂起 PlanRejected） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-unfaithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE4_DIR/request.json" \
   --run-dir "$CASE4_DIR" \
   --time-limit "$EXEC_TL" \
@@ -439,7 +439,7 @@ assert_state "$CASE4_DIR" "plan_rejected"
 
 echo "[r3] case4: driver feed revise（属主补充新需求） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- feed \
+cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE4_DIR" \
   --decision revise \
   --message "$CASE4_DIR/supplement.txt"

@@ -15,8 +15,8 @@
 #   RPC（panel-session.jsonl extension_ui_request/response）已随 CLI 删除归档。
 #
 # 模型：glm-4.7 省钱（config.yml 或 env 覆盖）。
-# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r4 以
-#   `cargo run --example driver -- run|feed` 驱动治理环——run 初始化+推进；feed 喂
+# 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
+#   r4 以 `cargo run --bin alfred -- run|feed` 驱动治理环（run 初始化+推进；feed 喂
 #   属主决策 → `governance::feed_owner_message`，Abandon/Retry 消息可选）。
 # 验收：cargo test 全绿 + 本脚本两用例 PASS。
 # ============================================================================
@@ -161,7 +161,7 @@ cat > "$CASE1_DIR/plan-faithful.json" <<'JSON'
 JSON
 echo "[r4] case1: driver run（执行 --time-limit 1 强制机械超时 → Escalated） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
   --time-limit 1 \
@@ -171,7 +171,7 @@ assert_state "$CASE1_DIR" "escalated"
 echo "PASS(case1a): 机械预算耗尽 → Escalated"
 
 echo "[r4] case1: driver feed abandon（属主放弃，无消息） ..."
-cargo run --quiet -p alfred-cli --example driver -- feed \
+cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE1_DIR" \
   --decision abandon \
   --message ""
@@ -241,7 +241,7 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
 JSON
 echo "[r4] case2: driver run（离线注入不忠实计划 → 计划审查打回 → PlanRejected） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-unfaithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE2_DIR/request.json" \
   --run-dir "$CASE2_DIR" \
   --time-limit "$EXEC_TL" \
@@ -252,7 +252,7 @@ echo "PASS(case2a): 不忠实计划被计划审查打回 → PlanRejected"
 
 echo "[r4] case2: driver feed retry（属主重跑，离线忠实计划重规划 → 执行） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli --example driver -- feed \
+cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE2_DIR" \
   --decision retry \
   --message ""

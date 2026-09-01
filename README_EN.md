@@ -23,7 +23,7 @@ documentation sync).
 - [Architecture](#architecture)
 - [Build & Test](#build--test)
 - [Configuration](#configuration)
-- [Commands](#commands)
+- [Library API and the alfred bin](#library-api-and-the-alfred-bin-owner-interaction-goes-through-the-codux-terminal)
 - [Governance Loop](#governance-loop)
 - [End-to-End Tests](#end-to-end-tests)
 - [Security Boundaries](#security-boundaries)
@@ -68,7 +68,7 @@ Owner (human)
 | `alfred-planner` | Planner (converse graph-building / maintain session-doc / disguise rejection); in-container pi conversation agent (bridge-relayed LLM) with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
 | `alfred-executor` | Execution side: generates the Inspect container-management driver (`driver.py`, not an eval Task), the sandbox compose, spawn/poll the driver (done record), artifact collection, config loading |
 | `alfred-reviewer` | Review side: plan/exec review both run in a dedicated reviewer container (driver.py in-container pi, judging fidelity → PlanVerdict / acceptance → ExecVerdict) |
-| `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal); test-only library driver example `examples/driver.rs` (run/feed/status, e2e black-box runs the governance loop) |
+| `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal) + real `alfred` bin (codux-schedulable CLI driver: run/feed/status, consumes leading `--append-system-prompt`) |
 
 ---
 
@@ -109,10 +109,12 @@ Environment overrides:
 
 ---
 
-## Library API and library driver (owner interaction goes through the codux
-## terminal, not a CLI)
+## Library API and the alfred bin (owner interaction goes through the codux
+## terminal)
 
-After removing the CLI, alfred exposes library APIs only:
+alfred exposes library APIs (the orchestrator state machine) plus a real
+`alfred` bin (a CLI driver schedulable by the codux terminal wrapper, per the
+omp.rs pattern — no invented panel):
 
 - `governance::run_governance_loop(&mut GovernanceRun, &GovernanceContext)`:
   initialize / advance the governance loop from the current state until a
@@ -125,22 +127,22 @@ After removing the CLI, alfred exposes library APIs only:
   resumes the loop, returning the new state for the caller to display.
   `decision` ∈ retry | revise | abandon (message optional for retry/abandon).
 
-Test-only library driver example `crates/alfred-cli/examples/driver.rs`
-(e2e black-box runs the governance loop):
+Real `alfred` bin (`crates/alfred-cli/src/main.rs`, codux-schedulable CLI driver)
+runs the governance loop:
 
 ```bash
 # Run the governance loop (request → plan → plan review → execute →
 #                            exec review → tiered routing → suspended/terminal)
-cargo run --quiet -p alfred-cli --example driver -- run \
+cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request <req.json> [--run-dir <dir>] [--time-limit 600] [--review-time-limit 300] \
   [--image alfred-executor:latest]
 
 # Feed an owner decision (retry / revise / abandon); resumes from the suspended state
-cargo run --quiet -p alfred-cli --example driver -- feed \
+cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir <dir> --decision retry|revise|abandon [--message <text|file>]
 
 # Read-only governance status
-cargo run --quiet -p alfred-cli --example driver -- status --run-dir <dir>
+cargo run --quiet -p alfred-cli --bin alfred -- status --run-dir <dir>
 ```
 
 `run` / `feed` share a resumable model: `state.json` stores the state machine
@@ -233,7 +235,7 @@ crates/
   alfred-planner/   converse / maintain / disguise / container / task_gen / llm
   alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
   alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
-  alfred-cli/       commands/{run, plan_review, decide, panel, status, governance}
+  alfred-cli/       src/{main.rs (alfred bin: run/feed/status), governance.rs, lib.rs}
 docker/
   Dockerfile        sandbox image (inspect base + Node 22 + pi-coding-agent 0.84.3)
   pi-sandbox.compose.yaml   zero-mount reference base (network none)

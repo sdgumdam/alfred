@@ -37,8 +37,8 @@
 #   无需 key）+ 本地 mock OpenAI 兼容 provider（reviewer，返回 {"pass":true}，
 #   无需真 LLM——真 kuaizi 走旧 eval 直判路径会撞 45s scoring 超时，见交付
 #   文档）；Tier 2 无模型；Tier 3 走 config.yml 真实模型。
-# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r6d 以
-#   `cargo run --example driver -- run` 驱动治理环——run 初始化 + 推进）。非 CLI 子命令。
+# 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
+#   r6d 以 `cargo run --bin alfred -- run` 驱动治理环（run 初始化 + 推进）。
 # 验收：cargo test 全绿 + Tier 1 离线回归 PASS（或 inspect/docker 缺失
 #   SKIP）+ Tier 2 容器可见性 PASS（或 docker 缺失 SKIP）。
 # ============================================================================
@@ -198,7 +198,7 @@ JSON
   export ALFRED_OFFLINE_PLAN_FILE="$T1B/plan-faithful.json"
 
   echo "[r6d] tier1b: driver run（离线规划 → mock 计划审查 PASS → 真实执行 → 执行审查离线回退） ..."
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$T1B/request.json" \
     --run-dir "$RUN1B" \
     --time-limit 300 \
@@ -356,7 +356,7 @@ if [[ "${R6D_REAL:-0}" == "1" ]]; then
 }
 JSON
   echo "[r6d] tier3: driver run（真容器 converse → 计划审查容器 → 执行 → 执行审查容器判 verdict） ..."
-  cargo run --quiet -p alfred-cli --example driver -- run \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE/request.json" \
     --run-dir "$CASE" \
     --time-limit 900 \

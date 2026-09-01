@@ -26,8 +26,8 @@
 #        - agt : AGT 策略求值原型（node 直测 policy 语义；agt/demo.sh 实机
 #                容器拦截演示是 LLM 依赖的可选演示，不在此链内）
 #
-# 驱动：alfred CLI 已删（08-31），e2e 经库驱动示例 `examples/driver.rs`
-#   （`cargo run --example driver -- run|feed`）。r2 独立 plan-review 两用例、
+# 驱动：e2e 经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）
+#   （`cargo run --bin alfred -- run|feed`）。r2 独立 plan-review 两用例、
 #   r3 case2b（decide retry --time-limit 覆盖）、r6c tier1b/tier3a 已归档
 #   （独立 plan-review/exec-review/panel CLI 已删；等价覆盖在治理环路径）。
 # 每步日志落 tests/e2e/.runs/skeleton-<ts>/<step>.log。
