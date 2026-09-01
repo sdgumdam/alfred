@@ -11,7 +11,7 @@
 #      执行→执行审查；执行产物/证据在最新 exec-N/ 下）
 #   6. 校验 ws/<workspace_subdirs[0]>/hello.txt 存在且内容为 Hello（R6f 布局：
 #      run 级单一 ws，子目录名不硬编码——真规划器按 R6fPlannerNaming 自由选）
-#   7. 校验 exec-N/evals/ 证据归档（*.eval 与 *.dump.json，P9）
+#   7. 校验 exec-N/驱动证据归档（driver.done.json + driver.stdout/stderr.log，P9）
 #
 # 验收（施工清单 S2）："容器里真跑出文件且变化符合预期"
 # ============================================================================
@@ -135,23 +135,25 @@ if [[ "$CONTENT" != "Hello" ]]; then
   exit 1
 fi
 
-# --- 7. 校验证据归档（P9）：PASS 前断言 exec-N/evals/ 有 *.eval 与 *.dump.json ---
+# --- 7. 校验驱动证据归档（P9）：PASS 前断言 exec-N/ 有 driver.done.json 与
+#    driver.stdout.log / driver.stderr.log（去 eval 后证据，替代 evals/*.eval） ---
 shopt -s nullglob
-EVAL_FILES=("$EXEC_DIR"/evals/*.eval)
-DUMP_FILES=("$EXEC_DIR"/evals/*.dump.json)
+DONE_FILES=("$EXEC_DIR"/driver.done.json)
+STDOUT_FILES=("$EXEC_DIR"/driver.stdout.log)
+STDERR_FILES=("$EXEC_DIR"/driver.stderr.log)
 shopt -u nullglob
-if [[ ${#EVAL_FILES[@]} -eq 0 ]] || [[ ${#DUMP_FILES[@]} -eq 0 ]]; then
-  echo "FAIL: exec-N/evals/ 缺少证据归档 (*.eval=${#EVAL_FILES[@]}, *.dump.json=${#DUMP_FILES[@]})" >&2
-  echo "--- exec-N/evals/ 内容 ---" >&2
-  find "$EXEC_DIR/evals" -maxdepth 1 -type f 2>/dev/null | sed "s|$REPO_ROOT/||" >&2
+if [[ ${#DONE_FILES[@]} -eq 0 ]] || [[ ${#STDOUT_FILES[@]} -eq 0 ]] || [[ ${#STDERR_FILES[@]} -eq 0 ]]; then
+  echo "FAIL: exec-N/ 缺少驱动证据归档 (driver.done.json=${#DONE_FILES[@]}, driver.stdout.log=${#STDOUT_FILES[@]}, driver.stderr.log=${#STDERR_FILES[@]})" >&2
+  echo "--- exec-N/ 内容 ---" >&2
+  find "$EXEC_DIR" -maxdepth 1 -type f 2>/dev/null | sed "s|$REPO_ROOT/||" >&2
   exit 1
 fi
-echo "[r1] evals arch : *.eval x${#EVAL_FILES[@]}, *.dump.json x${#DUMP_FILES[@]}"
+echo "[r1] driver evidence : driver.done.json x${#DONE_FILES[@]}, driver.stdout.log x${#STDOUT_FILES[@]}, driver.stderr.log x${#STDERR_FILES[@]}"
 
 echo ""
 echo "PASS: 容器内 pi 完成小需求，产物落宿主 run 目录"
 echo "  exec_dir: $EXEC_DIR"
 echo "  ws_hello: $WS_HELLO"
 echo "  content : $CONTENT"
-echo "  evals   : $(ls "$EXEC_DIR/evals/" 2>/dev/null | tr '\n' ' ')"
+echo "  driver  : driver.done.json + driver.stdout.log + driver.stderr.log"
 exit 0
