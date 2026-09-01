@@ -300,6 +300,7 @@ fn run_planner_container(
         &inputs_abs,
         &contract_abs,
         &outputs_abs,
+        mode == "maintain",
         agt_work.as_deref(),
     )?;
     let compose_path = work.join("compose.yaml");
@@ -429,8 +430,17 @@ fn render_planner_compose(
     inputs_abs: &Path,
     contract_abs: &Path,
     outputs_abs: &Path,
+    mount_trigger: bool,
     agt_work: Option<&Path>,
 ) -> Result<String> {
+    // E1 修复：converse 不产 trigger.json，不能无条件挂载——docker 对不存在的
+    // 宿主文件静默建目录（trigger.json 变目录），maintain 后写同名文件撞目录
+    // （os error 21）。故仅 maintain 挂载，converse 填注释行。
+    let trigger_mount = if mount_trigger {
+        format!("- {}:/inputs/trigger.json:ro", inputs_abs.join("trigger.json").display())
+    } else {
+        "# (converse 模式：不挂载 trigger.json，避免 docker 静默建目录)".to_string()
+    };
     let mut out = PLANNER_COMPOSE_TMPL
         .replace("{ws}", &ws_abs.display().to_string())
         .replace("{request_path}", &inputs_abs.join("request.json").display().to_string())
@@ -442,7 +452,7 @@ fn render_planner_compose(
         .replace("{owner_message_path}", &inputs_abs.join("owner_message.txt").display().to_string())
         // P2 修复：maintain 触发事件挂载（/inputs/trigger.json；缺此挂载容器读不到
         // MaintainTrigger，真实模式 PlanReviewed/OwnerMessage 两触发时机失效）。
-        .replace("{trigger_path}", &inputs_abs.join("trigger.json").display().to_string())
+        .replace("{trigger_mount}", &trigger_mount)
         .replace(
             "image: \"alfred-executor:latest\"",
             &format!("image: \"{}\"", opts.image),
