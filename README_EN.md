@@ -210,7 +210,7 @@ land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 | No network by default | sandbox compose `network_mode: none` (only loopback in container) | R0 experiment + carried into r1 |
 | No keys in container | in-container models.json uses a dummy key; real keys stay in the host driver process (`env_clear` + allowlist) | R0 audit (`docker inspect env` zero hits) |
 | Out-of-workspace write blocked | workspace-only volume; paths outside it land on the container overlay, not the host | `tests/e2e/escape.sh` (two-way PASS) |
-| Review isolation | exec-review scorer sees acceptance criteria + artifact summary only, not the prompt; planner is unaware of reviewer/executor | r2/r3 e2e assertions |
+| Review isolation | Non-claim, enforced by the mount surface: contract full text / acceptance criteria / conversation transcript are not mounted into the executor container; the reviewer container independently mounts ws full (ro) + conversation transcript for scoring; the planner is unaware of reviewer/executor | r2/r3 e2e assertions |
 | Tool-level policy (prototype, off by default) | AGT-style pi extension intercepts `tool_call` (rm -rf / sudo / secret read / out-of-workspace write) | `tests/e2e/agt/` (24 deterministic assertions + live demo) — owner decides, see `.plans/AGT评估.md` |
 
 ---
