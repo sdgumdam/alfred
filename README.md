@@ -29,7 +29,8 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 
 ```
 属主（人）
-  └─ alfred CLI（Rust；编排器状态机在 alfred-core 内，进程内调用）
+  └─ alfred 库（Rust；治理环驱动 alfred-cli::governance，owner 交互走 codux 终端
+       → feed_owner_message；编排器状态机在 alfred-core 内，进程内调用）
        ├─ planner：容器内 pi 对话 agent（converse 建图 / maintain 会话文档），
        │    经 sandbox_agent_bridge 桥调模型（容器断网 + 宿主代发）→ 产出 → DagSpec
        ├─ 执行：生成宿主侧容器驱动脚本（driver.py，非 eval Task）→ spawn `python3 driver.py`
@@ -39,7 +40,6 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
        │    ← 轮询 `<work>/driver.done.json` done 记录 → 读 bind mount 产物
        ├─ 计划审查 / 执行审查：同机制独立 reviewer 容器（driver.py 驱动容器内 pi
        │    判 DagSpec vs OwnerRequest 忠实度 / 产物 vs 验收标准）→ verdict.json
-       ├─ 决策面板：pi --mode rpc 会话（extension_ui_request/response 决策卡）
        └─ 持久层：run-<id>/{state.json, audit.jsonl, llm-calls/, exec-N/}（exec-N/ 下
             driver.done.json + driver.stdout/stderr.log 为驱动证据，替代旧 evals/）
 ```
@@ -52,7 +52,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 | `alfred-planner` | 规划器（converse 建图 / maintain 会话文档维护 / 打回伪装 disguise）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
 | `alfred-executor` | 执行侧：生成 Inspect 容器管理驱动（`driver.py` 非 eval Task）、沙箱 compose、spawn/poll 驱动（done 记录）、产物采集、配置加载 |
 | `alfred-reviewer` | 审查侧：计划/执行审查都在独立 reviewer 容器内完成（driver.py 容器 pi，判忠实度 PlanVerdict / 验收 ExecVerdict） |
-| `alfred-cli` | CLI：`run` / `plan-review` / `decide` / `panel` / `status` |
+| `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message`，owner 交互经 codux 终端）；test-only 库驱动示例 `examples/driver.rs`（run/feed/status，e2e 黑盒跑治理环） |
 
 ---
 
@@ -90,29 +90,37 @@ env 覆盖：
 
 ---
 
-## 命令
+## 库 API 与库驱动（owner 交互走 codux 终端，非 CLI）
+
+alfred 删 CLI 后只出库 API（编排器状态机驱动）：
+
+- `governance::run_governance_loop(&mut GovernanceRun, &GovernanceContext)`：
+  初始化 / 从当前状态推进治理环，直到挂起态（PlanRejected / Escalated）或终态
+  （Completed / Abandoned）。
+- `governance::feed_owner_message(&mut run, &ctx, message, decision)`：
+  owner 决策入口（codux 终端调它）：设属主消息（revise 重规划 / Planning 态续入
+  对话）、maintain② 固化关键结论、落 conversation.json，按挂起态路由续跑，返回
+  新状态给调用方显示。`decision` ∈ retry | revise | abandon（retry/abandon 消息可选）。
+
+test-only 库驱动示例 `crates/alfred-cli/examples/driver.rs`（e2e 黑盒跑治理环）：
 
 ```bash
 # 运行治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 分级路由 → 挂起/完成）
-alfred run --request <req.json> [--run-dir <dir>] [--time-limit 600]
-           [--review-time-limit 300] [--image alfred-executor:latest]
+cargo run --quiet -p alfred-cli --example driver -- run \
+  --request <req.json> [--run-dir <dir>] [--time-limit 600] [--review-time-limit 300] \
+  [--image alfred-executor:latest]
 
-# 计划审查：判 DagSpec 是否忠实于 OwnerRequest（reviewer 容器，PlanVerdict 落盘）
-alfred plan-review --request <req.json> --dagspec <dag.json> --run-dir <dir>
-
-# 属主拍板（retry / revise / abandon）并从挂起态续跑
-alfred decide --run-dir <dir> --decision retry|revise|abandon [--message <file>]
-
-# 决策面板 RPC：属主会话 pi 发三选项决策卡（重跑/改契约/放弃）→ 终端拍板 → 调 decide 续跑
-alfred panel --run-dir <dir> [--timeout 300] [--panel-model <id>] [--no-decide]
+# 喂属主决策（retry / revise / abandon）并从挂起态续跑
+cargo run --quiet -p alfred-cli --example driver -- feed \
+  --run-dir <dir> --decision retry|revise|abandon [--message <文本|文件>]
 
 # 只读查看治理环状态
-alfred status --run-dir <dir>
+cargo run --quiet -p alfred-cli --example driver -- status --run-dir <dir>
 ```
 
-`alfred run` / `decide` 的续跑模型：state.json 存状态机（`GovernanceRun`），
-`decide` 是 signal 不是终点——`Escalated + retry` 重入执行循环、`PlanRejected + retry`
-以伪装消息重规划、`revise` 以属主新需求重规划、任一 + `abandon` 终止。
+`run` / `feed` 的续跑模型：state.json 存状态机（`GovernanceRun`），`feed` 是 signal
+不是终点——`Escalated + retry` 重入执行循环、`PlanRejected + retry` 以伪装消息
+重规划、`revise` 以属主新需求重规划、任一 + `abandon` 终止。
 
 ---
 
@@ -149,9 +157,9 @@ Planning → PlanReviewing → Executing → ExecReviewing
 | 脚本 | 覆盖 | 模式 |
 |---|---|---|
 | `r1.sh` | 执行侧：容器内 pi 产出 hello.txt 落宿主 + driver.done.json/stdout/stderr 证据归档 | 真容器真 LLM |
-| `r2.sh` | 审查侧四用例：执行审查 C / 部分兑现 P / 注定不忠实计划打回 / 解析失败 unscored | 真 LLM + 离线注入 |
-| `r3.sh` | 治理环闭环四用例：正路径全环 / 机械升级闭环（decide retry 续跑）/ 打回伪装闭环 / 多轮会话文档 | 真 LLM + 离线注入 |
-| `r4.sh` | 决策面板 RPC 两用例：escalated→panel abandon→Abandoned / plan_rejected→panel retry→真重跑→Completed | 离线注入（面板属主会话真 LLM） |
+| `r2.sh` | 审查侧两用例：执行审查 C / 部分兑现 P（独立 plan-review 两用例已归档，等价覆盖见 r3 case3 / r6b caseA） | 真 LLM + 离线注入 |
+| `r3.sh` | 治理环闭环：正路径全环 / 机械升级闭环（case2b 归档）/ 打回伪装闭环（feed retry）/ 多轮会话文档（feed revise） | 真 LLM + 离线注入 |
+| `r4.sh` | 属主决策 feed 续跑两用例：escalated→feed abandon→Abandoned / plan_rejected→feed retry→重规划→Escalated（决策面板 RPC 已删归档） | 离线注入 |
 | `escape.sh` | 越界写边界两向验证：容器内 /tmp 写不落宿主 + 工作区写穿透宿主（纯 docker，无 LLM） | 纯容器边界 |
 | `agt/agt-policy.test.mjs` | AGT 策略求值原型确定性测试（29 断言） | 无 LLM 无容器 |
 | `agt/demo.sh` | AGT 实机演示：沙箱容器内 pi + 策略扩展拦截 `rm -rf`（审计 deny+allow） | 真容器真 LLM（可选演示） |
@@ -163,9 +171,9 @@ bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → escape → agt，全�
 ```
 
 skeleton.sh 头部注释如实说明两种模式：真容器真 LLM（r1 / r2 case1·1b / r3 case1 /
-escape）覆盖"真实执行与审查"；离线注入（r2 case2·3 / r3 case2·3·4 / r4 case1·2，
+escape）覆盖"真实执行与审查"；离线注入（r3 case2·3·4 / r4 case1·2，
 `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE`）覆盖"确定性状态机路径"（机械升级、
-伪装打回、决策面板），绕过 planner LLM 保证确定性；agt 为无 LLM 确定性原型测试。
+伪装打回、feed 属主决策），绕过 planner LLM 保证确定性；agt 为无 LLM 确定性原型测试。
 每步日志落 `tests/e2e/.runs/skeleton-<ts>/<step>.log`。
 
 ---
@@ -210,6 +218,5 @@ tests/
 - 治理文档（治理架构 / 业务架构 / 技术架构 / 限界上下文 / SKELETON 施工清单）在
   仓库外本地磁盘（`the-path-of-least-resistance/alfred-research/docs`），不进版本历史
 
-> 阶段状态：R1（执行侧）→ R2（审查侧）→ R3（治理环闭环）→ R4（决策面板 RPC +
-> codux 界面集成）→ R5（AGT 评估 + 全链 e2e + 越界写 + 文档同步）。当前实现状态以
+> 阶段状态：R1（执行侧）→ R2（审查侧）→ R3（治理环闭环）→ R4（属主决策会话 + codux 界面集成）→ R5（AGT 评估 + 全链 e2e + 越界写 + 文档同步）。当前实现状态以
 > `.plans/R5交付.md` 为准（验收文档不追认代码）。

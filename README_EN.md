@@ -35,8 +35,9 @@ documentation sync).
 
 ```
 Owner (human)
-  └─ alfred CLI (Rust; the orchestrator state machine lives in alfred-core,
-                 called in-process)
+  └─ alfred library (Rust; governance driver alfred-cli::governance, owner
+       interaction goes through the codux terminal → feed_owner_message; the
+       orchestrator state machine lives in alfred-core, called in-process)
        ├─ planner: in-container pi conversation agent (converse graph-building /
        │            maintain session-doc), calls the model through the bridge
        │            (container offline + host relays) → output → DagSpec
@@ -54,8 +55,6 @@ Owner (human)
        │            container (driver.py drives in-container pi to judge DagSpec
        │            fidelity vs OwnerRequest / artifact vs acceptance) →
        │            verdict.json
-       ├─ decision panel: pi --mode rpc session (extension_ui_request/response
-       │                  decision cards)
        └─ persistence: run-<id>/{state.json, audit.jsonl, llm-calls/, exec-N/}
                        (driver.done.json + driver.stdout/stderr.log under exec-N/
                        are the driver evidence, replacing the old evals/)
@@ -69,7 +68,7 @@ Owner (human)
 | `alfred-planner` | Planner (converse graph-building / maintain session-doc / disguise rejection); in-container pi conversation agent (bridge-relayed LLM) with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
 | `alfred-executor` | Execution side: generates the Inspect container-management driver (`driver.py`, not an eval Task), the sandbox compose, spawn/poll the driver (done record), artifact collection, config loading |
 | `alfred-reviewer` | Review side: plan/exec review both run in a dedicated reviewer container (driver.py in-container pi, judging fidelity → PlanVerdict / acceptance → ExecVerdict) |
-| `alfred-cli` | CLI: `run` / `plan-review` / `decide` / `panel` / `status` |
+| `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal); test-only library driver example `examples/driver.rs` (run/feed/status, e2e black-box runs the governance loop) |
 
 ---
 
@@ -110,34 +109,45 @@ Environment overrides:
 
 ---
 
-## Commands
+## Library API and library driver (owner interaction goes through the codux
+## terminal, not a CLI)
+
+After removing the CLI, alfred exposes library APIs only:
+
+- `governance::run_governance_loop(&mut GovernanceRun, &GovernanceContext)`:
+  initialize / advance the governance loop from the current state until a
+  suspended state (PlanRejected / Escalated) or a terminal state
+  (Completed / Abandoned).
+- `governance::feed_owner_message(&mut run, &ctx, message, decision)`:
+  owner-decision entry (called by the codux terminal): sets the owner message
+  (revise replans / resumes dialogue from Planning), maintain② persists key
+  conclusions, appends conversation.json, routes by suspended state and
+  resumes the loop, returning the new state for the caller to display.
+  `decision` ∈ retry | revise | abandon (message optional for retry/abandon).
+
+Test-only library driver example `crates/alfred-cli/examples/driver.rs`
+(e2e black-box runs the governance loop):
 
 ```bash
 # Run the governance loop (request → plan → plan review → execute →
 #                            exec review → tiered routing → suspended/terminal)
-alfred run --request <req.json> [--run-dir <dir>] [--time-limit 600]
-           [--review-time-limit 300] [--image alfred-executor:latest]
+cargo run --quiet -p alfred-cli --example driver -- run \
+  --request <req.json> [--run-dir <dir>] [--time-limit 600] [--review-time-limit 300] \
+  [--image alfred-executor:latest]
 
-# Plan review: judge whether a DagSpec is faithful to the OwnerRequest
-# (reviewer container, PlanVerdict persisted)
-alfred plan-review --request <req.json> --dagspec <dag.json> --run-dir <dir>
-
-# Owner decision (retry / revise / abandon); resumes from the suspended state
-alfred decide --run-dir <dir> --decision retry|revise|abandon [--message <file>]
-
-# Decision panel RPC: the owner-session pi presents a 3-option decision card
-# (重跑/改契约/放弃) → pick in the terminal → decide resumes the loop
-alfred panel --run-dir <dir> [--timeout 300] [--panel-model <id>] [--no-decide]
+# Feed an owner decision (retry / revise / abandon); resumes from the suspended state
+cargo run --quiet -p alfred-cli --example driver -- feed \
+  --run-dir <dir> --decision retry|revise|abandon [--message <text|file>]
 
 # Read-only governance status
-alfred status --run-dir <dir>
+cargo run --quiet -p alfred-cli --example driver -- status --run-dir <dir>
 ```
 
-`alfred run` / `decide` share a resumable model: `state.json` stores the state
-machine (`GovernanceRun`), and `decide` is a signal, not a terminal point —
-`Escalated + retry` re-enters execution, `PlanRejected + retry` replans with a
-disguised message, `revise` replans with the owner's new requirement, and any
-decision + `abandon` terminates.
+`run` / `feed` share a resumable model: `state.json` stores the state machine
+(`GovernanceRun`), and `feed` is a signal, not a terminal point — `Escalated +
+retry` re-enters execution, `PlanRejected + retry` replans with a disguised
+message, `revise` replans with the owner's new requirement, and any decision +
+`abandon` terminates.
 
 ---
 
@@ -180,9 +190,9 @@ Tiered routing (§3.3, all six rows in code):
 | script | coverage | mode |
 |---|---|---|
 | `r1.sh` | execution side: in-container pi produces hello.txt on host + driver.done.json/stdout/stderr evidence archive | real container + real LLM |
-| `r2.sh` | review side, four cases: exec review C / partial P / unfaithful plan bounced / parse-failure unscored | real LLM + offline injection |
-| `r3.sh` | governance loop, four cases: happy path full loop / mechanical-escalation loop (decide retry) / disguised-rejection loop / multi-turn session doc | real LLM + offline injection |
-| `r4.sh` | decision-panel RPC, two cases: escalated→panel abandon→Abandoned / plan_rejected→panel retry→real rerun→Completed | offline injection (panel owner session is a real LLM) |
+| `r2.sh` | review side, two cases: exec review C / partial P (the two standalone plan-review cases are archived; equivalent coverage in r3 case3 / r6b caseA) | real LLM + offline injection |
+| `r3.sh` | governance loop: happy path full loop / mechanical-escalation loop (case2b archived) / disguised-rejection loop (feed retry) / multi-turn session doc (feed revise) | real LLM + offline injection |
+| `r4.sh` | owner-decision feed resume, two cases: escalated→feed abandon→Abandoned / plan_rejected→feed retry→replan→Escalated (decision-panel RPC archived) | offline injection |
 | `escape.sh` | out-of-workspace-write boundary, two-way: in-container /tmp write does not land on host + workspace write lands on host (pure docker, no LLM) | pure container boundary |
 | `agt/agt-policy.test.mjs` | AGT policy-eval prototype, deterministic (29 assertions) | no LLM, no container |
 | `agt/demo.sh` | AGT live demo: in-sandbox pi + policy extension blocks `rm -rf` (audit deny+allow) | real container + real LLM (optional demo) |
@@ -195,9 +205,9 @@ bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → escape → agt; green
 
 The `skeleton.sh` header documents both modes honestly: real-container/real-LLM
 (r1 / r2 case1·1b / r3 case1 / escape) covers real execution and review;
-offline injection (r2 case2·3 / r3 case2·3·4 / r4 case1·2,
+offline injection (r3 case2·3·4 / r4 case1·2,
 `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE`) covers deterministic state-machine
-paths (mechanical escalation, disguised rejection, decision panel) by bypassing
+paths (mechanical escalation, disguised rejection, owner decisions via feed) by bypassing
 the planner LLM; `agt` is a no-LLM deterministic prototype test. Per-step logs
 land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 
@@ -248,7 +258,7 @@ tests/
   (`the-path-of-least-resistance/alfred-research/docs`), not in version history
 
 > Phase status: R1 (execution) → R2 (review) → R3 (governance loop) → R4
-> (decision-panel RPC + codux integration) → R5 (AGT evaluation + full-chain e2e
+> (owner-decision session + codux integration) → R5 (AGT evaluation + full-chain e2e
 > + out-of-workspace write + docs sync). Current implementation status is
 > authoritative in `.plans/R5交付.md` (acceptance docs do not retroactively bless
 > code).
