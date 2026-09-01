@@ -11,8 +11,8 @@
 //! 隔离（§2.2/P7）：`review_summary` 必须是**中性转写**（属主口吻、无结构化
 //! 否决信号），不能出现"你的计划被否决了"这类标签——由本模块的中和逻辑保证。
 //!
-//! 两种模式：`ALFRED_OFFLINE=1` 走确定性更新（e2e 可控）；否则走真 LLM
-//! 重写（维护者也是大模型）。
+//! 两种模式：`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1` 走确定性更新
+//! （e2e 可控）；否则走真 LLM 重写（维护者也是大模型）。
 
 
 use alfred_core::dagspec::DagSpec;
@@ -61,7 +61,9 @@ pub fn maintain(
     doc: &SessionDoc,
     trigger: MaintainTrigger,
 ) -> Result<SessionDoc> {
-    if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1") {
+    if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
+        || std::env::var("ALFRED_PLANNER_OFFLINE").as_deref() == Ok("1")
+    {
         // 离线模式保留：不经容器（现状直通）。
         Ok(maintain_offline(doc, trigger))
     } else {

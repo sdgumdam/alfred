@@ -589,8 +589,8 @@ fn execution_step(
 /// 执行审查由 `execute_exec_review`（alfred-reviewer）在独立 reviewer 容器内
 /// 判产物 vs 验收标准——容器挂 **ws 全量 ro**（执行者产物 run/ws，git 基线），
 /// 审查者自己读 ws 全量（含超过旧 scorer 4000B/文件截断的内容）。
-/// 离线回退（ALFRED_OFFLINE=1）：不跑容器（无 docker）——执行容器无审查
-/// 结论 → 升级属主（§六继承项，不悄悄放行）。
+/// 离线回退（ALFRED_OFFLINE=1 或 ALFRED_EXEC_REVIEW_OFFLINE=1）：不跑容器
+/// （无 docker）——执行容器无审查结论 → 升级属主（§六继承项，不悄悄放行）。
 fn exec_review_step(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
@@ -601,12 +601,13 @@ fn exec_review_step(
     pending
         .take()
         .context("governance state ExecReviewing without execution outcome")?;
-    let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1");
+    let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
+        || std::env::var("ALFRED_EXEC_REVIEW_OFFLINE").as_deref() == Ok("1");
 
     let (verdict, unscored_reason) = if offline {
         (
             None,
-            "offline: 执行审查容器跳过（ALFRED_OFFLINE=1，执行 eval 无内嵌 scorer）"
+            "offline: 执行审查容器跳过（ALFRED_OFFLINE/ALFRED_EXEC_REVIEW_OFFLINE=1，执行 eval 无内嵌 scorer）"
                 .to_string(),
         )
     } else {

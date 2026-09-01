@@ -13,8 +13,8 @@
 //!   按两分支规则产 /outputs/instructions.json 或 /outputs/reply.txt），宿主按
 //!   产出文件分派两分支 → GraphBuilder → DagSpec 或答复；每次调用落盘
 //!   llm-calls/（P9 证据）。
-//! - 离线（`ALFRED_OFFLINE=1`）：确定性直通，两分支由注入文件二选一——
-//!   `ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json>` → 建图指令分支；
+//! - 离线（`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1`）：确定性直通，
+//!   两分支由注入文件二选一——`ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json>` → 建图指令分支；
 //!   `ALFRED_OFFLINE_REPLY_FILE=<reply.txt>` → 答复分支；仍把 would-be 请求
 //!   落盘 llm-calls/（e2e 从记录断言会话文档/伪装消息）。
 
@@ -149,7 +149,9 @@ pub fn converse(
 ) -> Result<ConverseOutcome> {
     let messages = build_messages(request, doc, owner_message, &opts.append_system_prompt);
     let (outcome, response, offline, transport) =
-        if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1") {
+        if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
+            || std::env::var("ALFRED_PLANNER_OFFLINE").as_deref() == Ok("1")
+        {
             // 离线模式保留：不经容器（现状直通）；两分支由注入文件二选一。
             let (outcome, response) = converse_offline(request)?;
             (outcome, response, true, "offline")
@@ -268,7 +270,7 @@ fn validate_dagspec(dagspec: &DagSpec, request: &OwnerRequest) -> Result<()> {
     Ok(())
 }
 
-/// 离线确定性直通（`ALFRED_OFFLINE=1`）：§2.4 两分支由注入文件二选一。
+/// 离线确定性直通（`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1`）：§2.4 两分支由注入文件二选一。
 ///
 /// - `ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json>` → 建图指令分支（validate → DagSpec）。
 /// - `ALFRED_OFFLINE_REPLY_FILE=<reply.txt>` → 答复分支（纯文本）。
@@ -309,7 +311,7 @@ fn converse_offline(request: &OwnerRequest) -> Result<(ConverseOutcome, String)>
             ))
         }
         (None, None) => bail!(
-            "ALFRED_OFFLINE=1 requires ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json> or ALFRED_OFFLINE_REPLY_FILE=<reply.txt>"
+            "ALFRED_OFFLINE/ALFRED_PLANNER_OFFLINE=1 requires ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json> or ALFRED_OFFLINE_REPLY_FILE=<reply.txt>"
         ),
     }
 }
