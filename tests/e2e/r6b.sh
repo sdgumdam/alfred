@@ -402,7 +402,130 @@ assert sources == ["request.submit", "converse.reply", "owner.message", "convers
 # caseC 的 owner.message 仅一轮（无新增属主消息轮）
 assert sum(1 for s in sources if s == "owner.message") == 1, f"sources={sources}"
 PY
-  echo "PASS(caseE): Retry 无消息可选（重审同一计划 → 再升级挂起）"
+  # ---- Case F：PlanRejected+Retry 伪装重规划（P3a）+ panel.decision 轮（P3b）----
+  # 离线注入空 workspace_subdirs 计划 → 计划审查结构闸门 pass=false → PlanRejected。
+  # feed retry（无消息）→ disguise_rejection 把审查理由伪装成属主口吻驱动重规划
+  # （owner_message=伪装消息，无结构化否决词）→ 落 owner.message（伪装）+
+  # panel.decision 轮（拍板，§二.8）。
+  CASE_F="$R6B_RUNS/run-r6b-planrejected-retry"
+  rm -rf "$CASE_F"
+  mkdir -p "$CASE_F"
+  cat > "$CASE_F/request.json" <<'JSON'
+{
+  "id": "req-r6b-c5",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+  "created_at": "2026-09-01T00:00:00Z"
+}
+JSON
+  # 不忠实计划：缺 workspace_subdirs 声明 → 计划审查结构闸门直接打回（pass=false）
+  cat > "$CASE_F/plan-unfaithful.json" <<'JSON'
+{
+  "request_id": "req-r6b-c5",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": []
+      }
+    }
+  ]
+}
+JSON
+  # 重规划用的忠实计划：声明 workspace_subdirs → 结构闸门过 → 离线审查 unscored → 升级
+  cat > "$CASE_F/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r6b-c5",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
+  echo "[r6b] caseF: driver run（离线空 workspace_subdirs → 计划审查结构闸门打回 → PlanRejected） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_F/plan-unfaithful.json" \
+  cargo run --quiet -p alfred-cli --example driver -- run \
+    --request "$CASE_F/request.json" \
+    --run-dir "$CASE_F" \
+    --time-limit 60 \
+    --review-time-limit 60 \
+    --planner-time-limit 60
+
+  python3 - "$CASE_F" <<'PY' || { echo "FAIL(caseF1): PlanRejected 断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+assert state["state_machine"]["state"] == "plan_rejected", \
+    f"state={state['state_machine']['state']}"
+assert state["plan_verdicts"] and state["plan_verdicts"][-1]["pass"] is False, \
+    f"plan_verdicts={state.get('plan_verdicts')}"
+PY
+  echo "PASS(caseF1): 结构闸门打回 → PlanRejected（pass=false verdict）"
+
+  echo "[r6b] caseF: driver feed retry（无消息 → 伪装消息驱动重规划） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_F/plan-faithful.json" \
+  cargo run --quiet -p alfred-cli --example driver -- feed \
+    --run-dir "$CASE_F" \
+    --decision retry
+
+  python3 - "$CASE_F" <<'PY' || { echo "FAIL(caseF2): 伪装重规划断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+# 终态：重规划（忠实计划）→ 离线审查 unscored → 升级挂起（不悄悄放行）
+assert state["state_machine"]["state"] in ("escalated", "plan_rejected"), \
+    f"state={state['state_machine']['state']}"
+# P3a：owner_message = 伪装消息（属主口吻，无结构化否决信号）
+msg = state.get("owner_message") or ""
+assert msg, "owner_message (disguised) missing"
+forbidden = ["reject", "rejected", "rejection", "rejects", "verdict", "reviewer", "review",
+             "reviews", "reviewed", "scorer", "scored", "score", "grader", "graded",
+             "eval", "evaluated", "evaluation", "unscored",
+             "审查", "审查者", "评审", "评审者", "评分", "评估", "打分", "否决", "打回", "判定"]
+low = msg.lower()
+hits = [f for f in forbidden if f in low]
+assert not hits, f"disguise leaked forbidden signal(s) {hits}: {msg}"
+assert "重新" in msg and "需求" in msg, f"disguise missing owner tone: {msg}"
+# P3a：conversation.json owner.message 轮 = 伪装消息；P3b：panel.decision 轮 = 拍板
+conv = json.load(open(os.path.join(run, "conversation.json")))
+sources = [t["source"] for t in conv["turns"]]
+assert "owner.message" in sources, f"sources={sources}"
+assert "panel.decision" in sources, f"sources={sources}"
+owner_turns = [t for t in conv["turns"] if t["source"] == "owner.message"]
+assert owner_turns and owner_turns[-1]["content"] == msg, \
+    f"owner.message content != disguise: {owner_turns[-1]['content'] if owner_turns else None}"
+dec_turns = [t for t in conv["turns"] if t["source"] == "panel.decision"]
+assert dec_turns and dec_turns[-1]["content"] == "重跑（retry）", \
+    f"panel.decision={[t['content'] for t in dec_turns]}"
+PY
+  echo "PASS(caseF): PlanRejected+Retry 伪装重规划（无否决词）+ panel.decision 轮"
+
+  unset ALFRED_CONFIG
 
   unset ALFRED_CONFIG
 

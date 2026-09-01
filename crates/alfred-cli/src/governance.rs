@@ -20,6 +20,7 @@ use alfred_core::util::now_rfc3339;
 use alfred_executor::config::ExecutorModel;
 use alfred_executor::run::{execute_run, RunOptions};
 use alfred_planner::converse::{converse, ConverseOptions, ConverseOutcome};
+use alfred_planner::disguise::disguise_rejection;
 use alfred_planner::maintain::{maintain, MaintainOptions, MaintainTrigger};
 use alfred_reviewer::exec_review::{execute_exec_review, ExecReviewOptions};
 use alfred_reviewer::plan_review::{execute_plan_review, PlanReviewOptions};
@@ -131,14 +132,19 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
 /// 2. 有消息 → `run.owner_message = message`（下一轮 `planning_step` converse 读它）、
 ///    maintain②（`OwnerMessage` → `key_conclusions`，把属主消息固化为关键结论）、
 ///    落 conversation.json（`ConversationSource::OwnerMessage`，属主轮次）。
-///    Retry 消息可选（重跑不必然带新指令）；Revise 需非空消息（喂 planner 新指令）。
+///    **P3a**：`PlanRejected+Retry` 打回信号伪装（属主 08-18「肯定要做润色伪装」）——
+///    `disguise_rejection` 把审查者拒绝理由转写为属主口吻消息，伪装即本轮属主消息
+///    驱动重规划（不依赖属主另附消息）。
 /// 3. 挂起态路由 + 续跑 `run_governance_loop`：
 ///    - Planning（converse 答复分支停驻）→ 无状态转移，直接续跑（对话继续）；
 ///    - PlanRejected/Escalated → 按 `OwnerDecision` 路由：Revise → `OwnerRevise`
 ///      （回 Planning 重新规划，喂 owner_message 续 converse）；Retry →
 ///      `OwnerRetry`（按升级来源路由：重入执行/重审同一计划/重新规划）；
 ///      Abandon → `OwnerAbandon`（终态，不续跑）。
-/// 4. 返回新状态给调用方（planner 答复在 conversation.json 的 converse.reply 轮）。
+/// 4. **P3b**：升级拍板（`decision != Revise`，即 Retry/Abandon）→ 补落
+///    `panel.decision` 轮（§二.8：升级拍板时的属主决策；reviewer 挂载对话记录
+///    区分拍板与普通对话消息）。
+/// 5. 返回新状态给调用方（planner 答复在 conversation.json 的 converse.reply 轮）。
 pub fn feed_owner_message(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
@@ -166,6 +172,17 @@ pub fn feed_owner_message(
     // decision=Abandon 直接 apply(OwnerAbandon) 进终态，不触碰 planner（run 已坏也
     // 能弃）。Planning 态无 (Planning, OwnerAbandon) 转移会在这里显式报错。
     if decision == OwnerDecision::Abandon {
+        // P3b：升级拍板（abandon）→ 补落 panel.decision 轮（§二.8：升级拍板时的
+        // 属主决策；reviewer 挂载对话记录可见拍板）。不触碰 planner（P2b）。
+        append_to_disk(
+            &ctx.run_dir,
+            &run.run_id,
+            ConversationRole::Owner,
+            panel_decision_text(decision),
+            ConversationSource::PanelDecision,
+        )
+        .map_err(anyhow::Error::msg)
+        .context("append panel.decision to conversation.json")?;
         audit(
             &ctx.run_dir,
             "feed_owner_message",
@@ -190,8 +207,29 @@ pub fn feed_owner_message(
         bail!("feed_owner_message: revise 决策需要非空属主消息");
     }
 
+    // P3a：PlanRejected+Retry 打回信号伪装（属主 08-18「肯定要做润色伪装」）——
+    // 用 disguise_rejection 把审查者拒绝理由转写为属主口吻消息驱动重规划（旧
+    // decide retry 语义：伪装即本轮属主消息，不依赖属主另附消息）。其余决策用
+    // 属主原话。
+    let driving_message: String = if state == GovernanceState::PlanRejected
+        && decision == OwnerDecision::Retry
+    {
+        let dagspec = run
+            .dagspec
+            .clone()
+            .context("no dagspec in PlanRejected")?;
+        let reason = run
+            .plan_verdicts
+            .last()
+            .map(|v| v.reason.clone())
+            .unwrap_or_default();
+        disguise_rejection(&run.request, &dagspec, &reason).map_err(anyhow::Error::msg)?
+    } else {
+        message.to_string()
+    };
+
     // 有消息 → maintain② + 设 owner_message + 落对话轮；无消息（Retry）→ 跳过消息轮。
-    if !message.is_empty() {
+    if !driving_message.is_empty() {
         // 1. maintain②：属主消息固化为关键结论（先 maintain——喂旧 doc，得新 doc）。
         run.session_doc = maintain(
             &MaintainOptions {
@@ -204,23 +242,37 @@ pub fn feed_owner_message(
             },
             &run.session_doc,
             MaintainTrigger::OwnerMessage {
-                message: message.to_string(),
+                message: driving_message.clone(),
             },
         )?;
 
         // 2. 设置 owner_message（planning_step 下一轮 converse 读它；重规划/改需求语义）。
-        run.owner_message = Some(message.to_string());
+        run.owner_message = Some(driving_message.clone());
 
         // 3. 落 conversation.json（属主轮次，reviewer 挂载输入数据源，§二.8）。
         append_to_disk(
             &ctx.run_dir,
             &run.run_id,
             ConversationRole::Owner,
-            message.to_string(),
+            driving_message.clone(),
             ConversationSource::OwnerMessage,
         )
         .map_err(anyhow::Error::msg)
         .context("append owner.message to conversation.json")?;
+    }
+
+    // P3b：升级拍板（decision != Revise → Retry）→ 补落 panel.decision 轮
+    // （§二.8：升级拍板时的属主决策；reviewer 挂载对话记录区分拍板与普通消息）。
+    if decision != OwnerDecision::Revise {
+        append_to_disk(
+            &ctx.run_dir,
+            &run.run_id,
+            ConversationRole::Owner,
+            panel_decision_text(decision),
+            ConversationSource::PanelDecision,
+        )
+        .map_err(anyhow::Error::msg)
+        .context("append panel.decision to conversation.json")?;
     }
 
     audit(
@@ -229,7 +281,8 @@ pub fn feed_owner_message(
         &serde_json::json!({
             "decision": format!("{decision:?}"),
             "from_state": state_label(state),
-            "message": message,
+            "message": driving_message,
+            "disguised": state == GovernanceState::PlanRejected && decision == OwnerDecision::Retry,
         }),
     )?;
 
@@ -716,6 +769,15 @@ pub fn state_label(s: alfred_core::governance::GovernanceState) -> &'static str 
         Completed => "completed",
         Escalated => "escalated",
         Abandoned => "abandoned",
+    }
+}
+
+/// 属主决策的对话记录标签（conversation.json panel.decision 轮 content，§二.8）。
+fn panel_decision_text(d: OwnerDecision) -> &'static str {
+    match d {
+        OwnerDecision::Retry => "重跑（retry）",
+        OwnerDecision::Revise => "改需求重新规划（revise）",
+        OwnerDecision::Abandon => "放弃（abandon）",
     }
 }
 
