@@ -234,13 +234,17 @@ TXT
 可以，技术选型用 Rust。
 TXT
   echo "[r6b] caseC: driver run（离线 Reply 分支 → state=Planning，对话继续） ..."
+  # P2-2：规划器答复必须 surface 到终端（owner 直读，不再只落 conversation.json）。
+  RUN_OUT="$CASE_C/run-output.txt"
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_C/reply.txt" \
   cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_C/request.json" \
     --run-dir "$CASE_C" \
     --time-limit 60 \
     --review-time-limit 60 \
-    --planner-time-limit 60
+    --planner-time-limit 60 > "$RUN_OUT" 2>&1
+  grep -q "收到需求。技术选型确认一下" "$RUN_OUT" \
+    || { echo "FAIL(caseC1): 规划器答复未打印到终端（run-output.txt）" >&2; exit 1; }
 
   python3 - "$CASE_C" <<'PY' || { echo "FAIL(caseC): Reply 分支产物断言" >&2; exit 1; }
 import json, os, sys
