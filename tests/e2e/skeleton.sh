@@ -3,30 +3,33 @@
 # alfred 全链 e2e 汇总入口（R5 收尾，S3）
 #
 # 依次运行：
-#   r1（执行侧）→ r2（审查侧四用例）→ r3（治理环闭环四用例）→
-#   r4（决策面板 RPC 两用例）→ escape（越界写边界）→ agt（AGT 策略原型确定性）
+#   r1（执行侧）→ r2（审查侧）→ r3（治理环闭环）→
+#   r4（属主决策 feed 续跑两用例）→ escape（越界写边界）→ agt（AGT 策略原型确定性）
 # 全部 PASS 才算过；任一失败打印汇总报告并以非零退出（全绿才算过）。
 #
 # 两种模式（各脚本头部亦有说明）：
 #
 #   1) 真容器真 LLM（需 docker 沙箱镜像 alfred-executor:latest + 
 #      ~/.config/alfred/config.yml 模型凭据；容器 network none + 只挂 workspace）：
+#        - r1         : 执行侧（容器内 pi 产出 hello.txt 落宿主 + driver 证据归档）
 #        - r2 case1/1b: 执行审查（reviewer 容器判 C / 离线回退升级挂起）
-#        - r3 case1  : 正路径全环（真规划 → 计划审查 → 真容器执行 → 验收 C → Completed）
-#        - r2 case1/1b: 执行审查（scorer 判 C / P 部分兑现）
-#        - r3 case1  : 正路径全环（真规划 → 计划审查 → 真容器执行 → 验收 C → Completed）
-#        - escape    : 纯容器边界两向验证（无 LLM）
+#        - r3 case1   : 正路径全环（真规划 → 计划审查 → 真容器执行 → 验收 C → Completed）
+#        - escape     : 纯容器边界两向验证（无 LLM）
 #
 #   2) 离线注入（ALFRED_OFFLINE=1 + ALFRED_OFFLINE_PLAN_FILE 确定性直通，
 #      绕过 planner LLM；计划/执行审查仍走真 LLM）：
-#        - r2 case2/3 : 计划审查（注定不忠实打回 / 解析失败 unscored）
 #        - r3 case2/3/4: 机械升级闭环 / 打回伪装闭环 / 多轮会话文档
-#        - r4 case1/2 : 决策面板（escalated→abandon / plan_rejected→retry→重规划→执行审查离线回退→Escalated）
+#        - r4 case1/2 : 属主决策 feed 续跑（escalated→abandon /
+#                       plan_rejected→retry→重规划→执行审查离线回退→Escalated）
 #
 #   3) 确定性（无 LLM、无容器）：
 #        - agt : AGT 策略求值原型（node 直测 policy 语义；agt/demo.sh 实机
 #                容器拦截演示是 LLM 依赖的可选演示，不在此链内）
 #
+# 驱动：alfred CLI 已删（08-31），e2e 经库驱动示例 `examples/driver.rs`
+#   （`cargo run --example driver -- run|feed`）。r2 独立 plan-review 两用例、
+#   r3 case2b（decide retry --time-limit 覆盖）、r6c tier1b/tier3a 已归档
+#   （独立 plan-review/exec-review/panel CLI 已删；等价覆盖在治理环路径）。
 # 每步日志落 tests/e2e/.runs/skeleton-<ts>/<step>.log。
 # ============================================================================
 set -euo pipefail

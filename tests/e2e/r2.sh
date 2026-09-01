@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================================
-#   1. 执行审查正路径：alfred run（pi 真容器 + reviewer 容器判 C）
-#   1b. 执行审查离线回退：alfred run（ALFRED_OFFLINE=1 → 执行审查不跑容器、
+#   1. 执行审查正路径：driver run（pi 真容器 + reviewer 容器判 C）
+#   1b. 执行审查离线回退：driver run（ALFRED_OFFLINE=1 → 执行审查不跑容器、
 #       无 verdict → §3.3 升级挂起 escalated；部分兑现 P 档由 reviewer 容器在线判）
-#   2. 注定不忠实计划：alfred plan-review（需求 A 计划做 B → pass=false 打回）
-#   3. 解析失败 → unscored：alfred plan-review（reviewer=mockllm → 解析失败）
+#   2. 注定不忠实计划：已归档（独立 alfred plan-review CLI 已删；等价覆盖见 r3 case3）
+#   3. 解析失败 → unscored：已归档（独立 alfred plan-review CLI 已删；等价覆盖见
+#      r6b caseA / r6c tier1c）
 #
 # 模型：默认 glm-4.7（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
 # ALFRED_CONFIG 提供）。可用 ALFRED_EXECUTOR_MODEL / ALFRED_REVIEWER_MODEL
 # 覆盖（config 缺失的模型 id 会沿用基础角色 provider——见 config.rs）。
-# R3 起 `alfred run` 是完整治理环：case1/1b 断言读治理环 state.json
+# R3 起 `driver run` 是完整治理环：case1/1b 断言读治理环 state.json
 # （state_machine/exec_verdicts），执行产物在 exec-N/workspace/。
-# 验收：cargo test 全绿 + 本脚本四用例 PASS。
+# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r2 以
+#   `cargo run --example driver -- run` 驱动治理环）。非 CLI 子命令。
+# 验收：cargo test 全绿 + 本脚本两用例 PASS + 两用例归档 SKIP。
 # ============================================================================
 set -euo pipefail
 
@@ -112,8 +115,8 @@ cat > "$CASE1_DIR/request.json" <<'JSON'
   "created_at": "2026-08-26T00:00:00Z"
 }
 JSON
-echo "[r2] case1: alfred run (exec review, scorer 判 C) ..."
-cargo run --quiet -p alfred-cli -- run \
+echo "[r2] case1: driver run (exec review, scorer 判 C) ..."
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
   --time-limit "${R2_TIME_LIMIT:-900}" \
@@ -181,9 +184,9 @@ cat > "$CASE1B_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r2] case1b: alfred run (offline 忠实计划 → 执行部分兑现 → 执行审查离线回退 → §3.3 升级挂起) ..."
+echo "[r2] case1b: driver run (offline 忠实计划 → 执行部分兑现 → 执行审查离线回退 → §3.3 升级挂起) ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1B_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli -- run \
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE1B_DIR/request.json" \
   --run-dir "$CASE1B_DIR" \
   --time-limit "${R2_TIME_LIMIT:-900}" \
@@ -204,90 +207,27 @@ PY
 echo "PASS(case1b): 离线执行审查无 verdict → 升级挂起 escalated（R6d 语义）"
 
 # ============================================================================
-# Case 2：注定不忠实计划（需求 A 计划做 B → pass=false 打回）
+# Case 2：注定不忠实计划（需求 A 计划做 B → pass=false 打回）——已归档
+#   独立 `alfred plan-review` 子命令已删（08-31 删 CLI 六命令），driver 只提供
+#   run/feed/status，无独立 plan-review 入口。等价覆盖在治理环路径：
+#   r3 case3（离线注入不忠实计划 → 计划审查打回 → PlanRejected）。
 # ============================================================================
-CASE2_DIR="$R2_RUNS/run-r2-plan-fail"
-rm -rf "$CASE2_DIR"
-mkdir -p "$CASE2_DIR"
-cat > "$CASE2_DIR/request.json" <<'JSON'
-{
-  "id": "req-r2-plan",
-  "title": "create hello.txt",
-  "description": "Create a file named hello.txt with content Hello",
-  "acceptance_criteria": "hello.txt exists with content Hello",
-  "created_at": "2026-08-26T00:00:00Z"
-}
-JSON
-# 计划做的是 world.txt —— 与需求 A 不符（注定不忠实）
-cat > "$CASE2_DIR/dagspec.json" <<'JSON'
-{
-  "request_id": "req-r2-plan",
-  "nodes": [
-    {
-      "id": "task-1",
-      "summary": "create world.txt with content World",
-      "contract": {
-        "prompt": "Create a file named world.txt with content World",
-        "acceptance_criteria": "world.txt exists with content World",
-        "reviewer_models": []
-      },
-      "sandbox": {
-        "volumes": [],
-        "runtime": null,
-        "packages": [],
-        "network": false,
-        "workspace_subdirs": ["src"]
-      }
-    }
-  ]
-}
-JSON
-echo "[r2] case2: alfred plan-review (注定不忠实 → pass=false) ..."
-cargo run --quiet -p alfred-cli -- plan-review \
-  --request "$CASE2_DIR/request.json" \
-  --dagspec "$CASE2_DIR/dagspec.json" \
-  --run-dir "$CASE2_DIR" \
-  --time-limit "${R2_REVIEW_TIME_LIMIT:-300}"
-
-python3 - "$CASE2_DIR/verdict.json" <<'PY' || { echo "FAIL(case2): plan verdict not pass=false" >&2; exit 1; }
-import json, sys
-v = json.load(open(sys.argv[1]))
-vd = v["verdict"]
-assert vd is not None, f"verdict is None (unscored={v.get('unscored_reason')})"
-assert vd["pass"] is False, f"expected pass=false, got {vd}"
-assert vd["reason"], "reason must be non-empty"
-PY
-echo "PASS(case2): 注定不忠实计划被打回 (pass=false)"
+echo "[r2] case2: 归档 SKIP（独立 plan-review CLI 已删；等价覆盖见 r3 case3）"
 
 # ============================================================================
-# Case 3：解析失败 → unscored（reviewer=mockllm，返回非 JSON → 解析失败）
+# Case 3：解析失败 → unscored（reviewer=mockllm，返回非 JSON → 解析失败）——已归档
+#   同 case2：独立 `alfred plan-review` CLI 已删。等价覆盖在治理环路径：
+#   r6b caseA / r6c tier1c（ALFRED_OFFLINE=1 + mockllm → 计划审查 unscored →
+#   escalated；r6c 另断言 plan-review/verdict.json 的 unscored_reason）。
 # ============================================================================
-CASE3_DIR="$R2_RUNS/run-r2-plan-unscored"
-rm -rf "$CASE3_DIR"
-mkdir -p "$CASE3_DIR"
-cp "$CASE2_DIR/request.json" "$CASE3_DIR/request.json"
-cp "$CASE2_DIR/dagspec.json" "$CASE3_DIR/dagspec.json"
-echo "[r2] case3: alfred plan-review (mockllm → 解析失败 unscored) ..."
-ALFRED_REVIEWER_MODEL="mockllm/model" cargo run --quiet -p alfred-cli -- plan-review \
-  --request "$CASE3_DIR/request.json" \
-  --dagspec "$CASE3_DIR/dagspec.json" \
-  --run-dir "$CASE3_DIR" \
-  --time-limit 120
-
-python3 - "$CASE3_DIR/verdict.json" <<'PY' || { echo "FAIL(case3): expected unscored" >&2; exit 1; }
-import json, sys
-v = json.load(open(sys.argv[1]))
-assert v["verdict"] is None, f"expected unscored, got {v['verdict']}"
-assert v["unscored_reason"] == "plan_verdict_parse_failure", f"unexpected unscored_reason {v.get('unscored_reason')}"
-PY
-echo "PASS(case3): 解析失败 → unscored"
+echo "[r2] case3: 归档 SKIP（独立 plan-review CLI 已删；等价覆盖见 r6b caseA / r6c tier1c）"
 
 echo ""
 echo "============================================="
-echo "R2 e2e 全部通过：四用例真跑 PASS"
+echo "R2 e2e 全部通过：两用例真跑 PASS + 两用例归档 SKIP"
 echo "  case1  执行审查 C  : $CASE1_DIR/state.json"
 echo "  case1b 执行审查 P  : $CASE1B_DIR/state.json"
-echo "  case2  计划打回    : $CASE2_DIR/verdict.json"
-echo "  case3  unscored    : $CASE3_DIR/verdict.json"
+echo "  case2  归档（独立 plan-review CLI 已删，等价覆盖见 r3 case3）"
+echo "  case3  归档（独立 plan-review CLI 已删，等价覆盖见 r6b caseA / r6c tier1c）"
 echo "============================================="
 exit 0

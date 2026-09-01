@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 # ============================================================================
-# R4 e2e：决策面板 RPC 闭环（P4/P5 块A）——真跑
+# R4 e2e：属主决策经库驱动 feed 续跑闭环（决策面板 RPC 已删，owner 交互走 codux
+# 终端 → feed_owner_message）——真跑
 #
-#   1. 升级闭环（escalated → panel → 属主 abandon）：
+#   1. 升级闭环（escalated → feed abandon → Abandoned）：
 #      离线注入忠实计划 + 执行 --time-limit 1 → 机械预算耗尽 → Escalated →
-#      `echo 3 | alfred panel`（属主选 3=放弃）→ extension_ui_request/
-#      extension_ui_response 结构化对 → decide abandon → Abandoned（终态）。
-#   2. 打回续跑闭环（plan_rejected → panel → 属主 retry → 真重跑 → Completed）：
+#      `driver feed --decision abandon`（属主放弃，无消息）→ Abandoned（终态）。
+#   2. 打回续跑闭环（plan_rejected → feed retry → 重规划 → 执行）：
 #      离线注入不忠实计划 → 计划审查打回 → PlanRejected →
-#      `echo 1 | ALFRED_OFFLINE=1 ... alfred panel`（属主选 1=重跑）→
-#      decide retry（离线注入忠实计划）→ 重规划 → 审查过 → 真容器执行 → Completed。
+#      `ALFRED_OFFLINE=1 ... driver feed --decision retry`（离线注入忠实计划）→
+#      重规划 → 审查过 → 执行 → 执行审查离线回退 → Escalated（R6d 不悄悄放行）。
 #
-# 断言（结构化消息流，非 stdout 文本猜测）：panel-session.jsonl 里
-#   - extension_ui_request {method:"select", id, options:3项}
-#   - extension_ui_response {id: 同 id, value ∈ options}
-#   - state.json 推进（abandoned / completed + hello.txt）
+# 断言：state.json 状态推进（abandoned / escalated + 可选 hello.txt）。旧决策面板
+#   RPC（panel-session.jsonl extension_ui_request/response）已随 CLI 删除归档。
 #
-# 模型：面板属主会话 pi 用 ALFRED_PANEL_MODEL（默认 glm-4.7，省钱）。
+# 模型：glm-4.7 省钱（config.yml 或 env 覆盖）。
+# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r4 以
+#   `cargo run --example driver -- run|feed` 驱动治理环——run 初始化+推进；feed 喂
+#   属主决策 → `governance::feed_owner_message`，Abandon/Retry 消息可选）。
 # 验收：cargo test 全绿 + 本脚本两用例 PASS。
 # ============================================================================
 set -euo pipefail
@@ -43,13 +44,6 @@ fi
 export ALFRED_INSPECT="$INSPECT"
 echo "[r4] inspect CLI : $INSPECT"
 
-# --- pi CLI（面板属主会话宿主直连）---
-if ! command -v pi >/dev/null 2>&1; then
-  echo "ERROR: no pi CLI (needed for alfred panel). Install pi-coding-agent." >&2
-  exit 1
-fi
-echo "[r4] pi CLI      : $(command -v pi)"
-
 # --- 沙箱镜像（case 2 执行需要）---
 IMAGE="${ALFRED_IMAGE:-alfred-executor:latest}"
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -62,11 +56,10 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   fi
 fi
 
-# --- 模型（glm-4.7 省钱；面板属主会话单独 ALFRED_PANEL_MODEL）---
+# --- 模型（glm-4.7 省钱）---
 export ALFRED_EXECUTOR_MODEL="${ALFRED_EXECUTOR_MODEL:-glm-5.2}"
 export ALFRED_REVIEWER_MODEL="${ALFRED_REVIEWER_MODEL:-glm-4.7}"
 export ALFRED_PLANNER_MODEL="${ALFRED_PLANNER_MODEL:-glm-4.7}"
-export ALFRED_PANEL_MODEL="${ALFRED_PANEL_MODEL:-glm-4.7}"
 
 # --- cargo build + test ---
 echo "[r4] cargo build ..."
@@ -78,7 +71,6 @@ R4_RUNS="$REPO_ROOT/tests/e2e/.runs"
 mkdir -p "$R4_RUNS"
 EXEC_TL="${R4_EXEC_TIME_LIMIT:-300}"
 REVIEW_TL="${R4_REVIEW_TIME_LIMIT:-300}"
-PANEL_TL="${R4_PANEL_TIME_LIMIT:-180}"
 
 # 通用 Python 断言：读 state.json 的状态
 assert_state() { # <run_dir> <expected_state>
@@ -90,33 +82,8 @@ assert st == sys.argv[2], f"state={st}, expected {sys.argv[2]}"
 PY
 }
 
-# 结构化断言：panel-session.jsonl 里 extension_ui_request(method=select,id,options=3项)
-#                + extension_ui_response(同 id, value ∈ options) + 决策落盘
-assert_panel_session() { # <run_dir> <expected_option>
-  python3 - "$1" "$2" <<'PY' || { echo "FAIL: panel-session structured assertion" >&2; exit 1; }
-import json, sys
-run_dir, expected_option = sys.argv[1], sys.argv[2]
-lines = [json.loads(l) for l in open(run_dir + "/panel-session.jsonl")]
-reqs = [l["msg"] for l in lines
-        if l.get("dir") == "recv" and l.get("msg", {}).get("type") == "extension_ui_request"
-        and l["msg"].get("method") == "select"]
-resps = [l["msg"] for l in lines
-         if l.get("dir") == "send" and l.get("msg", {}).get("type") == "extension_ui_response"]
-assert reqs, f"no extension_ui_request(select) in panel-session.jsonl: {lines}"
-req = reqs[0]
-assert req["method"] == "select", f"method != select: {req}"
-assert req.get("id"), f"missing id: {req}"
-assert set(req["options"]) == {"重跑", "改契约", "放弃"}, f"options != 3项: {req['options']}"
-assert resps, f"no extension_ui_response in panel-session.jsonl: {lines}"
-resp = resps[0]
-assert resp["id"] == req["id"], f"id mismatch: resp {resp['id']} != req {req['id']}"
-assert resp["value"] in req["options"], f"value not in options: {resp['value']}"
-assert resp["value"] == expected_option, f"value {resp['value']} != expected {expected_option}"
-# 决策落盘
-dec = json.load(open(run_dir + "/panel-decision.json"))
-assert dec["option"] == expected_option, f"panel-decision option {dec.get('option')} != {expected_option}"
-PY
-}
+# （决策面板 RPC 已随 CLI 删除归档：panel-session.jsonl 结构化断言随之移除，
+#   属主决策现经 driver feed → feed_owner_message，断言只读 state.json。）
 
 # 产物路径解析（R6f）：不硬编码 workspace_subdirs 名——真规划器按 R6fPlannerNaming
 # 约束自由选具体子目录名（本机实测 ['output']，非固定 'src'）；离线注入计划也以
@@ -155,7 +122,7 @@ PY
 }
 
 # ============================================================================
-# Case 1：升级闭环（Escalated → panel abandon → Abandoned）
+# Case 1：升级闭环（Escalated → feed abandon → Abandoned）
 # ============================================================================
 CASE1_DIR="$R4_RUNS/run-r4-case1"
 rm -rf "$CASE1_DIR"
@@ -192,9 +159,9 @@ cat > "$CASE1_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r4] case1: alfred run（执行 --time-limit 1 强制机械超时 → Escalated） ..."
+echo "[r4] case1: driver run（执行 --time-limit 1 强制机械超时 → Escalated） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli -- run \
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
   --time-limit 1 \
@@ -203,16 +170,16 @@ cargo run --quiet -p alfred-cli -- run \
 assert_state "$CASE1_DIR" "escalated"
 echo "PASS(case1a): 机械预算耗尽 → Escalated"
 
-echo "[r4] case1: alfred panel（属主选 3=放弃） ..."
-echo "3" | cargo run --quiet -p alfred-cli -- panel \
+echo "[r4] case1: driver feed abandon（属主放弃，无消息） ..."
+cargo run --quiet -p alfred-cli --example driver -- feed \
   --run-dir "$CASE1_DIR" \
-  --timeout "$PANEL_TL"
+  --decision abandon \
+  --message ""
 assert_state "$CASE1_DIR" "abandoned"
-assert_panel_session "$CASE1_DIR" "放弃"
-echo "PASS(case1): 升级闭环 → panel 结构化决策卡 → decide abandon → Abandoned"
+echo "PASS(case1): 升级闭环 → feed abandon → Abandoned（决策面板 RPC 已删归档）"
 
 # ============================================================================
-# Case 2：打回续跑闭环（PlanRejected → panel retry → 真重跑 → Completed）
+# Case 2：打回续跑闭环（PlanRejected → feed retry → 重规划 → 执行审查离线回退）
 # ============================================================================
 CASE2_DIR="$R4_RUNS/run-r4-case2"
 rm -rf "$CASE2_DIR"
@@ -272,9 +239,9 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r4] case2: alfred run（离线注入不忠实计划 → 计划审查打回 → PlanRejected） ..."
+echo "[r4] case2: driver run（离线注入不忠实计划 → 计划审查打回 → PlanRejected） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-unfaithful.json" \
-cargo run --quiet -p alfred-cli -- run \
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE2_DIR/request.json" \
   --run-dir "$CASE2_DIR" \
   --time-limit "$EXEC_TL" \
@@ -283,13 +250,14 @@ cargo run --quiet -p alfred-cli -- run \
 assert_state "$CASE2_DIR" "plan_rejected"
 echo "PASS(case2a): 不忠实计划被计划审查打回 → PlanRejected"
 
-echo "[r4] case2: alfred panel（属主选 1=重跑 → decide retry 离线忠实计划重规划 → 执行） ..."
-printf "1\n" | ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli -- panel \
+echo "[r4] case2: driver feed retry（属主重跑，离线忠实计划重规划 → 执行） ..."
+ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
+cargo run --quiet -p alfred-cli --example driver -- feed \
   --run-dir "$CASE2_DIR" \
-  --timeout "$PANEL_TL"
+  --decision retry \
+  --message ""
 assert_state "$CASE2_DIR" "escalated"
-# R6d：离线 panel retry 走到执行审查时离线回退 → 升级挂起（escalated）——执行
+# R6d：离线 feed retry 走到执行审查时离线回退 → 升级挂起（escalated）——执行
 # eval 只出产物无审查结论，不悄悄放行。执行是否到达取决于离线计划审查模型速度
 # （plan_review.py.tmpl 45s scorer 限）；若执行已跑（产物落
 # ws/<workspace_subdirs[0]>），内容须正确。
@@ -297,12 +265,11 @@ HELLO2="$(run_ws_hello "$CASE2_DIR" || true)"
 if [[ -n "$HELLO2" && -f "$HELLO2" ]]; then
   [[ "$(cat "$HELLO2")" == "Hello" ]] || { echo "FAIL(case2): hello.txt content wrong" >&2; exit 1; }
 fi
-assert_panel_session "$CASE2_DIR" "重跑"
-echo "PASS(case2): 打回续跑闭环 → panel retry → 重规划 → 执行审查离线回退升级"
+echo "PASS(case2): 打回续跑闭环 → feed retry → 重规划 → 执行审查离线回退升级（决策面板 RPC 已删归档）"
 
 echo ""
 echo "============================================="
-echo "R4 e2e 全部通过：决策面板 RPC 闭环真跑 PASS"
+echo "R4 e2e 全部通过：属主决策 feed 续跑闭环真跑 PASS"
 echo "  case1 升级闭环(abandon): $CASE1_DIR/state.json"
 echo "  case2 打回续跑(retry)  : $CASE2_DIR/state.json"
 echo "============================================="

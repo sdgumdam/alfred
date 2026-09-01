@@ -7,8 +7,11 @@
 #   2. 确保沙箱镜像 alfred-executor:latest（无则 tag r0-lab-pi / docker build）
 #   3. cargo build
 #   4. 写 OwnerRequest（创建 hello.txt，内容 Hello）
-#   5. cargo run -p alfred-cli -- run ...   （R3 起为完整治理环：规划→计划审查→
+#   5. cargo run --example driver -- run ...   （R3 起为完整治理环：规划→计划审查→
 #      执行→执行审查；执行产物/证据在最新 exec-N/ 下）
+#
+# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r1 以
+#   `cargo run --example driver -- run` 驱动治理环——run 初始化 + 推进）。非 CLI 子命令。
 #   6. 校验 ws/<workspace_subdirs[0]>/hello.txt 存在且内容为 Hello（R6f 布局：
 #      run 级单一 ws，子目录名不硬编码——真规划器按 R6fPlannerNaming 自由选）
 #   7. 校验 exec-N/驱动证据归档（driver.done.json + driver.stdout/stderr.log，P9）
@@ -106,8 +109,8 @@ JSON
 echo "[r1] request      : $REQUEST"
 
 # --- 5. 真跑 ---
-echo "[r1] alfred run ..."
-cargo run --quiet -p alfred-cli -- run \
+echo "[r1] driver run ..."
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$REQUEST" \
   --run-dir "$RUN_DIR" \
   --time-limit "${R1_TIME_LIMIT:-600}" \

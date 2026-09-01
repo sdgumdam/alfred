@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # ============================================================================
+# R3 e2e：治理环全链回归（真规划 / 离线注入 / 属主决策 feed 续跑）
+#
+#   1. 正路径全环：driver run（真规划 → 计划审查 → 执行 → 验收 C → Completed）
+#   2. 失败升级闭环：driver run（离线忠实计划 + 执行 --time-limit 1 → 机械重跑2次 →
+#      预算耗尽 → Escalated）；case2b 已归档（旧 decide retry --time-limit 覆盖续跑，
+#      driver feed / feed_owner_message 用 run.options 持久配置，无覆盖参数）
 #   3. 计划打回伪装闭环：离线注入不忠实计划 → 计划审查打回 → PlanRejected →
-#      decide retry → 伪装消息进 planner（断言无结构化否决词）→ 重规划（离线注入忠实计划）
-#      → 计划审查过 → 执行 → 执行审查离线回退 → Escalated（R6d：离线不判 verdict）
-#   4. 多轮会话文档：打回 → 属主补充新需求（decide revise）→ converse 引用会话文档关键结论
-#      （从 llm-calls/ 记录断言）→ 执行审查离线回退 → Escalated
-#      → 计划审查过 → 执行 → 执行审查离线回退 → Escalated（R6d：离线不判 verdict）
-#   4. 多轮会话文档：打回 → 属主补充新需求（decide revise）→ converse 引用会话文档关键结论
-#      （从 llm-calls/ 记录断言）→ 执行审查离线回退 → Escalated
-#      → 计划审查过 → 执行 → Completed
-#   4. 多轮会话文档：打回 → 属主补充新需求（decide revise）→ converse 引用会话文档关键结论
-#      （从 llm-calls/ 记录断言）
+#      driver feed retry → 伪装消息进 planner（断言无结构化否决词）→ 重规划
+#      （离线注入忠实计划）→ 计划审查过 → 执行 → 执行审查离线回退 → Escalated
+#   4. 多轮会话文档：打回 → 属主补充新需求（driver feed revise）→ converse 引用
+#      会话文档关键结论（从 llm-calls/ 记录断言）→ 执行审查离线回退 → Escalated
 #
 # 模型：默认 glm-4.7（省钱；zhipu key 经 ~/.config/alfred/config.yml 或
 # ALFRED_CONFIG 提供）。可用 ALFRED_EXECUTOR_MODEL / ALFRED_REVIEWER_MODEL /
 # ALFRED_PLANNER_MODEL 覆盖。
-# 验收：cargo test 全绿 + 本脚本四用例 PASS。
+# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r3 以
+#   `cargo run --example driver -- run|feed` 驱动治理环——run 初始化+推进；feed 喂
+#   属主消息 → `governance::feed_owner_message` 续跑）。非 CLI 子命令。
+# 验收：cargo test 全绿 + 本脚本用例 PASS（case2b 归档 SKIP）。
 # ============================================================================
 set -euo pipefail
 
@@ -131,8 +134,8 @@ cat > "$CASE1_DIR/request.json" <<'JSON'
   "created_at": "2026-08-26T00:00:00Z"
 }
 JSON
-echo "[r3] case1: alfred run（真规划 → 计划审查 → 执行 → 验收） ..."
-cargo run --quiet -p alfred-cli -- run \
+echo "[r3] case1: driver run（真规划 → 计划审查 → 执行 → 验收） ..."
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE1_DIR/request.json" \
   --run-dir "$CASE1_DIR" \
   --time-limit "$EXEC_TL" \
@@ -163,7 +166,7 @@ fi
 echo "PASS(case1): 正路径全环 Completed + 执行审查 C"
 
 # ============================================================================
-# Case 2：失败升级闭环（机械失败 → 重跑2次 → Escalated → decide retry → 真重跑）
+# Case 2：失败升级闭环（机械失败 → 重跑2次 → Escalated → case2b 归档）
 #   用 --time-limit 1 让执行 eval 超时（机械失败）；计划审查用独立 --review-time-limit。
 # ============================================================================
 CASE2_DIR="$R3_RUNS/run-r3-case2"
@@ -202,9 +205,9 @@ cat > "$CASE2_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r3] case2: alfred run（执行 --time-limit 1 强制机械超时） ..."
+echo "[r3] case2: driver run（执行 --time-limit 1 强制机械超时） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli -- run \
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE2_DIR/request.json" \
   --run-dir "$CASE2_DIR" \
   --time-limit 1 \
@@ -224,31 +227,16 @@ assert "mechanical_budget_exhausted_escalated" in events, "budget exhausted miss
 PY
 echo "PASS(case2a): 机械重跑2次 → 预算耗尽 → Escalated"
 
-echo "[r3] case2: alfred decide retry（--time-limit 300 真重跑） ..."
-cargo run --quiet -p alfred-cli -- decide \
-  --run-dir "$CASE2_DIR" \
-  --decision retry \
-  --time-limit "$EXEC_TL" \
-  --image "$IMAGE"
-
-assert_state "$CASE2_DIR" "completed"
-HELLO2="$(run_ws_hello "$CASE2_DIR" || true)"
-if [[ -z "$HELLO2" || ! -f "$HELLO2" ]] || [[ "$(cat "$HELLO2")" != "Hello" ]]; then
-  echo "FAIL(case2): decide retry 后 hello.txt 未产出（resolved: ${HELLO2:-<none>}）" >&2
-  ls "$CASE2_DIR"/ws/ 2>/dev/null >&2
-  exit 1
-fi
-python3 - "$CASE2_DIR/state.json" <<'PY' || { echo "FAIL(case2): decide retry 后无新 exec verdict" >&2; exit 1; }
-import json, sys
-d = json.load(open(sys.argv[1]))
-assert d["state_machine"]["state"] == "completed"
-vs = d["exec_verdicts"]
-assert len(vs) >= 1 and vs[-1]["value"] == "C", f"exec verdicts: {vs}"
-PY
-echo "PASS(case2): 失败升级闭环 → decide retry → 真重跑 → 新 verdict → Completed"
+# ---- case2b（归档）：decide retry --time-limit 覆盖续跑 ---
+#   旧 `alfred decide` 支持 --time-limit 覆盖（重跑用更长时限真重跑）；driver
+#   feed / feed_owner_message 用 run.options 持久配置（无覆盖参数），无法表达
+#   "超时升级 → 属主 retry 带更长时限 → 完成"。本段归档。等价覆盖：
+#   - run → Completed（case1）；
+#   - 属主 retry 续跑（driver feed retry）→ r4 case2。
+echo "[r3] case2b: 归档 SKIP（decide retry --time-limit 覆盖已删；等价覆盖见 r3 case1 / r4 case2）"
 
 # ============================================================================
-# Case 3：计划打回伪装闭环（不忠实计划 → PlanRejected → decide retry → 伪装消息 → 重规划 → 过）
+# Case 3：计划打回伪装闭环（不忠实计划 → PlanRejected → driver feed retry → 伪装消息 → 重规划 → 过）
 # ============================================================================
 CASE3_DIR="$R3_RUNS/run-r3-case3"
 rm -rf "$CASE3_DIR"
@@ -309,9 +297,9 @@ cat > "$CASE3_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r3] case3: alfred run（离线注入不忠实计划 → 计划审查打回） ..."
+echo "[r3] case3: driver run（离线注入不忠实计划 → 计划审查打回） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-unfaithful.json" \
-cargo run --quiet -p alfred-cli -- run \
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE3_DIR/request.json" \
   --run-dir "$CASE3_DIR" \
   --time-limit "$EXEC_TL" \
@@ -326,19 +314,21 @@ assert "plan_review_rejected" in events, "plan_review_rejected missing"
 PY
 echo "PASS(case3a): 不忠实计划被计划审查打回 → PlanRejected"
 
-echo "[r3] case3: alfred decide retry（伪装消息重规划） ..."
+echo "[r3] case3: driver feed retry（伪装消息重规划） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli -- decide \
+cargo run --quiet -p alfred-cli --example driver -- feed \
   --run-dir "$CASE3_DIR" \
   --decision retry \
   --image "$IMAGE"
+# （--message "" = Retry 消息可选：feed_owner_message 无消息跳过消息轮，不做
+#   maintain②/不落 owner.message；--image 沿用 run.options 持久配置，无需重复传）
 
 assert_state "$CASE3_DIR" "escalated"
 # 断言：伪装消息无结构化否决词；llm-calls/0001.json（重规划）引用伪装消息
 python3 - "$CASE3_DIR/state.json" "$CASE3_DIR/llm-calls" <<'PY' || { echo "FAIL(case3): 伪装消息含禁词或 llm 记录缺失" >&2; exit 1; }
 import json, sys, glob, os
 d = json.load(open(sys.argv[1]))
-# R6d：离线 decide retry 走到执行审查时离线回退 → 升级挂起（escalated）——执行
+# R6d：离线 feed retry 走到执行审查时离线回退 → 升级挂起（escalated）——执行
 # eval 只出产物无审查结论，不悄悄放行。打回→retry→重规划闭环本身已完成。
 assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
 msg = d.get("owner_message") or ""
@@ -371,7 +361,7 @@ for f in files:
     u = r["messages"][-1]["content"]
     assert "owner_feedback" in u, f"converse projection missing owner_feedback: {u}"
 PY
-echo "PASS(case3): 打回伪装 → decide retry → 伪装消息进 planner（无结构化否决词）→ 重规划 → 执行 → 执行审查离线回退升级"
+echo "PASS(case3): 打回伪装 → feed retry → 伪装消息进 planner（无结构化否决词）→ 重规划 → 执行 → 执行审查离线回退升级"
 
 # ============================================================================
 # Case 4：多轮会话文档（打回 → 属主补充 → converse 引用会话文档关键结论）
@@ -438,9 +428,9 @@ JSON
 cat > "$CASE4_DIR/supplement.txt" <<'TXT'
 技术选型：内容必须是英文单词 Hello（大小写敏感），且文件必须位于工作区根目录。
 TXT
-echo "[r3] case4: alfred run（打回 → 挂起 PlanRejected） ..."
+echo "[r3] case4: driver run（打回 → 挂起 PlanRejected） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-unfaithful.json" \
-cargo run --quiet -p alfred-cli -- run \
+cargo run --quiet -p alfred-cli --example driver -- run \
   --request "$CASE4_DIR/request.json" \
   --run-dir "$CASE4_DIR" \
   --time-limit "$EXEC_TL" \
@@ -448,9 +438,9 @@ cargo run --quiet -p alfred-cli -- run \
   --image "$IMAGE"
 assert_state "$CASE4_DIR" "plan_rejected"
 
-echo "[r3] case4: alfred decide revise（属主补充新需求） ..."
+echo "[r3] case4: driver feed revise（属主补充新需求） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-faithful.json" \
-cargo run --quiet -p alfred-cli -- decide \
+cargo run --quiet -p alfred-cli --example driver -- feed \
   --run-dir "$CASE4_DIR" \
   --decision revise \
   --message "$CASE4_DIR/supplement.txt" \
@@ -461,7 +451,7 @@ assert_state "$CASE4_DIR" "escalated"
 python3 - "$CASE4_DIR/state.json" "$CASE4_DIR/llm-calls" <<'PY' || { echo "FAIL(case4): converse 未引用会话文档关键结论" >&2; exit 1; }
 import json, sys, glob, os
 d = json.load(open(sys.argv[1]))
-# R6d：离线 decide revise 走到执行审查时离线回退 → 升级挂起（escalated）；
+# R6d：离线 feed revise 走到执行审查时离线回退 → 升级挂起（escalated）；
 # 会话文档多轮（打回→补充→重规划）本身已验证。
 assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
 doc = d["session_doc"]
@@ -496,9 +486,9 @@ echo "PASS(case4): 打回→属主补充→converse 引用会话文档关键结�
 
 echo ""
 echo "============================================="
-echo "R3 e2e 全部通过：四用例真跑 PASS"
+echo "R3 e2e 全部通过：用例真跑 PASS（case2b 归档 SKIP）"
 echo "  case1 正路径全环      : $CASE1_DIR/state.json"
-echo "  case2 机械升级闭环    : $CASE2_DIR/state.json"
+echo "  case2 机械升级闭环    : $CASE2_DIR/state.json（case2b 归档：decide retry --time-limit 覆盖已删）"
 echo "  case3 打回伪装闭环    : $CASE3_DIR/state.json"
 echo "  case4 多轮会话文档    : $CASE4_DIR/state.json"
 echo "============================================="
