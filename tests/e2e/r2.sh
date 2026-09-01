@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 #   1. 执行审查正路径：driver run（pi 真容器 + reviewer 容器判 C）
-#   1b. 执行审查离线回退：driver run（ALFRED_OFFLINE=1 → 执行审查不跑容器、
-#       无 verdict → §3.3 升级挂起 escalated；部分兑现 P 档由 reviewer 容器在线判）
+#   1b. 计划审查离线升级：driver run（ALFRED_OFFLINE=1 主开关 → 计划审查不跑容器、
+#       无 verdict → plan_review_error_escalated → §3.3 升级挂起 escalated，
+#       escalation_source=plan_review）。执行审查离线回退的覆盖已移交 r6d Tier1b
+#       （ALFRED_PLANNER_OFFLINE + ALFRED_EXEC_REVIEW_OFFLINE，计划审查容器在线）。
 #   2. 注定不忠实计划：已归档（独立 alfred plan-review CLI 已删；等价覆盖见 r3 case3）
 #   3. 解析失败 → unscored：已归档（独立 alfred plan-review CLI 已删；等价覆盖见
 #      r6b caseA / r6c tier1c）
@@ -143,10 +145,11 @@ PY
 echo "PASS(case1): exec review 正路径 scorer 判 C"
 
 # ============================================================================
-# Case 1b：执行审查部分通过（scorer 判 P——部分兑现）
-#   prompt 只让 pi 建 hello.txt；acceptance_criteria 要求 hello+world 两个，
-#   并显式声明"只满足其一 = P"。grader 只见 acceptance_criteria + 产物摘要
-#   （不见 prompt），应判 P（R2Audit2：P 档补通）。
+# Case 1b：计划审查离线升级（诚实重述，非执行审查回退）
+#   ALFRED_OFFLINE=1 主开关同时让计划审查离线（不跑 reviewer 容器）→
+#   plan_review_error_escalated → §3.3 升级挂起 escalated + escalation_source=
+#   plan_review（不走到执行）。部分兑现 P 档由 reviewer 容器在线判定（见
+#   r6d.sh Tier3 / R6f 交付文档）。执行审查离线回退覆盖移交 r6d Tier1b。
 # ============================================================================
 CASE1B_DIR="$R2_RUNS/run-r2-exec-partial"
 rm -rf "$CASE1B_DIR"
@@ -184,7 +187,7 @@ cat > "$CASE1B_DIR/plan-faithful.json" <<'JSON'
   ]
 }
 JSON
-echo "[r2] case1b: driver run (offline 忠实计划 → 执行部分兑现 → 执行审查离线回退 → §3.3 升级挂起) ..."
+echo "[r2] case1b: driver run (ALFRED_OFFLINE=1 → 计划审查离线 → §3.3 升级挂起 escalated) ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE1B_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- run \
   --request "$CASE1B_DIR/request.json" \
@@ -192,19 +195,21 @@ cargo run --quiet -p alfred-cli --bin alfred -- run \
   --time-limit "${R2_TIME_LIMIT:-900}" \
   --image "$IMAGE"
 
-python3 - "$CASE1B_DIR/state.json" "$CASE1B_DIR/audit.jsonl" <<'PY' || { echo "FAIL(case1b): offline exec review 未升级挂起" >&2; exit 1; }
+python3 - "$CASE1B_DIR/state.json" "$CASE1B_DIR/audit.jsonl" <<'PY' || { echo "FAIL(case1b): 计划审查离线升级" >&2; exit 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))
-# R6d：离线（ALFRED_OFFLINE=1）执行审查不跑 reviewer 容器——执行 eval 只出产物
-# 无审查结论 → 升级属主（§六继承项，不悄悄放行），exec_verdicts 恒为空。
-# （部分兑现 P 档由 reviewer 容器在线判定，见 r6d.sh Tier3 / R6f 交付文档。）
+# 诚实重述：ALFRED_OFFLINE=1 主开关让计划审查也离线（不跑 reviewer 容器）→
+# plan_review_error_escalated → 升级属主（escalation_source=plan_review），不走到
+# 执行。执行审查离线回退覆盖移交 r6d Tier1b（ALFRED_PLANNER_OFFLINE +
+# ALFRED_EXEC_REVIEW_OFFLINE，计划审查容器在线）。
 assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
+assert d.get("escalation_source") == "plan_review", f"escalation_source={d.get('escalation_source')}"
 vs = d["exec_verdicts"]
-assert len(vs) == 0, f"R6d offline exec review must produce no verdict, got {vs}"
+assert len(vs) == 0, f"计划审查离线升级不产生 exec verdict, got {vs}"
 events = [json.loads(l)["event"] for l in open(sys.argv[2])]
-assert any("escalat" in e for e in events), f"no escalation event in audit: {events}"
+assert "plan_review_error_escalated" in events, f"audit 缺 plan_review_error_escalated: {events}"
 PY
-echo "PASS(case1b): 离线执行审查无 verdict → 升级挂起 escalated（R6d 语义）"
+echo "PASS(case1b): ALFRED_OFFLINE=1 计划审查离线升级（escalation_source=plan_review）"
 
 # ============================================================================
 # Case 2：注定不忠实计划（需求 A 计划做 B → pass=false 打回）——已归档
@@ -226,7 +231,7 @@ echo ""
 echo "============================================="
 echo "R2 e2e 全部通过：两用例真跑 PASS + 两用例归档 SKIP"
 echo "  case1  执行审查 C  : $CASE1_DIR/state.json"
-echo "  case1b 执行审查 P  : $CASE1B_DIR/state.json"
+  echo "  case1b 计划审查离线升级 : $CASE1B_DIR/state.json"
 echo "  case2  归档（独立 plan-review CLI 已删，等价覆盖见 r3 case3）"
 echo "  case3  归档（独立 plan-review CLI 已删，等价覆盖见 r6b caseA / r6c tier1c）"
 echo "============================================="
