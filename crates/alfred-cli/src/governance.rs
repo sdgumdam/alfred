@@ -41,7 +41,11 @@ pub struct GovernanceContext {
 }
 
 /// 从挂起/初始状态推进治理环，直到挂起态或终态。
-pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
+///
+/// 返回 `Ok(Some(reply))` = 规划器答复了属主（§2.4 Reply 分支，state=Planning
+/// 停驻、对话继续）——reply 文本 surface 给调用方（driver 打印到 stdout，owner
+/// 终端直读，P2-2）；`Ok(None)` = 推进到挂起态/终态（无待显示答复）。
+pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Option<String>> {
     // 执行结果跨态传递（Executing → ExecReviewing）。
     let mut pending_exec: Option<alfred_executor::run::RunOutcome> = None;
 
@@ -55,18 +59,12 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
             alfred_core::governance::GovernanceState::Planning => {
                 // P3 修复：规划侧失败（converse 出错）→ 升级属主（不悄悄放行），
                 // 落盘后可恢复（decide retry/revise/abandon 续跑）。
-                // §2.4 两分支：planning_step 返回 Ok(false) = 规划器答复了属主
-                // （对话继续，不产计划）——停止编排环，等属主下一轮消息。
+                // §2.4 两分支：planning_step 返回 Ok(Some(reply)) = 规划器答复了属主
+                // （对话继续，不产计划）——停止编排环，等属主下一轮消息；答复文本
+                // 返回调用方（driver 打印，owner 终端直读，P2-2）。
                 match planning_step(run, ctx) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        println!(
-                            "[alfred] 规划器已答复属主（state=Planning，对话继续）。\n\
-                             \x20 对话记录见 conversation.json（run_dir: {}）；等待属主界面喂入下一轮消息。",
-                            ctx.run_dir.display()
-                        );
-                        return Ok(());
-                    }
+                    Ok(None) => {}
+                    Ok(Some(reply)) => return Ok(Some(reply)),
                     Err(e) => {
                         audit(
                             &ctx.run_dir,
@@ -80,7 +78,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                              \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
                             ctx.run_dir.display()
                         );
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -93,7 +91,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                      \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
                     ctx.run_dir.display()
                 );
-                return Ok(());
+                return Ok(None);
             }
             alfred_core::governance::GovernanceState::Executing => {
                 pending_exec = execution_step(run, ctx)?;
@@ -103,7 +101,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
             }
             alfred_core::governance::GovernanceState::Completed => {
                 println!("[alfred] 全流程完成（Completed）。验收 C 推进到终点。");
-                return Ok(());
+                return Ok(None);
             }
             alfred_core::governance::GovernanceState::Escalated => {
                 println!(
@@ -111,17 +109,25 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                      \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
                     ctx.run_dir.display()
                 );
-                return Ok(());
+                return Ok(None);
             }
             alfred_core::governance::GovernanceState::Abandoned => {
                 println!("[alfred] 属主放弃（Abandoned，终态）。");
-                return Ok(());
+                return Ok(None);
             }
         }
         // P3 修复：每次状态转移后 persist state.json（转移已写 audit，persist 廉价）。
         // 进程在下一转移前崩溃也能从最新状态续跑（崩溃恢复显式化）。
         persist_governance_run(&ctx.run_dir, run)?;
     }
+}
+
+/// feed_owner_message 的返回：新状态 + 规划器答复（§2.4 Reply 分支有答复时
+/// `reply = Some(text)`，surface 给调用方终端显示；否则 `None`）。
+#[derive(Debug, Clone)]
+pub struct FeedOutcome {
+    pub state: GovernanceState,
+    pub reply: Option<String>,
 }
 
 /// 喂属主消息 → 续跑治理环（库调用方/codux driver 入口，非 CLI 子命令）。
@@ -148,13 +154,14 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
 /// 4. **P3b**：升级拍板（`decision != Revise`，即 Retry/Abandon）→ 补落
 ///    `panel.decision` 轮（§二.8：升级拍板时的属主决策；reviewer 挂载对话记录
 ///    区分拍板与普通对话消息）。
-/// 5. 返回新状态给调用方（planner 答复在 conversation.json 的 converse.reply 轮）。
+/// 5. 返回 `FeedOutcome { state, reply }` 给调用方——`reply` = planner 答复文本
+///    （§2.4 Reply 分支，driver 打印到 stdout，owner 终端直读，P2-2）；无答复则 `None`。
 pub fn feed_owner_message(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
     message: &str,
     decision: OwnerDecision,
-) -> Result<GovernanceState> {
+) -> Result<FeedOutcome> {
     let state = run.state();
     // P2a 修复：挂起态可拍板；Planning 态（converse 答复后停驻）可 revise（续入对话）
     // 或 abandon（放弃——属主放弃恒可选，Skeleton §3.2 三选一）。
@@ -202,7 +209,10 @@ pub fn feed_owner_message(
             "governance_paused",
             &serde_json::json!({ "state": state_label(run.state()) }),
         )?;
-        return Ok(run.state());
+        return Ok(FeedOutcome {
+            state: run.state(),
+            reply: None,
+        });
     }
 
     // Retry 消息可选（重跑不必然带新指令）；Revise 需非空消息（喂 planner 新指令）。
@@ -309,22 +319,26 @@ pub fn feed_owner_message(
 
     // 5. 续跑（从新状态推进到下一个挂起/终态）。
     persist_governance_run(&ctx.run_dir, run)?;
-    run_governance_loop(run, ctx)?;
+    let reply = run_governance_loop(run, ctx)?;
     persist_governance_run(&ctx.run_dir, run)?;
     audit(
         &ctx.run_dir,
         "governance_paused",
         &serde_json::json!({ "state": state_label(run.state()) }),
     )?;
-    Ok(run.state())
+    Ok(FeedOutcome {
+        state: run.state(),
+        reply,
+    })
 }
 
 /// Planning：converse（会话文档 + 属主消息 → §2.4 两分支）+ E5 reviewer_models 注入。
 ///
-/// 返回 `Ok(true)` = 产出计划（已 apply PlanProduced → PlanReviewing，编排环继续）；
-/// `Ok(false)` = 规划器答复了属主（纯文本答复，不产计划——对话继续，状态仍
-/// Planning，编排环返回调用方；调用方经下一轮属主消息（revise 语义）续入对话（P1-2）。
-fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<bool> {
+/// 返回 `Ok(None)` = 产出计划（已 apply PlanProduced → PlanReviewing，编排环继续）；
+/// `Ok(Some(reply))` = 规划器答复了属主（纯文本答复，不产计划——对话继续，状态仍
+/// Planning，编排环返回调用方；答复文本 surface 给调用方（driver 打印，P2-2），
+/// 调用方经下一轮属主消息（revise 语义）续入对话（P1-2）。
+fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Option<String>> {
 	let owner_message = match &run.owner_message {
 		Some(m) => m.clone(),
 		None => alfred_planner::format_request_message(&run.request),
@@ -377,7 +391,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<boo
 			)?;
 			run.dagspec = Some(dagspec);
 			run.apply(GovernanceEvent::PlanProduced)?;
-			Ok(true)
+			Ok(None)
 		}
 		// ---- §2.4 答复分支：纯文本答复给属主，不强制产 DagSpec（对话继续） ----
 		ConverseOutcome::Reply { reply, record_path } => {
@@ -386,7 +400,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<boo
 				&ctx.run_dir,
 				&run.run_id,
 				ConversationRole::Planner,
-				reply,
+				reply.clone(),
 				ConversationSource::ConverseReply,
 			)
 			.map_err(anyhow::Error::msg)
@@ -396,7 +410,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<boo
 				"converse_reply",
 				&serde_json::json!({ "record": record_path }),
 			)?;
-			Ok(false)
+			Ok(Some(reply))
 		}
 	}
 }
