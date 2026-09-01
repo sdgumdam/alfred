@@ -8,20 +8,23 @@
 #     的核心。
 #   Tier 1（需 inspect CLI，无需 docker / 无需真 LLM）：ALFRED_OFFLINE 规划 +
 #     mockllm 计划审查（unscored → 升级）——断言 converse 离线产物
-#     （llm-calls/dagspec.json/conversation.json）+ maintain 离线（decide revise
-#     更新 key_conclusions）。inspect 缺失时跳过（打印 SKIP）。
+#     （llm-calls/dagspec.json/conversation.json）+ maintain 离线（driver feed
+#     revise 更新 key_conclusions）。inspect 缺失时跳过（打印 SKIP）。
 #   Tier 2（需 inspect + docker + 真模型，验方跑）：R6B_REAL=1 时真容器 converse
 #     产合法 DagSpec（zhipu 真跑）+ ws 只读断言。默认关闭（留给验方）。
 #
 # 模型：Tier 1 用 mockllm（inspect 内建，无需 key）做计划审查——planner 离线
 #   直通、executor 不触发，因此不需要 docker 与真实 provider。
+# 驱动：alfred CLI 已删（08-31），黑盒经库驱动示例 `examples/driver.rs`（r6b 以
+#   `cargo run --example driver -- run|feed` 驱动治理环——run 初始化 + 推进；
+#   feed 喂属主消息 → `governance::feed_owner_message` 续跑）。非 CLI 子命令。
 # 验收：cargo test 全绿 + Tier 1 离线回归 PASS（或 inspect 缺失 SKIP）。
 # ============================================================================
 #
 # Tier 1 用例：
-#   caseA 离线 converse（run → 计划 → mockllm 审查 unscored → 升级挂起）
-#   caseB 离线 maintain②（decide revise 属主补充 → key_conclusions 更新）
-#   caseC P1-2 Reply 多轮续入（规划器答复 → state=Planning → decide revise
+#   caseA 离线 converse（driver run → 计划 → mockllm 审查 unscored → 升级挂起）
+#   caseB 离线 maintain②（driver feed revise 属主补充 → key_conclusions 更新）
+#   caseC P1-2 Reply 多轮续入（规划器答复 → state=Planning → driver feed revise
 #         续入属主答复 → 重规划 → 升级挂起）
 set -euo pipefail
 
@@ -82,7 +85,7 @@ YAML
   export ALFRED_EXECUTOR_MODEL="glm-4.7"
   export ALFRED_REVIEWER_MODEL="mockllm/model"
 
-  # ---- Case A：离线 converse（alfred run → 计划审查 unscored → 升级挂起）----
+  # ---- Case A：离线 converse（driver run → 计划审查 unscored → 升级挂起）----
   CASE_A="$R6B_RUNS/run-r6b-offline-converse"
   rm -rf "$CASE_A"
   mkdir -p "$CASE_A"
@@ -118,9 +121,9 @@ JSON
   ]
 }
 JSON
-  echo "[r6b] caseA: alfred run（离线规划 → mockllm 审查 unscored → escalated） ..."
+  echo "[r6b] caseA: driver run（离线规划 → mockllm 审查 unscored → escalated） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_A/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli -- run \
+  cargo run --quiet -p alfred-cli --example driver -- run \
     --request "$CASE_A/request.json" \
     --run-dir "$CASE_A" \
     --time-limit 60 \
@@ -156,14 +159,14 @@ assert state["state_machine"]["state"] == "escalated", f"state={state['state_mac
 PY
   echo "PASS(caseA): 离线 converse 产物（dagspec/llm-calls/conversation.json）+ 审查出错升级"
 
-  # ---- Case B：离线 maintain②（decide revise 属主补充 → key_conclusions 更新）----
-  echo "[r6b] caseB: alfred decide revise（离线 maintain → key_conclusions 追加） ..."
+  # ---- Case B：离线 maintain②（driver feed revise 属主补充 → key_conclusions 更新）----
+  echo "[r6b] caseB: driver feed revise（离线 maintain → key_conclusions 追加） ..."
   MSG_FILE="$CASE_A/owner-msg.txt"
   cat > "$MSG_FILE" <<'TXT'
 技术选型用 Rust
 TXT
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_A/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli -- decide \
+  cargo run --quiet -p alfred-cli --example driver -- feed \
     --run-dir "$CASE_A" \
     --decision revise \
     --message "$MSG_FILE"
@@ -181,7 +184,7 @@ assert state["owner_message"] == "技术选型用 Rust", "owner_message not upda
 PY
   # ---- Case C：P1-2 Reply 多轮续入（规划器答复 → state=Planning → decide revise 续入 → 重规划）----
   # 规划器第一轮先答复属主（不产计划，§2.4 Reply 分支）→ 状态停 Planning（对话继续）；
-  # 属主经 `alfred decide --decision revise --message <回答>` 从 Planning 态续入下一轮
+  # 属主经 `driver feed --decision revise --message <回答>` 从 Planning 态续入下一轮
   # 消息（设 owner_message → maintain② → planning_step 复用 revise 机制）→ 重规划
   # → 计划审查（mockllm unscored）→ 升级挂起。多轮对话端到端闭环。
   CASE_C="$R6B_RUNS/run-r6b-reply-continue"
@@ -227,9 +230,9 @@ TXT
   cat > "$CASE_C/answer.txt" <<'TXT'
 可以，技术选型用 Rust。
 TXT
-  echo "[r6b] caseC: alfred run（离线 Reply 分支 → state=Planning，对话继续） ..."
+  echo "[r6b] caseC: driver run（离线 Reply 分支 → state=Planning，对话继续） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_C/reply.txt" \
-  cargo run --quiet -p alfred-cli -- run \
+  cargo run --quiet -p alfred-cli --example driver -- run \
     --request "$CASE_C/request.json" \
     --run-dir "$CASE_C" \
     --time-limit 60 \
@@ -251,9 +254,9 @@ assert "技术选型确认" in conv["turns"][1]["content"], f"reply content={con
 PY
   echo "PASS(caseC1): Reply 分支 → Planning（对话继续）"
 
-  echo "[r6b] caseC: alfred decide revise（Planning 态续入属主答复 → 重规划） ..."
+  echo "[r6b] caseC: driver feed revise（Planning 态续入属主答复 → 重规划） ..."
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_C/plan-faithful.json" \
-  cargo run --quiet -p alfred-cli -- decide \
+  cargo run --quiet -p alfred-cli --example driver -- feed \
     --run-dir "$CASE_C" \
     --decision revise \
     --message "$CASE_C/answer.txt"
@@ -320,8 +323,8 @@ if [[ "${R6B_REAL:-0}" == "1" ]]; then
   "created_at": "2026-08-28T00:00:00Z"
 }
 JSON
-  echo "[r6b] caseT: alfred run（真容器 planner converse → 真计划审查/执行） ..."
-  cargo run --quiet -p alfred-cli -- run \
+  echo "[r6b] caseT: driver run（真容器 planner converse → 真计划审查/执行） ..."
+  cargo run --quiet -p alfred-cli --example driver -- run \
     --request "$CASE_T/request.json" \
     --run-dir "$CASE_T" \
     --time-limit 900 \
