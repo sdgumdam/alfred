@@ -1,10 +1,11 @@
 //! alfred-executor：执行侧（R1）。
 //!
-//! 职责（实施计划 R1 交付）：
-//! 1. `task_gen`：Rust 生成 Inspect Task 定义（Python 文件）。
-//! 2. `compose_gen`：按 run 目录生成沙箱 compose（network none + 工作区卷）。
-//! 3. `driver`：spawn `inspect eval --detach --json`（venv python）→ 轮询
-//!    output_file 的 done 记录 → `inspect log dump` 取证据。
+//! 职责（实施计划 R1 交付，三容器 Inspect 统一管）：
+//! 1. `task_gen`：Rust 生成 Inspect 容器管理驱动脚本（`driver.py`，非 eval Task）。
+//! 2. `compose_gen`：按 run 目录生成沙箱 compose（network none + 挂载面矩阵）。
+//! 3. `driver`：spawn `python3 driver.py`（Inspect 容器管理接口：docker compose
+//!    起容器 + sandbox_agent_bridge 代发 + exec_remote 驱动 pi）→ 轮询
+//!    `driver.done.json` done 记录。
 //! 4. `artifact`：容器 workspace 卷的文件比对（前后快照 diff）。
 //! 5. `config`：R1 最小 executor 配置（roles.executor → 模型 → provider）。
 //!
@@ -14,7 +15,7 @@
 //!   解析 executor 模型。
 //! - forward_generation_config 默认 False；宿主 Model 配置定死 max_tokens（≥1024，
 //!   glm-5.2 是 reasoning 模型）。
-//! - detach+ctl 首用：完成判定看 output_file 末行 done 记录；进程消失无 done = crash。
+//! - 完成判定看 driver.done.json done 记录；进程消失无 done = crash。
 
 pub mod artifact;
 pub mod compose_gen;

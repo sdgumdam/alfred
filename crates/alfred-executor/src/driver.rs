@@ -1,221 +1,146 @@
-//! Inspect 驱动层：spawn `inspect eval --detach --json` → 轮询 output_file
-//! done 记录 → `inspect log dump` 取证据。
+//! Inspect 容器管理驱动层：宿主侧 Python 驱动脚本（非 eval）起容器 + 驱动 pi。
 //!
-//! CLI 观测契约（调研文档 + R0报告）：
-//! - launch 记录: {event,run_id,pid,log_dir,control.socket_path,output_file}
-//! - 完成判定: output_file 末行 done 记录；进程消失无 done = crash
-//! - task error ≠ crash: done 照发、退出码 0——分支看 logs[].status 不看退出码！
+//! 依据：属主 08-27「容器统一用 Inspect AI 管理」——"管理容器"的正确接口是
+//! Inspect 的容器管理机制（`DockerSandboxEnvironment`（docker compose 起容器）
+//! + `sandbox_agent_bridge`（宿主 run_model_service + 容器内 exec_remote
+//! model_proxy）+ `exec_remote` 驱动容器内 pi），不是 `inspect eval` 评测包装。
+//! 属主 08-05「Inspect AI 只是一个可选的技术架构」——Inspect 只承担容器管理，
+//! 不承担评测（去 eval 启动包装）。
+//!
+//! 流程：渲染 compose（挂载面矩阵，隔离机制不变）+ 生成宿主侧驱动脚本
+//! （`driver.py`，独立 Python 脚本，非 eval Task）→ spawn `python3 driver.py`
+//! （env 清洗白名单 + 单角色 provider 凭据）→ 轮询 `<work>/driver.done.json`
+//! done 记录 → 读 bind mount 产物。容器生命周期（compose up/down）由驱动脚本
+//! 经 Inspect 容器管理接口负责；宿主不再经 `inspect eval`。
+//!
+//! done 记录契约（驱动脚本产出，与旧 eval output_file 同构）：
+//! - `{"event":"done","status":"success"}`：pi 正常完成。
+//! - `{"event":"done","status":"error","error":"..."}`：任务级失败（pi 未
+//!   settled / 容器未产出）——done 照发、驱动进程退出码非零；分支看 status。
+//! - `{"event":"done","status":"timed_out","error":"..."}`：驱动脚本自限时
+//!   （`anyio.fail_after`）触达——先清理容器再写 done。
+//! - 进程消失无 done = crash / 被 kill。
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use alfred_core::verdict::{Confidence, ExecVerdict, FailureClass, VerdictGrade};
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::config::ExecutorModel;
 
-/// inspect CLI 解析：`ALFRED_INSPECT` 环境变量优先，否则 PATH 上的 `inspect`。
-pub fn inspect_binary() -> String {
-    std::env::var("ALFRED_INSPECT").unwrap_or_else(|_| "inspect".to_string())
+/// 宿主侧 Python 解析：`ALFRED_PYTHON` 环境变量优先，否则 PATH 上的 `python3`。
+pub fn python_binary() -> String {
+    std::env::var("ALFRED_PYTHON").unwrap_or_else(|_| "python3".to_string())
 }
 
-/// `inspect eval --detach` 的 launch 记录。
+/// 容器驱动进程的 launch 记录。
 #[derive(Debug, Clone)]
-pub struct LaunchRecord {
-    pub run_id: String,
-    pub pid: Option<i64>,
-    pub log_dir: Option<String>,
-    /// 分离进程的输出文件（含 done 记录）。
-    pub output_file: PathBuf,
+pub struct DriverLaunch {
+    pub pid: i64,
+    /// done 记录文件（驱动脚本写完即结束）。
+    pub done_marker: PathBuf,
 }
 
-/// done 记录（logs[0] 为主任务）。
+/// done 记录（驱动脚本产出；status: "success" | "error" | "timed_out"）。
 #[derive(Debug, Clone)]
-pub struct EvalDone {
-    pub task: String,
-    pub task_id: String,
-    pub eval_id: String,
-    /// "success" / "error"（task error ≠ crash，看 status 不看退出码）
+pub struct DriverDone {
     pub status: String,
-    /// .eval 文件绝对路径
-    pub location: String,
+    pub error: Option<String>,
 }
 
 /// 轮询结果。
 #[derive(Debug, Clone)]
-pub enum PollOutcome {
+pub enum DriverOutcome {
     /// 读到 done 记录。
-    Done(EvalDone),
+    Done(DriverDone),
     /// 超时（未 done、进程仍活）。
     TimedOut,
-    /// 进程消失且无 done（crash）。
+    /// 进程消失且无 done（crash / 被 kill）。
     Crashed,
 }
 
-/// 只注入 executor/reviewer 两个 provider 凭据（经 env：`{PROVIDER}_API_KEY`
-/// + `ALFRED_EXEC_API_KEY`，不进 argv），子进程 env 做 env_clear + 白名单
-/// 清洗（R0 审计约束 1：防执行者经桥点名其他 provider）。
+/// 生成宿主侧容器驱动脚本并 spawn（非 eval）。
 ///
-/// `grader` 为执行审查 scorer 的判分模型（config roles.reviewer）：经
-/// `--model-role grader=<id>` 绑定，且其 provider key 一并注入 eval 进程。
-/// 计划审查 eval（scorer 判忠实度）不传 grader——主模型即审查者。
+/// 驱动脚本自身经 Inspect 容器管理接口（DockerSandboxEnvironment +
+/// sandbox_agent_bridge + exec_remote）起容器、驱动容器内 pi、写 done 记录。
+/// 本函数只负责 spawn + 记录 pid + done_marker 路径，不等待。
 ///
-/// inspect eval 的任务文件必须是相对路径（绝对路径会触发
-/// `root_dir.glob(glob)` 的 NotImplementedError）——把 cwd 设为任务文件
-/// 所在目录，传裸文件名。detached 子进程继承该 cwd；log-dir/compose 均
-/// 为绝对路径，不受影响。
-pub fn spawn_eval(
-    task_py: &Path,
+/// env 清洗：env_clear + 白名单 + 单角色 provider 凭据（`{PROVIDER}_API_KEY` /
+/// `{PROVIDER}_BASE_URL` + `ALFRED_EXEC_API_KEY`，不进 argv，`ps` 不可见）。
+/// 驱动进程只应能解析本角色模型（R0 审计约束 1：防容器内经桥点名其他 provider）。
+pub fn spawn_container_driver(
+    driver_py: &Path,
     model: &ExecutorModel,
-    grader: Option<&ExecutorModel>,
-    log_dir: &Path,
-    time_limit_secs: u32,
-) -> Result<LaunchRecord> {
-    let task_dir = task_py
-        .parent()
-        .context("task.py has no parent dir")?
-        .to_path_buf();
-    // log_dir 必须绝对：detach 子进程 cwd=任务目录，相对 log-dir 会被
-    // 二次拼接（实测：exec-N/<相对路径> 双拼导致 compose/evals 找不到）。
-    let log_dir = &log_dir
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(log_dir));
-    let task_name = task_py
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("task.py has no file name")?
-        .to_string();
-
-    let mut cmd = Command::new(inspect_binary());
-    cmd.arg("eval")
-        .arg(&task_name)
-        .current_dir(&task_dir)
-        .arg("--detach")
-        .arg("--model")
-        .arg(model.inspect_model_id());
-    // 内建模型（mockllm 等）无 base_url——不传 --model-base-url
-    if !model.base_url.is_empty() {
-        cmd.arg("--model-base-url").arg(&model.base_url);
+    work_dir: &Path,
+) -> Result<DriverLaunch> {
+    let done_marker = work_dir.join("driver.done.json");
+    // 清陈旧 done 记录（重跑/续跑幂等）。
+    if done_marker.exists() {
+        std::fs::remove_file(&done_marker)
+            .with_context(|| format!("remove stale done marker {}", done_marker.display()))?;
     }
-    cmd.arg("--max-tokens")
-        .arg(model.max_tokens.to_string())
-        .arg("--time-limit")
-        .arg(time_limit_secs.to_string())
-        .arg("--log-dir")
-        .arg(log_dir)
-        .arg("--log-level")
-        .arg("info");
+    let stdout = File::create(work_dir.join("driver.stdout.log"))
+        .with_context(|| format!("create driver stdout log in {}", work_dir.display()))?;
+    let stderr = File::create(work_dir.join("driver.stderr.log"))
+        .with_context(|| format!("create driver stderr log in {}", work_dir.display()))?;
 
-    // 执行审查：grader 角色绑定审查者模型（scorer 里 get_model(role="grader")）
-    if let Some(g) = grader {
-        cmd.arg("--model-role")
-            .arg(format!("grader={}", g.inspect_model_id()));
-    }
-
-    // env 清洗：env_clear + 白名单注入——继承的凭据形态变量（KEY/TOKEN/
-    // SECRET/PASSWORD 或 LLM provider 前缀）从根上不进入 eval 进程（R0 审计
-    // 约束 1：eval 进程只应能解析 executor/reviewer 两个 provider）。executor
-    // key 改经 env 注入（{PROVIDER}_API_KEY 供 Inspect openai-api provider 读取，
-    // ALFRED_EXEC_API_KEY 为规范名），不再走 `-M api_key=` argv——ps 不可见。
+    let mut cmd = Command::new(python_binary());
+    cmd.arg(driver_py)
+        .current_dir(work_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
     cmd.env_clear();
-    cmd.envs(eval_child_env(model, grader));
+    cmd.envs(container_child_env(model));
 
-    let output = cmd
-        .output()
-        .with_context(|| {
-            // 不打印完整 {:?}：Command Debug 会展开 env（含 executor key）。
-            // 只留 program + args 供排障，env 一律 redact。
-            let args: Vec<String> = cmd
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            format!(
-                "spawn {} {} (env redacted)",
-                cmd.get_program().to_string_lossy(),
-                args.join(" ")
-            )
-        })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // --detach 在 stdout 打一行 launch 记录后退出 0
-    for line in stdout.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            if v.get("event").and_then(|e| e.as_str()) == Some("launch") {
-                return parse_launch(v);
-            }
-        }
-        // 非 launch 的末尾行：可能是 detach 失败诊断
-        bail!("unexpected inspect eval stdout: {line}");
-    }
-    bail!(
-        "inspect eval --detach produced no launch record\nstdout: {stdout}\nstderr: {stderr}"
-    )
-}
-
-fn parse_launch(v: Value) -> Result<LaunchRecord> {
-    let run_id = v
-        .get("run_id")
-        .and_then(|x| x.as_str())
-        .context("launch record missing run_id")?
-        .to_string();
-    let pid = v.get("pid").and_then(|x| x.as_i64());
-    let log_dir = v.get("log_dir").and_then(|x| x.as_str()).map(String::from);
-    let output_file = v
-        .get("output_file")
-        .and_then(|x| x.as_str())
-        .context("launch record missing output_file")?
-        .to_string();
-    Ok(LaunchRecord {
-        run_id,
-        pid,
-        log_dir,
-        output_file: PathBuf::from(output_file),
+    let child = cmd.spawn().with_context(|| {
+        // 不打印完整 {:?}：Command Debug 会展开 env（含 executor key）。
+        // 只留 program + args 供排障，env 一律 redact。
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        format!(
+            "spawn {} {} (env redacted)",
+            cmd.get_program().to_string_lossy(),
+            args.join(" ")
+        )
+    })?;
+    Ok(DriverLaunch {
+        pid: child.id() as i64,
+        done_marker,
     })
 }
 
-/// 轮询 output_file 直到 done 记录 / 进程 crash / 超时。
+/// 轮询 done 记录直到 Done / 进程 crash / 超时。
 ///
-/// 同时轮询 `inspect ctl task list --json` 记录状态到 stderr（观测面），
-/// 完成判定只认 output_file 的 done 记录。
-pub fn poll_until_done(
-    launch: &LaunchRecord,
-    timeout_secs: u64,
-    ctl_enabled: bool,
-) -> Result<PollOutcome> {
+/// 完成判定只认 done 记录；进程消失无 done = crash；超时未 done = timed out。
+/// `ctl_enabled` 观测面已随 `inspect ctl` 退役（无 eval 即无 ctl），不再轮询。
+pub fn poll_container_driver(launch: &DriverLaunch, timeout_secs: u64) -> Result<DriverOutcome> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        if let Some(done) = read_done_record(&launch.output_file)? {
-            return Ok(PollOutcome::Done(done));
+        if let Some(done) = read_done_marker(&launch.done_marker)? {
+            return Ok(DriverOutcome::Done(done));
         }
-        if let Some(pid) = launch.pid {
-            if !process_alive(pid) {
-                return Ok(PollOutcome::Crashed);
-            }
-        }
-        if ctl_enabled {
-            // 观测面：记录 ctl 视角的任务状态（失败不阻断）
-            let _ = ctl_task_status(launch);
+        if !process_alive(launch.pid) {
+            return Ok(DriverOutcome::Crashed);
         }
         if Instant::now() >= deadline {
-            return Ok(PollOutcome::TimedOut);
+            return Ok(DriverOutcome::TimedOut);
         }
         std::thread::sleep(Duration::from_secs(3));
     }
 }
 
-/// 读 output_file 中的 done 记录（末行；容错非 JSON 诊断行）。
-pub fn read_done_record(output_file: &Path) -> Result<Option<EvalDone>> {
-    let text = match std::fs::read_to_string(output_file) {
+/// 读 done 记录（驱动脚本写 `<work>/driver.done.json`，末行；容错非 JSON 行）。
+pub fn read_done_marker(path: &Path) -> Result<Option<DriverDone>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("read detach output_file"),
+        Err(e) => return Err(e).context("read driver done marker"),
     };
     for line in text.lines().rev() {
         let line = line.trim();
@@ -228,285 +153,27 @@ pub fn read_done_record(output_file: &Path) -> Result<Option<EvalDone>> {
         if v.get("event").and_then(|e| e.as_str()) != Some("done") {
             continue;
         }
-        return parse_done(v).map(Some);
+        return Ok(Some(DriverDone {
+            status: v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            error: v.get("error").and_then(|e| e.as_str()).map(String::from),
+        }));
     }
     Ok(None)
 }
 
-fn parse_done(v: Value) -> Result<EvalDone> {
-    let logs = v
-        .get("logs")
-        .and_then(|x| x.as_array())
-        .context("done record missing logs")?;
-    let first = logs.first().context("done record logs empty")?;
-    Ok(EvalDone {
-        task: first
-            .get("task")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        task_id: first
-            .get("task_id")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        eval_id: first
-            .get("eval_id")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        status: first
-            .get("status")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        location: first
-            .get("location")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string(),
-    })
-}
-
-/// `inspect ctl task list --json` 的当前状态（观测面，失败忽略）。
-fn ctl_task_status(launch: &LaunchRecord) -> Result<String> {
-    let out = Command::new(inspect_binary())
-        .args(["ctl", "task", "list", "--json"])
-        .output()
-        .context("run inspect ctl task list")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let v: Value = serde_json::from_str(&text).context("parse ctl task list")?;
-    let empty = Vec::new();
-    let tasks = v.get("tasks").and_then(|x| x.as_array()).unwrap_or(&empty);
-    let statuses: Vec<String> = tasks
-        .iter()
-        .filter_map(|t| {
-            // ctl 行按 pid 关联（log_location 是日志目录，不含 run_id）
-            let pid = t.get("pid").and_then(|x| x.as_i64());
-            if pid == launch.pid {
-                Some(
-                    t.get("status")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                )
-            } else {
-                None
-            }
-        })
-        .collect();
-    eprintln!("[alfred] ctl status: {}", statuses.join(","));
-    Ok(statuses.join(","))
-}
-
-/// 归档 eval log（P9 证据）：复制 .eval 原文件 + `inspect log dump` JSON。
+/// 驱动子进程 env 白名单（`env_clear` 后注入）。
 ///
-/// 若 .eval 已直接写在 dest_dir（本实现的默认：`--log-dir` 就是 evals 目录），
-/// 复制步骤跳过——self-copy 会把文件截断成 0 字节。
-pub fn archive_eval_log(location: &str, dest_dir: &Path) -> Result<PathBuf> {
-    let src = PathBuf::from(location);
-    let file_name = src
-        .file_name()
-        .with_context(|| format!("eval log has no file name: {location}"))?;
-
-    // 1) 复制 .eval 原文件（源目标同路径则跳过）
-    let copied = dest_dir.join(file_name);
-    let same_file = src.canonicalize().ok() == copied.canonicalize().ok();
-    if !same_file {
-        std::fs::copy(&src, &copied).with_context(|| {
-            format!("copy eval log {} -> {}", src.display(), copied.display())
-        })?;
-    }
-
-    // 2) inspect log dump → JSON
-    let out = Command::new(inspect_binary())
-        .args(["log", "dump", location])
-        .output()
-        .with_context(|| format!("inspect log dump {location}"))?;
-    if !out.status.success() {
-        bail!(
-            "inspect log dump failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let dump_path = dest_dir.join(format!(
-        "{}.dump.json",
-        file_name.to_string_lossy().replace(".eval", "")
-    ));
-    std::fs::write(&dump_path, &out.stdout)
-        .with_context(|| format!("write dump {}", dump_path.display()))?;
-    Ok(dump_path)
-}
-
-/// 解析 `inspect log dump` JSON 文本。
-///
-/// inspect 对 unscored score 的 `value` 写非标准 `NaN`（JSON 规范外），
-/// serde_json 默认拒绝——先归一化为 null 再解析。R2Audit2 修复：朴素
-/// `replace` 会篡改 rationale 里合法出现的 "NaN"/"Infinity" 字样——改为
-/// token-aware 替换（只在 JSON 字符串字面量之外的位置替换非标准浮点 token）。
-pub fn parse_dump(text: &str) -> Result<Value> {
-    serde_json::from_str(&sanitize_nonstandard_floats(text)).context("parse inspect log dump JSON")
-}
-
-/// 把 JSON 字符串字面量之外的非标准浮点 token（`NaN`/`Infinity`/`-Infinity`）
-/// 归一化为 `null`。字符串内的同名文本原样保留（token-aware，不误伤
-/// rationale 里合法出现的 "NaN" 等字样）。
-fn sanitize_nonstandard_floats(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            // 字符串字面量：整体透传（含转义序列），不做任何替换
-            let start = i;
-            i += 1;
-            let mut escaped = false;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && !escaped {
-                    escaped = true;
-                    i += 1;
-                    continue;
-                }
-                if bytes[i] == b'"' && !escaped {
-                    i += 1;
-                    break;
-                }
-                escaped = false;
-                i += 1;
-            }
-            out.push_str(&text[start..i]);
-            continue;
-        }
-        // 字符串外：按 token 前缀匹配替换（先 -Infinity，再 Infinity/NaN）
-        if text[i..].starts_with("-Infinity") {
-            out.push_str("null");
-            i += "-Infinity".len();
-        } else if text[i..].starts_with("Infinity") {
-            out.push_str("null");
-            i += "Infinity".len();
-        } else if text[i..].starts_with("NaN") {
-            out.push_str("null");
-            i += "NaN".len();
-        } else {
-            out.push_str(&text[i..i + 1]);
-            i += 1;
-        }
-    }
-    out
-}
-/// 从 `inspect log dump` JSON 读某个 scorer 的首个 sample score（原始值）。
-///
-/// 返回 `samples[0].scores[<scorer_name>]`，形如
-/// `{"value": "C", "answer": ..., "explanation": ..., "metadata": {...}}`；
-/// scorer 缺失或无样本时返回 None。执行/计划审查都是单样本任务。
-pub fn sample_score<'a>(dump: &'a Value, scorer_name: &str) -> Option<&'a Value> {
-    let samples = dump.get("samples")?.as_array()?;
-    let first = samples.first()?;
-    let scores = first.get("scores")?.as_object()?;
-    scores.get(scorer_name)
-}
-
-/// 执行审查结论（从 eval dump 的 `exec_verdict_scorer` 分数解析）。
-///
-/// 结构化读取：`value` 为等级（C/I/P），`metadata.failure_class` /
-/// `metadata.rationale` 为分流依据；`value` 为 null 即 unscored（解析失败
-/// 或打分器未产出），unscored 原因在 `metadata.unscored_reason`。
-///
-/// 注意：scorer 产出 `{grade, failure_class, rationale}`（限界上下文 §6.9
-/// 的子集），Rust 侧映射为 alfred-core ExecVerdict 时 confidence 取 High
-/// （temperature=0 确定性判分），evidence 空——对齐表未覆盖，记录到 R2 交付。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ExecReviewOutcome {
-    /// 解析出的审查结论（unscored / 未知等级时为 None）。
-    pub verdict: Option<ExecVerdict>,
-    /// unscored 原因（verdict_parse_failure / scorer 缺失 / 未知等级等）。
-    pub unscored_reason: Option<String>,
-    /// 解析失败细节（pydantic 错误等）。
-    pub detail: Option<String>,
-}
-
-/// 从 dump JSON 提取执行审查结论。
-pub fn extract_exec_verdict(dump: &Value) -> ExecReviewOutcome {
-    let score = match sample_score(dump, "exec_verdict_scorer") {
-        Some(s) => s,
-        None => {
-            return ExecReviewOutcome {
-                verdict: None,
-                unscored_reason: Some("exec_verdict_scorer_missing".into()),
-                detail: None,
-            }
-        }
-    };
-    let meta = score
-        .get("metadata")
-        .and_then(|m| m.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let value = score.get("value").and_then(|v| v.as_str());
-    let Some(grade_str) = value else {
-        // unscored：value 为 null
-        return ExecReviewOutcome {
-            verdict: None,
-            unscored_reason: meta
-                .get("unscored_reason")
-                .and_then(|u| u.as_str())
-                .map(String::from)
-                .or_else(|| Some("unscored".into())),
-            detail: meta
-                .get("detail")
-                .and_then(|d| d.as_str())
-                .map(String::from),
-        };
-    };
-    let grade = match grade_str {
-        "C" => VerdictGrade::C,
-        "I" => VerdictGrade::I,
-        "P" => VerdictGrade::P,
-        other => {
-            return ExecReviewOutcome {
-                verdict: None,
-                unscored_reason: Some("unknown_grade".into()),
-                detail: Some(other.to_string()),
-            }
-        }
-    };
-    let failure_class = meta
-        .get("failure_class")
-        .and_then(|f| f.as_str())
-        .and_then(|s| serde_json::from_str::<FailureClass>(&format!("\"{s}\"")).ok());
-    let rationale = meta
-        .get("rationale")
-        .and_then(|r| r.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let explanation = score
-        .get("explanation")
-        .and_then(|e| e.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| rationale.clone());
-    match ExecVerdict::new(grade, failure_class, Confidence::High, vec![], explanation) {
-        Ok(v) => ExecReviewOutcome {
-            verdict: Some(v),
-            unscored_reason: None,
-            detail: None,
-        },
-        Err(e) => ExecReviewOutcome {
-            verdict: None,
-            unscored_reason: Some("verdict_invariant_violation".into()),
-            detail: Some(e),
-        },
-    }
-}
-
-/// eval 子进程 env 白名单（`env_clear` 后注入）。
-///
-/// - 固定项：`PYTHONDONTWRITEBYTECODE=1`（任务 import 时不写 __pycache__）。
+/// - 固定项：`PYTHONDONTWRITEBYTECODE=1`（驱动 import 时不写 __pycache__）。
 /// - 基础变量：PATH/HOME/LANG/TZ/TERM（父进程有则保留）。
-/// - 透传：`ALFRED_*`（ALFRED_INSPECT/ALFRED_STATE_DIR 等按需保留）。
+/// - 透传：`ALFRED_*`（ALFRED_STATE_DIR 等按需保留）。
 ///
 /// 白名单从根上排除继承的凭据形态变量（KEY/TOKEN/SECRET/PASSWORD 及常见
-/// LLM provider 前缀）；executor 凭据单独经 `{PROVIDER}_API_KEY` /
-/// `ALFRED_EXEC_API_KEY` 注入（见 `eval_child_env`）。
+/// LLM provider 前缀）；本角色凭据单独经 `{PROVIDER}_API_KEY` /
+/// `{PROVIDER}_BASE_URL` / `ALFRED_EXEC_API_KEY` 注入（见 `container_child_env`）。
 fn whitelisted_env() -> Vec<(String, String)> {
     let mut envs = vec![("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())];
     for key in ["PATH", "HOME", "LANG", "TZ", "TERM"] {
@@ -522,38 +189,28 @@ fn whitelisted_env() -> Vec<(String, String)> {
     envs
 }
 
-/// 组装 eval 子进程 env（`env_clear` 语义）：白名单 + executor/reviewer 凭据。
+/// 组装驱动子进程 env（`env_clear` 语义）：白名单 + 单角色 provider 凭据。
 ///
-/// Inspect `openai-api/<provider>/<model>` 从 `{PROVIDER}_API_KEY` env 读 key
-/// （不设 `api_key` 模型选项时）；`ALFRED_EXEC_API_KEY` 为规范别名（探针/排障
-/// 用）。两者均不进 argv——`ps` 不可见。reviewer（grader）若与 executor 不同
-/// provider，其 key 一并注入；raw 内建模型（mockllm）无 key 不注入。
-fn eval_child_env(model: &ExecutorModel, grader: Option<&ExecutorModel>) -> Vec<(String, String)> {
+/// Inspect `openai-api/<provider>/<model>` 从 `{PROVIDER}_API_KEY` /
+/// `{PROVIDER}_BASE_URL` env 读 key/base_url（不设模型选项时）；`ALFRED_EXEC_API_KEY`
+/// 为规范别名（探针/排障用）。两者均不进 argv——`ps` 不可见。raw 内建模型
+/// （mockllm）无 key/base_url 不注入。
+fn container_child_env(model: &ExecutorModel) -> Vec<(String, String)> {
     let mut envs = whitelisted_env();
-    push_provider_key(&mut envs, model, true);
-    if let Some(g) = grader {
-        push_provider_key(&mut envs, g, false);
-        // grader 无显式 base_url（model-role 配置不接受 base_url 字段）——
-        // 经 INSPECT_EVAL_MODEL_BASE_URL env 兜底（inspect model_base_url 末级回退）。
-        // 主模型（executor）已有 --model-base-url，不受影响。
-        if !g.raw_id && !g.base_url.is_empty() {
-            envs.push(("INSPECT_EVAL_MODEL_BASE_URL".to_string(), g.base_url.clone()));
-        }
-    }
+    push_provider_creds(&mut envs, model);
     envs
 }
 
-fn push_provider_key(envs: &mut Vec<(String, String)>, m: &ExecutorModel, is_main: bool) {
+fn push_provider_creds(envs: &mut Vec<(String, String)>, m: &ExecutorModel) {
     if m.raw_id || m.api_key.is_empty() {
         return;
     }
-    envs.push((
-        format!("{}_API_KEY", m.provider.to_ascii_uppercase().replace('-', "_")),
-        m.api_key.clone(),
-    ));
-    if is_main {
-        envs.push(("ALFRED_EXEC_API_KEY".to_string(), m.api_key.clone()));
+    let prefix = m.provider.to_ascii_uppercase().replace('-', "_");
+    envs.push((format!("{prefix}_API_KEY"), m.api_key.clone()));
+    if !m.base_url.is_empty() {
+        envs.push((format!("{prefix}_BASE_URL"), m.base_url.clone()));
     }
+    envs.push(("ALFRED_EXEC_API_KEY".to_string(), m.api_key.clone()));
 }
 
 /// 进程是否存活（`/bin/kill -0 <pid>`）。

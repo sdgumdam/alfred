@@ -1,8 +1,12 @@
 //! 一次执行运行的编排（R1 单节点）。
 //!
-//! 流程：建 run 目录 → 快照工作区 → 生成 compose + task.py → spawn
-//! `inspect eval --detach` → 轮询 done → 归档 eval log → 产物采集 →
-//! 写 state.json + audit.jsonl。
+//! 流程：建 run 目录 → 快照工作区 → 生成 compose + driver.py（宿主侧 Inspect
+//! 容器驱动，非 eval）→ spawn `python3 driver.py` → 轮询 done 记录 →
+//! 产物采集（持久 ws git diff）→ 写 state.json + audit.jsonl。
+//!
+//! 依据（三容器 Inspect 统一管）：属主 08-27「容器统一用 Inspect AI 管理」——
+//! 容器经 Inspect 容器管理接口（DockerSandboxEnvironment + sandbox_agent_bridge
+//! + exec_remote）起容器/驱动 pi，不再经 `inspect eval` 评测包装。
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +24,7 @@ use crate::compose_gen::{
     CONTAINER_WORKSPACE_DIR,
 };
 use crate::config::ExecutorModel;
-use crate::driver::{archive_eval_log, poll_until_done, spawn_eval, PollOutcome};
+use crate::driver::{poll_container_driver, spawn_container_driver, DriverOutcome};
 use crate::task_gen::{generate_task_py, TaskGenParams};
 
 /// 单次运行选项。
@@ -41,7 +45,7 @@ pub struct RunOptions {
     pub port_base: u32,
     /// settled 后宽限（秒）。
     pub settle_grace_seconds: f64,
-    /// 是否轮询 `inspect ctl` 观测面。
+    /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
 }
 
@@ -78,7 +82,7 @@ pub struct RunOutcome {
     pub artifact: Option<Artifact>,
     pub started_at: String,
     pub finished_at: String,
-    /// 失败原因（eval status error / timed_out / crashed 各自填）；成功为 None。
+    /// 失败原因（容器驱动 status error / timed_out / crashed 各自填）；成功为 None。
     pub error: Option<String>,
 }
 
@@ -174,7 +178,7 @@ fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
 }
 
 ///
-/// R6d：执行 eval 只出产物——不再绑定 grader（内嵌 scorer 已移除，执行审查
+/// R6d：执行容器只出产物——不再绑定 grader（内嵌 scorer 已移除，执行审查
 /// 由 reviewer 容器承担，见 governance exec_review_step）。
 pub fn execute_run(
     opts: &RunOptions,
@@ -191,7 +195,6 @@ pub fn execute_run(
         None => short_id("run"),
     };
     let run_dir = &opts.run_dir;
-    let evals_dir = run_dir.join("evals");
 
     // 1) 目录与工作区（须先于 compose 生成存在）
     std::fs::create_dir_all(run_dir).with_context(|| format!("create run dir {}", run_dir.display()))?;
@@ -206,7 +209,6 @@ pub fn execute_run(
         std::fs::create_dir_all(workspace_host.join(sub))
             .with_context(|| format!("create workspace subdir {}", workspace_host.join(sub).display()))?;
     }
-    std::fs::create_dir_all(&evals_dir)?;
     canonicalize_workspace(&workspace_host)?;
     // R6e：git 基线（幂等）——executor 改动相对基线可见，reviewer 挂 ws 全量 ro 自己看 git diff。
     init_workspace_git(&workspace_host)?;
@@ -214,7 +216,7 @@ pub fn execute_run(
     // 2) 执行前工作区快照（文件比对基线）
     let before = snapshot_workspace(&workspace_host)?;
 
-    // 3) 生成 compose + task.py
+    // 3) 生成 compose + driver.py（宿主侧 Inspect 容器驱动，非 eval Task）
     let compose_path = run_dir.join("executor.compose.yaml");
     // R6e：executor 容器挂载 = workspace_subdirs 声明子集（rw），非全量 ws（块B：
     // 非空挂载保证——空 subdirs 已被 validate_executor_sandbox 防御性报错）。
@@ -225,87 +227,80 @@ pub fn execute_run(
     };
     let compose = generate_executor_compose(&workspace_host, &opts.image, &mounts)?;
     std::fs::write(&compose_path, compose)?;
-    // 注入 task.py 的 compose 路径必须绝对：inspect 相对自身解析根再拼
-    // 相对路径会双拼（实测 exec-N/<相对路径> 找不到 compose）。
+    // 注入 driver.py 的 compose 路径必须绝对（E1/E3：相对路径被 docker 静默变
+    // named volume；colima 只共享 ~）。
     let compose_abs = compose_path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", compose_path.display()))?;
 
-    let task_py = run_dir.join("task.py");
+    let done_marker = run_dir.join("driver.done.json");
+    let driver_py = run_dir.join("driver.py");
     let py = generate_task_py(&TaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),
         contract_prompt: opts.assignment.contract.prompt.clone(),
-        port_base: opts.port_base,
+        port: opts.port_base,
         pi_model: "inspect-bridge/inspect".to_string(),
+        bridge_model: format!("inspect/{}", model.inspect_model_id()),
+        max_tokens: model.max_tokens,
         workspace_dir: CONTAINER_WORKSPACE_DIR.to_string(),
         sandbox_user: "root".to_string(),
         run_id: run_id.clone(),
         settle_grace_seconds: opts.settle_grace_seconds,
+        time_limit_secs: opts.time_limit_secs,
+        done_marker: done_marker.to_string_lossy().into_owned(),
+        task_name: "alfred-executor".to_string(),
     })?;
-    std::fs::write(&task_py, py)?;
+    std::fs::write(&driver_py, py)?;
 
     append_audit(run_dir, "run_started", &serde_json::json!({ "run_id": run_id, "task_id": opts.assignment.task_id }))?;
 
-    // 4) spawn detached eval
-    let launch = spawn_eval(&task_py, model, None, &evals_dir, opts.time_limit_secs)?;
+    // 4) spawn 宿主侧容器驱动（非 eval）
+    let launch = spawn_container_driver(&driver_py, model, run_dir)?;
     append_audit(
         run_dir,
-        "eval_launched",
-        &serde_json::json!({ "run_id": launch.run_id, "output_file": launch.output_file, "log_dir": launch.log_dir }),
+        "container_driver_launched",
+        &serde_json::json!({ "pid": launch.pid, "done_marker": launch.done_marker }),
     )?;
 
     // 5) 轮询（timeout = time_limit + 缓冲）
     let poll_timeout = opts.time_limit_secs as u64 + 600;
-    let outcome = match poll_until_done(&launch, poll_timeout, opts.ctl_enabled)? {
-        PollOutcome::Done(done) => done,
-        PollOutcome::TimedOut => {
+    let outcome = match poll_container_driver(&launch, poll_timeout)? {
+        DriverOutcome::Done(done) => done,
+        DriverOutcome::TimedOut => {
             // 失败路径填 error（P3）：state.json 落 timed_out 原因后仍以 Err 上报
             let msg = format!(
-                "eval timed out after {}s (no done record in {})",
+                "container driver timed out after {}s (no done record in {})",
                 poll_timeout,
-                launch.output_file.display()
+                launch.done_marker.display()
             );
             fail_run(
                 run_dir, request, opts, model, &run_id, &started_at,
-                "timed_out", None, "eval_timed_out", &msg,
+                "timed_out", None, "container_driver_timed_out", &msg,
             )?;
             bail!(msg);
         }
-        PollOutcome::Crashed => {
+        DriverOutcome::Crashed => {
             // 失败路径填 error（P3）：state.json 落 crashed 原因后仍以 Err 上报
             let msg = format!(
-                "eval process died without a done record (output: {})",
-                launch.output_file.display()
+                "container driver process died without a done record (done: {})",
+                launch.done_marker.display()
             );
             fail_run(
                 run_dir, request, opts, model, &run_id, &started_at,
-                "crashed", None, "eval_crashed", &msg,
+                "crashed", None, "container_driver_crashed", &msg,
             )?;
             bail!(msg);
         }
     };
 
-    // R6d：执行 eval 只出产物无审查行为——归档 eval log（P9 证据）但不再从
-    // dump 提取执行审查结论（内嵌 scorer 已移除；审查由 reviewer 容器承担，
-    // 见 governance exec_review_step）。归档失败仍为硬错误（证据链完整性）。
-    match archive_eval_log(&outcome.location, &evals_dir) {
-        Ok(dump) => {
-            append_audit(
-                run_dir,
-                "eval_log_archived",
-                &serde_json::json!({ "dump": dump }),
-            )?;
-        }
-        Err(e) => {
-            let msg = format!("archive eval log failed: {e:#}");
-            fail_run(
-                run_dir, request, opts, model, &run_id, &started_at,
-                &outcome.status, Some(&outcome.location),
-                "eval_log_archive_failed", &msg,
-            )?;
-            bail!(msg);
-        }
-    };
+    // R6d：执行容器只出产物无审查行为——审查由 reviewer 容器承担（governance
+    // exec_review_step）。驱动证据 = driver.done.json + driver.stdout/stderr.log
+    // （P9 审计），不再有 .eval 文件可归档。
+    append_audit(
+        run_dir,
+        "container_driver_done",
+        &serde_json::json!({ "status": outcome.status, "error": outcome.error }),
+    )?;
     // 7) 产物采集（执行后快照 → diff）
     let artifact = collect_artifact(&opts.assignment.task_id, &workspace_host, &before)?;
     append_audit(
@@ -317,17 +312,23 @@ pub fn execute_run(
     // 8) 落盘 state.json（失败路径 error 填原因——P3：error 不再是死字段）
     let finished_at = now_rfc3339();
     let eval_error = (outcome.status != "success").then(|| {
-        format!(
-            "eval finished with status '{}' (task_id={}, location={})",
-            outcome.status, outcome.task_id, outcome.location
-        )
+        let err = outcome
+            .error
+            .clone()
+            .unwrap_or_else(|| "container driver finished with non-success status".to_string());
+        format!("container driver status '{}': {err}", outcome.status)
     });
     let rec = RunOutcome {
         run_id,
         task_id: opts.assignment.task_id.clone(),
         executor_model: model.inspect_model_id(),
         eval_status: outcome.status.clone(),
-        eval_location: Some(outcome.location.clone()),
+        eval_location: Some(
+            launch
+                .done_marker
+                .to_string_lossy()
+                .into_owned(),
+        ),
         artifact: Some(artifact.clone()),
         started_at,
         finished_at,
@@ -346,8 +347,8 @@ pub fn execute_run(
 
 /// 失败路径统一构造 RunOutcome + 落 audit + 落盘 state.json（不悄悄放行）。
 ///
-/// eval 异常（timed_out/crashed）与 eval log 归档失败共用——不再用 if-let
-/// 静默吞错误。填 error 后以 Err 上报给调用方（不悄悄放行）。
+/// 容器驱动异常（timed_out/crashed/status error）共用——不再用 if-let 静默吞
+/// 错误。填 error 后以 Err 上报给调用方（不悄悄放行）。
 #[allow(clippy::too_many_arguments)]
 fn fail_run(
     run_dir: &Path,
