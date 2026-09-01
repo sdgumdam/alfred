@@ -26,6 +26,9 @@
 #   caseB 离线 maintain②（driver feed revise 属主补充 → key_conclusions 更新）
 #   caseC P1-2 Reply 多轮续入（规划器答复 → state=Planning → driver feed revise
 #         续入属主答复 → 重规划 → 升级挂起）
+#   caseD P2a/P2b Planning 态 Abandon（converse 答复停驻 → feed abandon 无消息、
+#         planner 不可用也能弃 → 终态 Abandoned；不跑 maintain②/不落 owner.message 轮）
+#   caseE Retry 消息可选（feed retry 无 --message → 按来源重审 → 再升级挂起）
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -282,7 +285,126 @@ assert "可以，技术选型用 Rust" in conv["turns"][2]["content"], f"owner t
 # 续入后产出了 dagspec（重规划成功）
 assert os.path.exists(os.path.join(run, "dagspec.json")), "decide revise 后续入未产 dagspec"
 PY
-  echo "PASS(caseC): Planning 态 decide revise 续入 → 重规划 → 升级挂起（多轮闭环）"
+  # ---- Case D：Planning 态 Abandon（P2a/P2b：属主放弃恒可选 + Abandon 前置路由）----
+  # P2a：Planning（converse 答复停驻）→ feed abandon → 终态 Abandoned（此前无
+  #      (Planning, OwnerAbandon) 转移，属主从该态无法终止 run——违背"放弃恒可选"）。
+  # P2b：Abandon 前置路由——不要求消息、不跑 maintain②、不落 owner.message 轮。
+  #      坏 run 也能弃：下面 feed abandon 不带 ALFRED_OFFLINE（planner 容器路径不可用，
+  #      dummy provider 无 docker）——若代码仍跑 maintain②（planner）会失败，Abandon 生效不了。
+  CASE_D="$R6B_RUNS/run-r6b-planning-abandon"
+  rm -rf "$CASE_D"
+  mkdir -p "$CASE_D"
+  cat > "$CASE_D/request.json" <<'JSON'
+{
+  "id": "req-r6b-c4",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+  "created_at": "2026-09-01T00:00:00Z"
+}
+JSON
+  cat > "$CASE_D/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r6b-c4",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
+  cat > "$CASE_D/reply.txt" <<'TXT'
+收到需求。技术选型确认一下：内容用 Rust 实现，可以吗？
+TXT
+  echo "[r6b] caseD: driver run（离线 Reply 分支 → state=Planning，对话继续） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_D/reply.txt" \
+  cargo run --quiet -p alfred-cli --example driver -- run \
+    --request "$CASE_D/request.json" \
+    --run-dir "$CASE_D" \
+    --time-limit 60 \
+    --review-time-limit 60 \
+    --planner-time-limit 60
+
+  python3 - "$CASE_D" <<'PY' || { echo "FAIL(caseD1): Reply 分支 → Planning" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+assert state["state_machine"]["state"] == "planning", f"state={state['state_machine']['state']}"
+PY
+  echo "PASS(caseD1): Reply 分支 → Planning（对话继续）"
+
+  # 坏 run：不带 ALFRED_OFFLINE——planner 容器路径不可用。若 Abandon 仍走 maintain②
+  # （planner）会失败；前置路由应让 Abandon 不触碰 planner 直接进终态。
+  echo "[r6b] caseD: driver feed abandon（无 --message；planner 不可用也能弃） ..."
+  env -u ALFRED_OFFLINE -u ALFRED_OFFLINE_PLAN_FILE -u ALFRED_OFFLINE_REPLY_FILE \
+  cargo run --quiet -p alfred-cli --example driver -- feed \
+    --run-dir "$CASE_D" \
+    --decision abandon
+
+  python3 - "$CASE_D" <<'PY' || { echo "FAIL(caseD2): Planning 态 Abandon 断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+# 终态 Abandoned（P2a：Planning → OwnerAbandon 合法转移）
+assert state["state_machine"]["state"] == "abandoned", f"state={state['state_machine']['state']}"
+# P2b：不落 owner.message 轮、不跑 maintain②——但 Retry/Abandon 决策补落
+# panel.decision 轮（ConversationSource::PanelDecision，reviewer 可见升级拍板，
+# P3 契约）：conversation.json = request.submit → converse.reply → panel.decision
+conv = json.load(open(os.path.join(run, "conversation.json")))
+sources = [t["source"] for t in conv["turns"]]
+assert sources == ["request.submit", "converse.reply", "panel.decision"], \
+    f"sources={sources}"
+assert "owner.message" not in sources, f"sources={sources}"
+# P2b：不跑 maintain②（key_conclusions 无新增）
+assert state["session_doc"]["key_conclusions"] == [], \
+    f"key_conclusions={state['session_doc']['key_conclusions']}"
+# P2b：不设 owner_message（保持 None，无消息轮）
+assert "owner_message" not in state or state["owner_message"] is None, \
+    f"owner_message={state.get('owner_message')}"
+PY
+  echo "PASS(caseD): Planning 态 Abandon → Abandoned（坏 run planner 不可用也能弃）"
+
+  # ---- Case E：Retry 消息可选（--message 不强制非空）----
+  # caseC 结束后 run 处于 Escalated（计划审查 unscored 升级，来源 PlanReview）。
+  # feed retry 不带 --message：不应因消息缺失/为空而 bail——按来源路由回
+  # PlanReviewing 重审同一计划（ALFRED_OFFLINE=1 离线跳过 → unscored → 再升级挂起）。
+  echo "[r6b] caseE: driver feed retry（无 --message → 按来源重审 → 再升级） ..."
+  ALFRED_OFFLINE=1 \
+  cargo run --quiet -p alfred-cli --example driver -- feed \
+    --run-dir "$CASE_C" \
+    --decision retry
+
+  python3 - "$CASE_C" <<'PY' || { echo "FAIL(caseE): Retry 无消息断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+# retry 无消息不应 bail；从 Escalated(PlanReview) 重审同一计划 → 离线跳过 → 再升级挂起
+assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
+# 无消息 → 不新增 owner.message 轮、不跑 maintain②；Retry 决策补落
+# panel.decision 轮（ConversationSource::PanelDecision，P3 契约）
+conv = json.load(open(os.path.join(run, "conversation.json")))
+sources = [t["source"] for t in conv["turns"]]
+assert sources == ["request.submit", "converse.reply", "owner.message", "converse.reply", "panel.decision"], \
+    f"sources={sources}"
+# caseC 的 owner.message 仅一轮（无新增属主消息轮）
+assert sum(1 for s in sources if s == "owner.message") == 1, f"sources={sources}"
+PY
+  echo "PASS(caseE): Retry 无消息可选（重审同一计划 → 再升级挂起）"
+
+  unset ALFRED_CONFIG
 
   unset ALFRED_CONFIG
   echo ""
