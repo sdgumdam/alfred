@@ -318,8 +318,7 @@ echo "[r3] case3: driver feed retry（伪装消息重规划） ..."
 ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --example driver -- feed \
   --run-dir "$CASE3_DIR" \
-  --decision retry \
-  --image "$IMAGE"
+  --decision retry
 # （--message "" = Retry 消息可选：feed_owner_message 无消息跳过消息轮，不做
 #   maintain②/不落 owner.message；--image 沿用 run.options 持久配置，无需重复传）
 
@@ -443,8 +442,7 @@ ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE4_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --example driver -- feed \
   --run-dir "$CASE4_DIR" \
   --decision revise \
-  --message "$CASE4_DIR/supplement.txt" \
-  --image "$IMAGE"
+  --message "$CASE4_DIR/supplement.txt"
 
 assert_state "$CASE4_DIR" "escalated"
 # 断言：第二次 converse 的 llm-calls 记录引用会话文档（review_summary + key_conclusions）
