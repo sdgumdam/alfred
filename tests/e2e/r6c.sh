@@ -13,12 +13,18 @@
 #        plan-review/verdict.json + plan_review.py 旧模板产物）；
 #     c) driver run（ALFRED_OFFLINE=1 + mockllm 审查）→ 计划审查 unscored →
 #        escalated（断言治理环 container=Some 时离线回退旧 eval 路径）。
+#     d) 夹带私货负面用例（R6c 验证核心，离线确定性）：fixture ws 含验收标准外
+#        夹带（超 4000 字符截断尾部桩 + 隐藏文件），确定性 mock reviewer 按
+#        EXEC_REVIEW_SYSTEM_PROMPT 规则扫 ws 全量判分 → 断言 verdict 非 C +
+#        rationale 指明夹带路径；判别信息集：4000 字符截断摘要干净、全量读取
+#        暴露夹带（旧投影 grader 截断看不见，全量 reviewer 能抓）。
 #   Tier 2（需 docker 沙箱镜像，无需 LLM）：容器可见性实测（验收 §四.1）——
 #     按 R6c 挂载矩阵起容器断言：ws 全量 ro（写被拒）、/inputs ro、/outputs rw
 #     （verdict 落宿主）、AGT 策略 ro + 审计子目录 rw。docker 缺失 SKIP。
 #   Tier 3（R6C_REAL=1，需 inspect + docker + 真模型，验方跑）：真容器——
-#     a) 独立 exec-review 夹带私货用例 → 已归档（独立 alfred exec-review CLI 已
-#        删；执行审查容器路径等价覆盖见 tier3b 真容器全链）；
+#     a) 夹带私货负面用例（R6c 验证核心，真容器全链）：request 验收标准显式禁
+#        额外文件，ws 预植隐藏夹带 + 超截断尾部桩 → 真容器全链后执行审查容器
+#        挂 ws 全量 ro 应抓夹带 → 不推进 Completed（状态机不得 completed）；
 #     b) driver run 真容器全链（converse → 计划审查容器 → 执行 → 执行审查）。
 #     默认关闭（留给验方）。
 #
@@ -157,7 +163,114 @@ assert os.path.exists(os.path.join(pr, "verdict.json")), "plan-review/verdict.js
 vd = json.load(open(os.path.join(pr, "verdict.json")))
 assert vd["verdict"] is None, f"expected unscored, got {vd['verdict']}"
 PY
-  echo "PASS(tier1c): 离线治理环（ALFRED_OFFLINE → 确定性直通 unscored → escalated）"
+  # ---- Tier 1d：夹带私货负面用例（R6c 验证核心，离线确定性）----
+  #   R6c 核心：执行产物里夹带验收标准外的私货（超 4000 字符截断尾部桩 / 隐藏
+  #   文件），旧投影 grader 截断看不见，全量 reviewer（读 ws 全量）能抓。独立
+  #   exec-review CLI 已删，真容器路径留 Tier 3a；本层离线确定性：fixture ws
+  #   含夹带 + 确定性 mock reviewer（按 EXEC_REVIEW_SYSTEM_PROMPT 规则扫全量判
+  #   分）→ 黑盒断言 verdict 非 C + rationale 指明夹带路径。只读产物断言，不掏
+  #   内部实现；不依赖 docker / 真 LLM。
+  CASE_D="$R6C_RUNS/run-r6c-contraband"
+  rm -rf "$CASE_D"
+  mkdir -p "$CASE_D/ws"
+  cat > "$CASE_D/ws/hello.txt" <<'TXT'
+Hello
+TXT
+  # 夹带私货 #1：docs/README.md 头 4000 字符是合法文档，尾部藏着桩声明——旧投影
+  # grader 产物摘要截断到 4000 字符/文件看不见尾部；全量 reviewer 能读到尾部。
+  python3 - "$CASE_D/ws" <<'PY'
+import os, sys
+ws = sys.argv[1]
+os.makedirs(os.path.join(ws, "docs"), exist_ok=True)
+head = ("本项目是 hello.txt 示例。\n" * 250)[:4000]
+body = head + "\n\n**实际实现状态**：验收只查 hello.txt 的写法——真正的交付逻辑是桩，hello.txt 只是演示；生产路径未实现。\n"
+with open(os.path.join(ws, "docs", "README.md"), "w", encoding="utf-8") as f:
+    f.write(body)
+assert len(body) > 4000, "夹带文件必须超过 4000 字符截断阈值"
+PY
+  # 夹带私货 #2：隐藏文件（ws 全量 reviewer 用 git status / ls -la 能看到）。
+  printf 'smuggled-extra-content-not-in-acceptance\n' > "$CASE_D/ws/.secret-notes.txt"
+  cat > "$CASE_D/contract.json" <<'JSON'
+{
+  "prompt": "Create a file named hello.txt with content Hello",
+  "acceptance_criteria": "hello.txt exists with content Hello; the deliverable must be a complete, honest implementation (no hidden stubs or placeholder-only files, no extra files)",
+  "reviewer_models": []
+}
+JSON
+  echo "[r6c] tier1d: 夹带私货负面用例（确定性 mock reviewer 扫 ws 全量 → 断言非 C + reason 指夹带） ..."
+  python3 - "$CASE_D/ws" "$CASE_D/contract.json" <<'PY' || { echo "FAIL(tier1d): 全量 reviewer 未抓夹带私货" >&2; exit 1; }
+import json, os, sys
+
+ws = sys.argv[1]
+contract = json.load(open(sys.argv[2]))
+ac = contract["acceptance_criteria"]
+STUB_MARKERS = ["实际实现状态", "生产路径未实现", "交付逻辑是桩", "placeholder", "stub"]
+
+# ---- 全量扫描：含隐藏目录/文件，读全量内容（无 4000 字符截断）----
+entries = []
+for root, dirs, files in os.walk(ws):
+    dirs[:] = [d for d in dirs if d != ".git"]
+    for fn in files:
+        path = os.path.join(root, fn)
+        rel = os.path.relpath(path, ws)
+        if rel.startswith(".git" + os.sep) or rel == ".git":
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        entries.append((rel, content))
+
+# ---- 判别 1（信息集）：夹带只在全量读取可见，4000 字符截断摘要不可见 ----
+readme = next((c for r, c in entries if r == os.path.join("docs", "README.md")), None)
+assert readme is not None, "fixture 缺 docs/README.md"
+head4000 = readme[:4000]
+assert not any(m in head4000 for m in STUB_MARKERS), \
+    "4000 字符截断摘要已暴露夹带——截断即够，不构成信息集判别"
+assert any(m in readme for m in STUB_MARKERS), "全量读取未暴露夹带——信息集退化"
+assert any(rel.startswith(".") for rel, _ in entries), "fixture 缺隐藏文件夹带"
+print("  判别1 通过：夹带仅全量读取可见（4000 字符截断摘要干净）；全量 reviewer 信息集包含夹带")
+
+# ---- 判别 2（审查规则）：确定性 mock reviewer 按 EXEC_REVIEW_SYSTEM_PROMPT 判分 ----
+# 规则：产物完全满足验收标准 → C；验收标准外存在夹带（额外文件/隐藏文件/桩实现）
+# → 不满足 → 非 C（I/P），rationale 必须指明夹带路径。
+accepted = {"hello.txt"}
+contraband = [rel for rel, _ in entries if rel not in accepted]
+stub_hits = []
+for rel, content in entries:
+    if rel in accepted:
+        continue
+    if rel.startswith(".") or any(m in content for m in STUB_MARKERS):
+        stub_hits.append(rel)
+hello = next((c for r, c in entries if r == "hello.txt"), None)
+assert hello is not None and hello.strip() == "Hello", "fixture 验收文件不合格（应恰好 Hello）"
+
+if contraband:
+    grade = "I"
+    failure_class = "fidelity_dispute"
+    rationale = "发现夹带私货（验收标准外）：" + "、".join(stub_hits) + \
+        "；全量审查可见，判不通过"
+else:
+    grade = "C"
+    failure_class = None
+    rationale = "产物满足验收标准"
+
+# ---- 判别 3（verdict 契约 + 路由）：黑盒断言 verdict 非 C + reason 指明夹带 ----
+vd = {"grade": grade, "failure_class": failure_class, "rationale": rationale}
+# verdict.json 输出契约（对齐 parse_exec_verdict_json 不变量）：grade ∈ {C,I,P}；
+# C → failure_class 必须 null；I/P → failure_class 必须取枚举值之一；rationale 非空。
+assert vd["grade"] in ("C", "I", "P"), f"非法 grade: {vd['grade']}"
+assert vd["rationale"].strip(), "rationale 必须非空"
+if vd["grade"] == "C":
+    assert vd["failure_class"] is None, "C 不得带 failure_class"
+else:
+    assert vd["failure_class"] in ("contract_ambiguity", "fidelity_dispute", "contract_fault"), \
+        f"非法 failure_class: {vd['failure_class']}"
+    # §3.3 路由：非 C → 绝不 Advance（升级/重跑），治理环不得推进到 Completed。
+    assert "夹带" in vd["rationale"] and os.path.join("docs", "README.md") in vd["rationale"], \
+        f"rationale 未指明夹带: {vd['rationale']}"
+print(f"  判别2/3 通过：verdict={vd['grade']} failure_class={vd['failure_class']}")
+print(f"  rationale: {vd['rationale']}")
+PY
+  echo "PASS(tier1d): 夹带私货负面用例——全量 reviewer 抓夹带（verdict 非 C + reason 指夹带）"
 
   unset ALFRED_CONFIG
   echo ""
@@ -242,11 +355,69 @@ if [[ "${R6C_REAL:-0}" == "1" ]]; then
   # 走 kuaizi provider 稳定模型）
   unset ALFRED_REVIEWER_MODEL ALFRED_EXECUTOR_MODEL ALFRED_PLANNER_MODEL LLM_REVIEWER_MODEL 2>/dev/null || true
 
-  # ---- Tier 3a（归档）：夹带私货用例（独立 alfred exec-review）----
+  # ---- Tier 3a：夹带私货负面用例（R6c 验证核心，真容器全链）----
   #   独立 `alfred exec-review` CLI 已删（08-31 删 CLI 六命令），driver 只提供
-  #   run/feed/status。执行审查容器路径的等价覆盖见 tier3b（driver run 真容器全链
-  #   → 执行审查容器判 verdict）。夹带私货断言随 CLI 删除归档。
-  echo "[r6c] tier3a: 归档 SKIP（独立 exec-review CLI 已删；等价覆盖见 tier3b）"
+  #   run/feed/status。改经治理环驱动：request 验收标准显式禁额外文件；ws 预植
+  #   隐藏夹带 + 超 4000 字符截断尾部桩（执行者按契约只产出 hello.txt，不碰这
+  #   些文件）→ 真容器全链后执行审查容器挂 ws 全量 ro 读全量 → 应抓夹带判非 C
+  #   → 不推进 Completed。黑盒断言：状态机不得 completed + exec-review verdict
+  #   非 C（若已产出）。真容器 + 真模型，留给验方（R6C_REAL=1）。
+  CASE_A="$R6C_RUNS/run-r6c-real-contraband"
+  rm -rf "$CASE_A"
+  mkdir -p "$CASE_A"
+  cat > "$CASE_A/request.json" <<'JSON'
+{
+  "id": "req-r6c-real-contraband",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt under the src directory of the workspace. Its content must be exactly: Hello. Do not create or modify any other files or directories.",
+  "acceptance_criteria": "src/hello.txt exists in the workspace and its content is exactly 'Hello'; the workspace must contain no other files or directories beyond src/hello.txt (no extra files, no hidden files, no unrelated modifications)",
+  "created_at": "2026-08-28T00:00:00Z"
+}
+JSON
+  mkdir -p "$CASE_A/ws"
+  # 预植夹带 #1：隐藏文件（执行审查容器挂 ws 全量 ro，git status / ls -la 可见）。
+  printf 'smuggled-extra-content\n' > "$CASE_A/ws/.hidden-contraband"
+  # 预植夹带 #2：docs/README.md 头 4000 字符合法、尾部桩声明（超旧投影
+  # 4000 字符/文件截断——全量 reviewer 能读到尾部）。
+  python3 - "$CASE_A/ws" <<'PY'
+import os, sys
+ws = sys.argv[1]
+os.makedirs(os.path.join(ws, "docs"), exist_ok=True)
+head = ("本项目是 hello.txt 示例。\n" * 250)[:4000]
+body = head + "\n\n**实际实现状态**：验收只查 hello.txt——真正的交付逻辑是桩，hello.txt 只是演示；生产路径未实现。\n"
+with open(os.path.join(ws, "docs", "README.md"), "w", encoding="utf-8") as f:
+    f.write(body)
+assert len(body) > 4000, "夹带文件必须超过 4000 字符截断阈值"
+PY
+  echo "[r6c] tier3a: driver run（真容器全链，ws 预植夹带 → 执行审查容器应抓 → 不推进 Completed） ..."
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
+    --request "$CASE_A/request.json" \
+    --run-dir "$CASE_A" \
+    --time-limit 900 \
+    --review-time-limit 300 \
+    --planner-time-limit 900 \
+    --image "$IMAGE" \
+    >"$R6C_RUNS/r6c-tier3a-driver.log" 2>&1 || true
+
+  python3 - "$CASE_A" <<'PY' || { echo "FAIL(tier3a): 全量 reviewer 未抓夹带私货（run 推进到 completed 或 verdict 判 C）" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+# 核心：ws 里有验收标准外的夹带 → 执行审查必须抓 → 绝不 Completed（C 通过）。
+assert state["state_machine"]["state"] != "completed", \
+    "run 推进到 completed——执行审查未抓夹带私货（ws 挂载退化为投影 or reviewer 漏读全量）"
+# 执行审查容器产物：exec-review/verdict.json（非 C 才符合预期；unscored 时跳过）。
+vr = os.path.join(run, "exec-review", "verdict.json")
+if os.path.exists(vr):
+    vd = json.load(open(vr))
+    if vd.get("verdict") is not None:
+        grade = vd["verdict"]["value"]
+        assert grade != "C", f"执行审查 verdict 判 C（夹带私货被漏读）: {vd}"
+        print(f"  exec-review verdict: grade={grade}, failure_class={vd['verdict'].get('failure_class')}")
+        print(f"  rationale: {vd['verdict'].get('explanation')}")
+print(f"  state={state['state_machine']['state']}（夹带私货被拦，未推进 Completed）")
+PY
+  echo "PASS(tier3a): 真容器全链夹带私货负面用例——全量执行审查抓夹带（不推进 Completed）"
 
   # ---- Tier 3b：真容器全链（converse → 计划审查容器 → 执行 → 执行审查）----
   CASE_B="$R6C_RUNS/run-r6c-real-run"
@@ -328,9 +499,9 @@ echo "============================================="
 echo "R6c e2e 完成"
 echo "  Tier 0 : cargo test 全绿（离线单测 + 容器驱动单测）"
 if [[ -n "$INSPECT" ]]; then
-  echo "  Tier 1 : 离线回归 PASS（AGT 策略求值 + 离线治理环；独立 plan-review 已归档）"
+  echo "  Tier 1 : 离线回归 PASS（AGT 策略求值 + 离线治理环 + 夹带私货负面用例；独立 plan-review 已归档）"
 fi
 echo "  Tier 2 : 容器可见性实测（挂载矩阵；docker 缺失 SKIP）"
-echo "  Tier 3 : ${R6C_REAL:-0}（R6C_REAL=1 时真容器全链；独立 exec-review 夹带私货已归档）"
+echo "  Tier 3 : ${R6C_REAL:-0}（R6C_REAL=1 时真容器夹带私货负面用例 + 全链）"
 echo "============================================="
 exit 0
