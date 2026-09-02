@@ -262,6 +262,26 @@ fn run_planner_container(
         .with_context(|| format!("create planner outputs dir {}", outputs_dir.display()))?;
     std::fs::create_dir_all(&ws_dir)
         .with_context(|| format!("create planner ws dir {}", ws_dir.display()))?;
+    // 跨轮残留清理（确定性 bug 根治）：同 run 跨轮复用 `<run_dir>/planner/outputs/`
+    // （create_dir_all 不清理）——轮 1 reply.txt 残留 + 轮 2 instructions.json 并存时，
+    // driver 与宿主双侧"恰好一个候选"检查都误判 wrote both → planning_error_escalated
+    // （两轮改口→建图路径 100% 复现）。每次起容器前清空本轮候选产出文件（bind mount
+    // 即时同步，容器内 /outputs 同步干净）；maintain 上一轮 session.json 同病根一并清
+    // ——容器本轮重写后宿主才读，宿主读取路径不受影响，且杜绝失败轮误读陈旧会话文档。
+    let output_host = |f: &str| {
+        outputs_dir.join(f.trim_start_matches("/outputs/").trim_start_matches('/'))
+    };
+    for f in output_files {
+        match std::fs::remove_file(output_host(f)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("remove stale planner output {}", output_host(f).display())
+                })
+            }
+        }
+    }
 
     for (name, content) in &inputs {
         let path = inputs_dir.join(name);
