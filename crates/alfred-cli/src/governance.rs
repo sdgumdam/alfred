@@ -385,6 +385,11 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
 			.map_err(anyhow::Error::msg)
 			.context("append converse.reply to conversation.json")?;
 			let mut dagspec = dagspec;
+			// 矩阵 §1.1 第 7 行：planner 回看"自己写的契约"——run 级 contract.json 由
+			// 容器驱动首轮落 `{}` 占位（run_planner_container），dagspec 落定时这里写真
+			// 内容（首节点契约投影）。必须在 E5 注入**前**写：reviewer_models 是系统
+			// 注入的审查者信息，规划器不感知（注入后版本只进 dagspec.json 供审查/编排）。
+			write_run_contract(&ctx.run_dir, &dagspec)?;
 			// E5：reviewer_models 由系统从 config roles.reviewer 注入（规划器不感知审查者）。
 			for node in &mut dagspec.nodes {
 				node.contract.reviewer_models = vec![ctx.reviewer_model.model.clone()];
@@ -764,6 +769,16 @@ fn exec_state_is_mechanical(exec_dir: &Path) -> Result<bool> {
 fn write_dagspec(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
     let text = serde_json::to_string_pretty(dagspec).context("serialize dagspec")?;
     std::fs::write(run_dir.join("dagspec.json"), text).context("write dagspec.json")
+}
+
+/// 落盘 run 级契约 contract.json（矩阵 §1.1 第 7 行：planner 挂"自己写的契约" ro 回看）。
+///
+/// 投影真源 = [`alfred_core::DagSpec::contract_json`]（首节点契约全字段，与
+/// reviewer 输入 contract.json 同源）。dagspec 每次落定即重写——重规划轮 planner
+/// 读到的恒为最新一轮自己写的契约。
+fn write_run_contract(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
+    let text = dagspec.contract_json().context("serialize run contract")?;
+    std::fs::write(run_dir.join("contract.json"), text).context("write contract.json")
 }
 
 /// 把 converse 产出的 DagSpec 格式化为语义回复（对话记录 converse.reply 轮的 content）。

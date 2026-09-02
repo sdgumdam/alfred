@@ -60,3 +60,17 @@ impl DagSpec {
         }
     }
 }
+
+impl DagSpec {
+    /// run 级 contract.json 投影（挂载矩阵 §1.1 第 7 行）：计划首节点契约全字段
+    /// JSON 文本；无节点 → "{}" 占位（bind mount 源必须存在，E1）。
+    ///
+    /// 单一真源：planner 回看自己的契约（治理环 planning_step 落盘 run_dir/
+    /// contract.json）与 reviewer 契约全字段输入（plan_review_inputs）共用本投影。
+    pub fn contract_json(&self) -> serde_json::Result<String> {
+        match self.nodes.first() {
+            Some(node) => serde_json::to_string_pretty(&node.contract),
+            None => Ok("{}".to_string()),
+        }
+    }
+}

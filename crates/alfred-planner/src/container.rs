@@ -176,6 +176,7 @@ pub const CONVERSE_DRIVER_PROMPT: &str = r#"你的任务：按两分支规则决
 - /inputs/request.json —— 属主请求（JSON 对象，含 id/title/description/acceptance_criteria）
 - /inputs/session.json —— 会话文档（记忆，JSON 对象：key_file_paths / key_conclusions / owner_feedback）
 - /inputs/owner_message.txt —— 属主本轮消息（文本）
+- /inputs/contract.json —— 你先前落定的计划契约（JSON 对象：prompt + acceptance_criteria；重规划轮回看用，首轮为空对象 {}）
 
 按上面 SYSTEM_PROMPT 的规则二选一（只产其中一种）：
 - 若产出建图指令序列：把 JSON 数组写入 /outputs/instructions.json。
@@ -274,9 +275,11 @@ fn run_planner_container(
             .with_context(|| format!("write planner input {}", path.display()))?;
     }
 
-    // 契约挂载（矩阵 §1.1 第 7 行：planner 挂自己写的契约 ro 回看）；首轮规划
-    // 无契约 → 写空占位，保证 bind mount 源存在（E1：docker 对不存在的宿主文件
-    // 静默建目录，挂载会错）。
+    // 契约挂载（矩阵 §1.1 第 7 行：planner 挂自己写的契约 ro 回看）。首轮规划无契约
+    // → 写空占位，保证 bind mount 源存在（E1：docker 对不存在的宿主文件静默建目录，
+    // 挂载会错）；真实内容由治理环 planning_step 在 dagspec 落定时写入
+    // （governance.rs write_run_contract → DagSpec::contract_json 投影）——重规划轮
+    // 起容器读到的就是 planner 上一轮自己写的契约。
     let contract_path = run_dir.join("contract.json");
     if !contract_path.exists() {
         std::fs::write(&contract_path, "{}")
