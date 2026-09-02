@@ -26,6 +26,12 @@
 #   case4 多挂起消歧：再造一个挂起 run → 无 --run-dir 时发现 2 个挂起 run →
 #         列出清单要求 --run-dir（非零退出）
 #
+#   case5 Planning 态放弃出口（P1-2）：需求收集 → Planning → 整行精确"放弃" →
+#         Abandoned（属主放弃恒可选，owner 唯一入口可达）
+#   case6 PlanRejected 打回（R6e 结构闸门离线确定性命中）：打回意见呈现
+#         （plan_verdicts.last 原始 reason + 产物摘要）→ 重试（P3a 伪装重规划，
+#         断言 disguised + 禁词净化轮）→ 放弃
+
 # CHAT_REAL=1 附加真容器真 LLM REPL 用例（照 r3 真容器模式分层，需 docker +
 # 沙箱镜像 + config.yml 凭据）：stdin 喂需求 → [pi] 真答复/建图 → 改口 →
 # 建图 → 挂起/终态断言 + conversation.json ConverseReply 真轮次 + llm-calls 证据。
@@ -220,6 +226,66 @@ has "$LOG/case4b.err" "$C2_NEW_RUN" case4
 has "$LOG/case4b.err" "$CASE4" case4
 pass case4 "多挂起消歧（列出 2 个挂起 run 要求 --run-dir，exit=${C4_RC}）"
 
+
+# ============================================================================
+# Case 5：Planning 态放弃出口（P1-2：属主放弃恒可选，owner 唯一入口上必须可达）
+# ============================================================================
+CASE5="$STATE/run-chat-case5"
+mkdir -p "$CASE5"
+printf '需求收集后放弃\n按需求\n' | \
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$FIX/reply1.txt" \
+  ALFRED chat --run-dir "$CASE5" > "$LOG/case5a.out" 2> "$LOG/case5a.err"
+assert_state "$CASE5" "planning" case5
+printf '放弃\n' | \
+  ALFRED chat --run-dir "$CASE5" > "$LOG/case5b.out" 2> "$LOG/case5b.err"
+assert_state "$CASE5" "abandoned" case5
+audit_has "$CASE5" '"decision":"Abandon"' || fail case5 "Planning 态精确放弃应路由 Abandon"
+audit_has "$CASE5" '"from_state":"planning"' || fail case5 "放弃应发生在 planning 态"
+pass case5 "Planning 态放弃出口（整行精确匹配 → Abandoned，owner 唯一入口可达）"
+
+# ============================================================================
+# Case 6：PlanRejected 打回（R6e 结构闸门离线确定性命中）→ 打回意见呈现 →
+#         重试（P3a 伪装重规划）→ 再打回 → 放弃
+# ============================================================================
+CASE6="$STATE/run-chat-case6"
+mkdir -p "$CASE6"
+printf '写一个 hello.txt\n按需求\n' | \
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$FIX/reply1.txt" \
+  ALFRED chat --run-dir "$CASE6" > "$LOG/case6a.out" 2> "$LOG/case6a.err"
+assert_state "$CASE6" "planning" case6
+CASE6_REQ_ID="$(python3 -c "import json;print(json.load(open('$CASE6/request.json'))['id'])")"
+write_plan_fixture "$FIX/plan-case6.json" "$CASE6_REQ_ID"
+python3 - "$FIX/plan-case6.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+p["nodes"][0]["sandbox"]["workspace_subdirs"] = []   # 结构闸门命中：缺产物区声明
+json.dump(p, open(sys.argv[1], "w"))
+PY
+printf '直接建图\n' | \
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$FIX/plan-case6.json" \
+  ALFRED chat --run-dir "$CASE6" > "$LOG/case6b.out" 2> "$LOG/case6b.err"
+assert_state "$CASE6" "plan_rejected" case6
+has "$LOG/case6b.out" "计划被打回（PlanRejected）" case6
+has "$LOG/case6b.out" "计划审查意见（打回）" case6
+# 重试 → P3a 伪装：打回理由转写为属主口吻消息驱动重规划（同一缺声明计划再被打回）
+printf '重试\n' | \
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$FIX/plan-case6.json" \
+  ALFRED chat --run-dir "$CASE6" > "$LOG/case6c.out" 2> "$LOG/case6c.err"
+assert_state "$CASE6" "plan_rejected" case6
+audit_has "$CASE6" '"decision":"Retry"' || fail case6 "重试应路由 Retry"
+audit_has "$CASE6" '"disguised":true' || fail case6 "PlanRejected+Retry 应走伪装重规划"
+python3 - "$CASE6" <<'PY' || fail case6 "伪装消息应作为净化后的属主轮落 conversation.json"
+import json, sys
+log = json.load(open(sys.argv[1] + "/conversation.json"))
+assert any(t["role"] == "owner" and t["source"] == "owner.message" and
+           not any(w in t["content"] for w in ("verdict", "打回", "reject"))
+           for t in log["turns"]), "无净化后的属主伪装轮"
+PY
+printf '放弃\n' | \
+  ALFRED chat --run-dir "$CASE6" > "$LOG/case6d.out" 2> "$LOG/case6d.err"
+assert_state "$CASE6" "abandoned" case6
+pass case6 "PlanRejected 打回呈现（verdict 意见）+ 伪装重试闭环 + 放弃"
+
 # ============================================================================
 # 真 LLM REPL 用例（CHAT_REAL=1 门控；照 r3 真容器模式分层）
 # ============================================================================
@@ -232,11 +298,13 @@ if [[ "${CHAT_REAL:-0}" == "1" ]]; then
     export ALFRED_PYTHON="$REPO_ROOT/.plans/r0-lab/venv/bin/python"
   fi
   REAL="$STATE/run-chat-real"
-  # 真对话：需求 → （[pi] 真答复/建图）→ 改口促建图 → 挂起/终态拍板
+  # 真对话（§二.8 改口语义）：需求+先答复要求 → [pi] 真答复（Planning）→ 确认建图
+  # → 自主流转 → 挂起/终态。pi 若跳过答复直接建图，后续行按"终态→新需求"路由
+  # （同样合法），断言与最终状态无关。
   # （子壳内 unset 离线注入 env——env 工具无法调用 shell 函数，走 ALFRED 函数本体）
   (
     unset ALFRED_OFFLINE ALFRED_OFFLINE_PLAN_FILE ALFRED_OFFLINE_REPLY_FILE
-    printf '在 workspace 里写一个 hello.txt，内容必须是 Hello\n按需求\n请直接按需求建图，产出计划，不要再文字答复\n放弃\n' | \
+    printf '在 workspace 里写一个 hello.txt，内容必须是 Hello。先回复我你的理解，等我确认后再建图\n按需求\n确认无误，直接按验收标准建图\n' | \
       ALFRED chat --run-dir "$REAL" > "$LOG/chat-real.out" 2> "$LOG/chat-real.err"
   )
   has "$LOG/chat-real.out" "\[pi\] " chat-real
@@ -245,8 +313,8 @@ if [[ "${CHAT_REAL:-0}" == "1" ]]; then
   python3 - "$REAL" <<'PY' || fail chat-real "conversation.json 应含真实 planner ConverseReply 轮"
 import json, sys
 log = json.load(open(sys.argv[1] + "/conversation.json"))
-assert any(t["role"] == "planner" and t["source"] == "converse_reply" and t["content"].strip()
-           for t in log["turns"]), "无 planner converse_reply 轮"
+assert any(t["role"] == "planner" and t["source"] == "converse.reply" and t["content"].strip()
+           for t in log["turns"]), "无 planner converse.reply 轮"
 PY
   [[ -n "$(ls "$REAL/llm-calls" 2>/dev/null)" ]] || fail chat-real "llm-calls/ 无真实调用证据"
   case "$(state_of "$REAL")" in
