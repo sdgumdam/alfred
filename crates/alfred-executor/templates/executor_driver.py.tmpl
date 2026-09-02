@@ -19,6 +19,14 @@ executor 只出产物：pi 在沙箱内（network none）按契约 prompt 产出
 alfred-executor task_gen.rs::mount_anchor_prompt 生成）：workspace_subdirs[0]
 直接挂为执行者 /workspace 根，契约里该目录名即 /workspace 本身——锚定翻译，
 防「在 src 下创建 f.txt」被误读为 /workspace/src/f.txt（多嵌套一层）。
+
+The AGT boundary-policy extension (`-e /tmp/.agt/agt-policy.ts`) is loaded when
+AGT_EXT is non-empty; policy and audit paths default to
+/tmp/.agt/{policy.json, audit/audit.jsonl} (the audit subdir is mounted rw so
+decisions land on the host — AGT audit trail). The policy keeps the executor's
+default tool surface but denies out-of-workspace writes and dangerous commands
+(rm -rf / sudo / secret reads) at the tool_call level — tool-level permission
+control, not prompt discipline.
 """
 
 import json
@@ -53,6 +61,9 @@ BRIDGE_MODEL = __BRIDGE_MODEL_JSON__
 MAX_TOKENS = int(__MAX_TOKENS__)
 WORKSPACE_DIR = __WORKSPACE_DIR_JSON__
 SANDBOX_USER = __SANDBOX_USER_JSON__
+AGT_EXT = __AGT_EXT_JSON__
+AGT_POLICY_PATH = __AGT_POLICY_PATH_JSON__
+AGT_AUDIT_PATH = __AGT_AUDIT_PATH_JSON__
 RUN_ID = __RUN_ID_JSON__
 SETTLE_GRACE_SECONDS = float(__SETTLE_GRACE_SECONDS__)
 TIME_LIMIT_SECS = float(__TIME_LIMIT_SECS__)
@@ -206,11 +217,19 @@ async def _run_container() -> None:
             sbox = sandbox()
             await _write_models_json(sbox, PORT)
 
+            env = {"PI_OFFLINE": "1", "HOME": "/root"}
+            if AGT_EXT:
+                env["AGT_POLICY_PATH"] = AGT_POLICY_PATH
+                env["AGT_AUDIT_PATH"] = AGT_AUDIT_PATH
+
+            cmd = ["pi", "--mode", "rpc", "--no-session", "--model", PI_MODEL]
+            if AGT_EXT:
+                cmd += ["-e", AGT_EXT]
             proc = await sbox.exec_remote(
-                cmd=["pi", "--mode", "rpc", "--no-session", "--model", PI_MODEL],
+                cmd=cmd,
                 options=ExecRemoteStreamingOptions(
                     cwd=WORKSPACE_DIR,
-                    env={"PI_OFFLINE": "1", "HOME": "/root"},
+                    env=env,
                     user=SANDBOX_USER or None,
                     concurrency=False,
                     stdin_open=True,

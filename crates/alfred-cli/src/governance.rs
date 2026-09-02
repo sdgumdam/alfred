@@ -561,6 +561,9 @@ fn execution_step(
         port_base: run.options.port_base,
         settle_grace_seconds: run.options.settle_grace_seconds,
         ctl_enabled: run.options.ctl_enabled,
+        // AGT 拦写层（executor 行，属主钉死项：权限控制不让写文件）：与
+        // planner/reviewer 共用 `ALFRED_AGT_DIR`；未设 = 不挂（最小环境）。
+        agt_dir: alfred_executor::run::resolve_agt_dir(),
     };
     match execute_run(&opts, &ctx.executor_model, &run.request) {
         Ok(outcome) => {

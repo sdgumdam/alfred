@@ -27,6 +27,12 @@ pub struct TaskGenParams {
     pub workspace_dir: String,
     /// 容器内执行用户（"root"）。
     pub sandbox_user: String,
+    /// AGT 扩展路径（"/tmp/.agt/agt-policy.ts"）；空串 = 不加载。
+    pub agt_ext: String,
+    /// AGT 策略文件容器内路径（"/tmp/.agt/policy.json"）；与 `agt_ext` 同空。
+    pub agt_policy_path: String,
+    /// AGT 审计文件容器内路径（"/tmp/.agt/audit/audit.jsonl"）；与 `agt_ext` 同空。
+    pub agt_audit_path: String,
     /// 样本 id（run id）。
     pub run_id: String,
     /// settled 后的宽限秒数（进程未在 EOF 退出则 kill）。
@@ -79,6 +85,9 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
         ("__MAX_TOKENS__", params.max_tokens.to_string()),
         ("__WORKSPACE_DIR_JSON__", json(&params.workspace_dir)?),
         ("__SANDBOX_USER_JSON__", json(&params.sandbox_user)?),
+        ("__AGT_EXT_JSON__", json(&params.agt_ext)?),
+        ("__AGT_POLICY_PATH_JSON__", json(&params.agt_policy_path)?),
+        ("__AGT_AUDIT_PATH_JSON__", json(&params.agt_audit_path)?),
         ("__RUN_ID_JSON__", json(&params.run_id)?),
         (
             "__SETTLE_GRACE_SECONDS__",
@@ -106,6 +115,9 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
         "__MAX_TOKENS__",
         "__WORKSPACE_DIR_JSON__",
         "__SANDBOX_USER_JSON__",
+        "__AGT_EXT_JSON__",
+        "__AGT_POLICY_PATH_JSON__",
+        "__AGT_AUDIT_PATH_JSON__",
         "__RUN_ID_JSON__",
         "__TIME_LIMIT_SECS__",
         "__DONE_MARKER_JSON__",

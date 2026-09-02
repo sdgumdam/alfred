@@ -1,8 +1,13 @@
 //! 一次执行运行的编排（R1 单节点）。
 //!
 //! 流程：建 run 目录 → 快照工作区 → 生成 compose + driver.py（宿主侧 Inspect
-//! 容器驱动，非 eval）→ spawn `python3 driver.py` → 轮询 done 记录 →
-//! 产物采集（持久 ws git diff）→ 写 state.json + audit.jsonl。
+//! 容器驱动，非 eval；含 AGT 拦写层挂载）→ spawn `python3 driver.py` → 轮询
+//! done 记录 → 产物采集（持久 ws git diff）→ 写 state.json + audit.jsonl。
+//!
+//! AGT 拦写层（属主钉死项：权限控制不让写文件——工具给到，越界写由工具级策略
+//! 拦）：照 planner/reviewer 范式——`prepare_agt_work` 拷策略到 `<run>/agt/` +
+//! compose 挂 `/tmp/.agt` ro（审计子目录 rw）+ driver env 注入 `-e` 扩展，容器
+//! 内 pi 的 tool_call 命中策略即拒（越界写/rm -rf/sudo/秘密读取）并落审计。
 //!
 //! 依据（三容器 Inspect 统一管）：属主 08-27「容器统一用 Inspect AI 管理」——
 //! 容器经 Inspect 容器管理接口（DockerSandboxEnvironment + sandbox_agent_bridge
@@ -47,6 +52,11 @@ pub struct RunOptions {
     pub settle_grace_seconds: f64,
     /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
+    /// AGT 策略 + 扩展目录（源：含 agt-policy.ts + policy.json）。拷贝到
+    /// `<run>/agt/`（策略 ro + 审计子目录 rw）挂 `/tmp/.agt`，容器内 pi 经
+    /// `-e` 加载扩展拦截 tool_call（越界写/危险命令，审计 JSONL 落宿主）。
+    /// None = 不挂 AGT、不加载扩展（`ALFRED_AGT_DIR` 未设，测试/最小环境）。
+    pub agt_dir: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -67,6 +77,7 @@ impl Default for RunOptions {
             port_base: 13100,
             settle_grace_seconds: 20.0,
             ctl_enabled: true,
+            agt_dir: None,
         }
     }
 }
@@ -182,6 +193,51 @@ fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
     Ok(())
 }
 
+/// AGT 目录解析：`ALFRED_AGT_DIR`（executor 边界策略目录）；未设 → None。
+/// 与 planner/reviewer 共用同一 env（策略文件内容不同：executor 用
+/// `tests/e2e/agt/policy.json` 的沙箱边界策略——workspace-write-only /
+/// no-sudo / recursive-delete / host-secret-read / no-host-path-touch）。
+pub fn resolve_agt_dir() -> Option<PathBuf> {
+    std::env::var("ALFRED_AGT_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// AGT 拦写层准备（照 planner/reviewer 范式）：拷贝源 agt 目录（agt-policy.ts +
+/// policy.json）到 `<work>/agt/`，建审计子目录 `audit/`（rw 挂载源，审计 JSONL
+/// 落宿主）。None → 不挂 AGT。
+pub fn prepare_agt_work(work: &Path, agt_dir: &Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(src) = agt_dir else {
+        return Ok(None);
+    };
+    let dest = work.join("agt");
+    std::fs::create_dir_all(&dest)
+        .with_context(|| format!("create executor agt dir {}", dest.display()))?;
+    std::fs::create_dir_all(dest.join("audit")).with_context(|| {
+        format!(
+            "create executor agt audit dir {}",
+            dest.join("audit").display()
+        )
+    })?;
+    std::fs::copy(src.join("agt-policy.ts"), dest.join("agt-policy.ts")).with_context(|| {
+        format!(
+            "copy agt extension {} -> {}",
+            src.join("agt-policy.ts").display(),
+            dest.join("agt-policy.ts").display()
+        )
+    })?;
+    std::fs::copy(src.join("policy.json"), dest.join("policy.json")).with_context(|| {
+        format!(
+            "copy agt policy {} -> {}",
+            src.join("policy.json").display(),
+            dest.join("policy.json").display()
+        )
+    })?;
+    Ok(Some(dest))
+}
+
+
 ///
 /// R6d：执行容器只出产物——不再绑定 grader（内嵌 scorer 已移除，执行审查
 /// 由 reviewer 容器承担，见 governance exec_review_step）。
@@ -218,6 +274,11 @@ pub fn execute_run(
     // R6e：git 基线（幂等）——executor 改动相对基线可见，reviewer 挂 ws 全量 ro 自己看 git diff。
     init_workspace_git(&workspace_host)?;
 
+    // AGT 拦写层（属主钉死项：权限控制不让写文件）：拷贝策略 + 扩展到
+    // `<run>/agt/`（策略 ro），审计子目录 rw（审计 JSONL 落宿主）。照
+    // planner/reviewer 接入范式（prepare_agt_work + /tmp/.agt 挂载 + env 注入
+    // `-e` 扩展）；None = 不挂（`ALFRED_AGT_DIR` 未设，测试/最小环境）。
+    let agt_work = prepare_agt_work(run_dir, &opts.agt_dir)?;
     // 2) 执行前工作区快照（文件比对基线）
     let before = snapshot_workspace(&workspace_host)?;
 
@@ -225,10 +286,14 @@ pub fn execute_run(
     let compose_path = run_dir.join("executor.compose.yaml");
     // R6e：executor 容器挂载 = workspace_subdirs 声明子集（rw），非全量 ws（块B：
     // 非空挂载保证——空 subdirs 已被 validate_executor_sandbox 防御性报错）。
-    // 参考卷/AGT 挂载留待后续块（当前 sandbox 校验已拒绝 volumes；AGT 未接入 run 路径）。
+    // 参考卷仍拒绝（sandbox 校验已拒 volumes）；AGT 拦写层照 reviewer 范式接入：
+    // 策略目录 /tmp/.agt ro（agent 不可改策略）+ 审计子目录 rw（审计落宿主）。
     let mounts = ExecutorMounts {
         workspace_subdirs: opts.assignment.sandbox.workspace_subdirs.clone(),
-        ..Default::default()
+        // 参考卷：sandbox 校验已拒绝 volumes（执行驱动不支持），恒空。
+        ref_volumes: vec![],
+        agt_dir: agt_work.clone(),
+        agt_audit_dir: agt_work.as_ref().map(|p| p.join("audit")),
     };
     let compose = generate_executor_compose(&workspace_host, &opts.image, &mounts)?;
     std::fs::write(&compose_path, compose)?;
@@ -242,6 +307,15 @@ pub fn execute_run(
     // 路径被二次解析（双拼）——与 spawn 层 absolutize_cwd 同源约束。
     let done_marker = absolutize_cwd(&run_dir.join("driver.done.json"));
     let driver_py = run_dir.join("driver.py");
+    // AGT 扩展/策略/审计的容器内路径（照 planner/reviewer 范式；空串 = 不加载）。
+    let (agt_ext, agt_policy_path, agt_audit_path) = match &agt_work {
+        Some(_) => (
+            "/tmp/.agt/agt-policy.ts".to_string(),
+            "/tmp/.agt/policy.json".to_string(),
+            "/tmp/.agt/audit/audit.jsonl".to_string(),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
     let py = generate_task_py(&TaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),
         contract_prompt: opts.assignment.contract.prompt.clone(),
@@ -258,6 +332,9 @@ pub fn execute_run(
         settle_grace_seconds: opts.settle_grace_seconds,
         time_limit_secs: opts.time_limit_secs,
         done_marker: done_marker.to_string_lossy().into_owned(),
+        agt_ext,
+        agt_policy_path,
+        agt_audit_path,
         task_name: "alfred-executor".to_string(),
     })?;
     std::fs::write(&driver_py, py)?;
