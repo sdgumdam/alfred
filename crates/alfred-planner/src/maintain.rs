@@ -19,7 +19,7 @@ use alfred_core::dagspec::DagSpec;
 use alfred_core::session::SessionDoc;
 use alfred_core::verdict::PlanVerdict;
 use alfred_executor::config::ExecutorModel;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crate::disguise::{neutralize_review_language, sanitize_review_summary};
 use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord};
 
@@ -152,12 +152,24 @@ fn maintain_messages(doc: &SessionDoc, trigger: &MaintainTrigger) -> Vec<ChatMes
 /// key_conclusions 取 `content`/`text`/`conclusion`，review_summary 取
 /// `content`/`text`/`summary`），取不到则忽略该元素；标量/null 忽略；顶层
 /// 未知字段忽略。字段为单个字符串（非数组）时当单元素数组。
+/// 顶层不含任何一个已知字段名（如 `{"session_doc":{…}}` 包装形态）→ Err——
+/// 宽松解析此时得到全空文档，静默清空规划器记忆，宁可回退不可清空。
 /// 仍解析失败（如整体非 JSON）→ Err，由调用方（governance）回退旧会话文档。
 pub fn parse_session_doc(text: &str) -> Result<SessionDoc> {
     let cleaned = strip_fences(text);
     let v: serde_json::Value = serde_json::from_str(&cleaned)
         .with_context(|| format!("session doc not JSON: {cleaned}"))?;
     let obj = v.as_object().context("session doc must be a JSON object")?;
+    // P2-1 修复：顶层不含任何一个已知字段名 → 输出形态漂移（如 LLM 把三段包进
+    // {"session_doc":{…}} 包装形态）。宽松解析此时得到全空 SessionDoc，会被调用方
+    // 拿去覆盖 run.session_doc——规划器记忆静默丢失。必须 Err，由调用方走既有回退
+    // （保留旧 session_doc + maintain_warning），宁可回退不可清空。
+    const KNOWN_FIELDS: [&str; 3] = ["key_file_paths", "key_conclusions", "review_summary"];
+    if !KNOWN_FIELDS.iter().any(|f| obj.contains_key(*f)) {
+        bail!(
+            "session doc 顶层对象不含任何已知字段 {KNOWN_FIELDS:?}（输出形态漂移）: {cleaned}"
+        );
+    }
     let mut doc = SessionDoc::new();
     doc.key_file_paths = tolerant_string_array(obj.get("key_file_paths"), &["path", "file"]);
     doc.key_conclusions =
