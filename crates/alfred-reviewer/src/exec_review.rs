@@ -136,7 +136,7 @@ pub fn execute_exec_review(
     let verdict = match parse_exec_verdict_json(&out.output_text) {
         Ok(v) => Some(v),
         Err(e) => {
-            eprintln!("[alfred] warn: exec verdict parse failed: {e}");
+            eprintln!("[orchestrator] warn: exec verdict parse failed: {e}");
             None
         }
     };

@@ -326,7 +326,7 @@ fn execute_plan_review_container(
     let verdict = match parse_plan_verdict_json(&out.output_text) {
         Ok(v) => Some(v),
         Err(e) => {
-            eprintln!("[alfred] warn: plan verdict parse failed: {e}");
+            eprintln!("[orchestrator] warn: plan verdict parse failed: {e}");
             None
         }
     };

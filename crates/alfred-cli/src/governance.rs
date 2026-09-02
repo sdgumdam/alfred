@@ -16,10 +16,15 @@ use alfred_executor::agt::resolve_agt_source;
 use alfred_core::conversation::{
     append_to_disk, load_conversation, ConversationRole, ConversationSource,
 };
-use alfred_core::governance::{GovernanceEvent, GovernanceRun, GovernanceState, OwnerDecision};
+use alfred_core::governance::{
+    GovernanceEvent, GovernanceOptions, GovernanceRun, GovernanceState, OwnerDecision,
+};
+use alfred_core::request::OwnerRequest;
 use alfred_core::util::now_rfc3339;
-use alfred_executor::config::ExecutorModel;
-use alfred_executor::run::{execute_run, RunOptions};
+use alfred_executor::config::{
+    load_executor_model, load_planner_model, load_reviewer_model, ExecutorModel,
+};
+use alfred_executor::run::{ensure_run_workspace, execute_run, RunOptions};
 use alfred_planner::converse::{converse, ConverseOptions, ConverseOutcome};
 use alfred_planner::disguise::disguise_rejection;
 use alfred_planner::maintain::{maintain, MaintainOptions, MaintainTrigger};
@@ -57,6 +62,9 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
             "state_entered",
             &serde_json::json!({ "state": state_label(run.state()) }),
         )?;
+        // 自主流转呈现（工单③）：每次状态进入打一行 [orchestrator] 状态行——
+        // owner（chat 终端 / CLI driver）看到协调者的路由行为。
+        println!("[orchestrator] {}", orchestrator_status_line(run.state()));
         match run.state() {
             alfred_core::governance::GovernanceState::Planning => {
                 // P3 修复：规划侧失败（converse 出错）→ 升级属主（不悄悄放行），
@@ -76,7 +84,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                         run.apply(GovernanceEvent::PlanningError)?;
                         persist_governance_run(&ctx.run_dir, run)?;
                         println!(
-                            "[alfred] 规划失败已升级属主（state=Escalated，挂起）。\n\
+                            "[orchestrator] 规划失败已升级属主（state=Escalated，挂起）。\n\
                              \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
                             ctx.run_dir.display()
                         );
@@ -88,11 +96,7 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                 plan_review_step(run, ctx)?
             }
             alfred_core::governance::GovernanceState::PlanRejected => {
-                println!(
-                    "[alfred] 计划被打回（state=PlanRejected，挂起）。\n\
-                     \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
-                    ctx.run_dir.display()
-                );
+                // 挂起呈现已由循环顶 [orchestrator] 状态行承担。
                 return Ok(None);
             }
             alfred_core::governance::GovernanceState::Executing => {
@@ -102,19 +106,12 @@ pub fn run_governance_loop(run: &mut GovernanceRun, ctx: &GovernanceContext) -> 
                 exec_review_step(run, ctx, &mut pending_exec)?;
             }
             alfred_core::governance::GovernanceState::Completed => {
-                println!("[alfred] 全流程完成（Completed）。验收 C 推进到终点。");
                 return Ok(None);
             }
             alfred_core::governance::GovernanceState::Escalated => {
-                println!(
-                    "[alfred] 已升级属主（state=Escalated，挂起）。\n\
-                     \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
-                    ctx.run_dir.display()
-                );
                 return Ok(None);
             }
             alfred_core::governance::GovernanceState::Abandoned => {
-                println!("[alfred] 属主放弃（Abandoned，终态）。");
                 return Ok(None);
             }
         }
@@ -183,7 +180,8 @@ pub fn feed_owner_message(
 
     // P2b：Abandon 前置路由——不要求消息、不跑 maintain②、不落 owner.message 轮。
     // decision=Abandon 直接 apply(OwnerAbandon) 进终态，不触碰 planner（run 已坏也
-    // 能弃）。Planning 态无 (Planning, OwnerAbandon) 转移会在这里显式报错。
+    // 能弃）。Planning 态走 P2a 转移 (Planning, OwnerAbandon) → Abandoned（属主
+    // 放弃恒可选——转移表已支持，chat 的对话态放弃出口即走此行）。
     if decision == OwnerDecision::Abandon {
         // P3b：升级拍板（abandon）→ 补落 panel.decision 轮（§二.8：升级拍板时的
         // 属主决策；reviewer 挂载对话记录可见拍板）。不触碰 planner（P2b）。
@@ -600,7 +598,7 @@ fn execution_step(
                         &serde_json::json!({ "attempt": run.attempts_used, "budget": run.mechanical_budget, "error": format!("{e:#}") }),
                     )?;
                     println!(
-                        "[alfred] 执行机械失败，按同一契约重跑（{}/{}）：{e}",
+                        "[orchestrator] 执行机械失败，按同一契约重跑（{}/{}）：{e}",
                         run.attempts_used, run.mechanical_budget
                     );
                 } else {
@@ -736,7 +734,7 @@ fn exec_review_step(
                     )?;
                     if suggest_contract_change {
                         println!(
-                            "[alfred] 执行审查 contract_fault：预标注『建议改契约』，升级属主。"
+                            "[orchestrator] 执行审查 contract_fault：预标注『建议改契约』，升级属主。"
                         );
                     }
                 }
@@ -847,6 +845,22 @@ pub fn audit(run_dir: &Path, event: &str, data: &Value) -> Result<()> {
     Ok(())
 }
 
+/// [orchestrator] 流转状态行文本（工单③：owner 可见的编排器路由行为）。
+/// 每次 `run_governance_loop` 状态进入打一行；chat / run / feed 共用同一呈现。
+fn orchestrator_status_line(s: alfred_core::governance::GovernanceState) -> &'static str {
+    use alfred_core::governance::GovernanceState::*;
+    match s {
+        Planning => "规划中（planner converse 建图/对话）…",
+        PlanReviewing => "计划审查中…",
+        PlanRejected => "计划被打回（PlanRejected），挂起等待属主拍板。",
+        Executing => "执行中（沙箱容器）…",
+        ExecReviewing => "执行审查中…",
+        Completed => "全流程完成（Completed）：验收 C 推进到终点。",
+        Escalated => "已升级属主（Escalated），挂起等待属主拍板。",
+        Abandoned => "属主放弃（Abandoned，终态）。",
+    }
+}
+
 /// 状态短标签（audit/打印用）。
 pub fn state_label(s: alfred_core::governance::GovernanceState) -> &'static str {
     use alfred_core::governance::GovernanceState::*;
@@ -871,13 +885,72 @@ fn panel_decision_text(d: OwnerDecision) -> &'static str {
     }
 }
 
-/// 默认治理 run 目录（`$ALFRED_STATE_DIR` 或 `~/.local/state/alfred/runs`）。
-pub fn default_governance_dir() -> PathBuf {
-    let base = std::env::var("ALFRED_STATE_DIR")
+/// 默认治理 runs 基目录（`$ALFRED_STATE_DIR` 或 `~/.local/state/alfred/runs`）——
+/// `run-<id>` 子目录的父目录；`chat` 的 run 发现扫描这里（P3 发现规则）。
+pub fn default_governance_base() -> PathBuf {
+    std::env::var("ALFRED_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
             PathBuf::from(home).join(".local/state/alfred/runs")
-        });
-    base.join(alfred_core::util::short_id("run"))
+        })
+}
+
+/// 默认治理 run 目录（runs 基目录下新起 `run-<id>`，id 纳秒戳唯一）。
+pub fn default_governance_dir() -> PathBuf {
+    default_governance_base().join(alfred_core::util::short_id("run"))
+}
+
+/// 初始化治理 run 目录 + run 实体（`cmd_run` 与 `chat` 需求收集共用的单一初始化
+/// 路径，不复制第二份）：建目录 + R6e 单一持久 ws（git 基线）+ request.json 落盘 +
+/// R6a 对话记录 request.submit 首轮 + GovernanceRun 构造 + governance_started 审计。
+/// 调用方拿到 run 后自行 `run_governance_loop` 推进并 `persist_governance_run`。
+pub fn init_governance_run(
+    run_dir: &Path,
+    request: OwnerRequest,
+    options: GovernanceOptions,
+) -> Result<GovernanceRun> {
+    std::fs::create_dir_all(run_dir)
+        .with_context(|| format!("create run dir {}", run_dir.display()))?;
+    // R6e：治理 run 初始化单一持久 ws（git init 基线快照）——三容器共享此 ws。
+    ensure_run_workspace(run_dir)?;
+    std::fs::write(
+        run_dir.join("request.json"),
+        serde_json::to_string_pretty(&request).context("serialize OwnerRequest")?,
+    )
+    .context("write request.json")?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("run")
+        .to_string();
+    // R6a：对话记录（reviewer 挂载输入数据源，§二.8）——初始需求提交轮。
+    append_to_disk(
+        run_dir,
+        &run_id,
+        ConversationRole::Owner,
+        alfred_planner::format_request_message(&request),
+        ConversationSource::RequestSubmit,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("append request.submit to conversation.json")?;
+    let run = GovernanceRun::new(run_id, request, options);
+    audit(
+        run_dir,
+        "governance_started",
+        &serde_json::json!({ "request_id": run.request.id }),
+    )?;
+    Ok(run)
+}
+
+/// 组装治理驱动上下文（模型配置 + codux wrapper 注入的系统提示）——
+/// `cmd_run` / `cmd_feed` / `chat` 共用，单一真源。
+pub fn build_governance_context(run_dir: &Path) -> Result<GovernanceContext> {
+    Ok(GovernanceContext {
+        run_dir: run_dir.to_path_buf(),
+        planner_model: load_planner_model()?,
+        executor_model: load_executor_model()?,
+        reviewer_model: load_reviewer_model()?,
+        append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
+    })
 }

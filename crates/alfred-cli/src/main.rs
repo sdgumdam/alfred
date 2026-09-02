@@ -6,9 +6,12 @@
 //! owner 在 codux 终端与 pi 对话；wrapper 调度本 bin 驱动治理环。
 //!
 //! 子命令：
+//! - `chat`   [--run-dir <dir>]
+//!     owner 持续会话入口（REPL，codux 调度的常驻会话进程）：需求收集态（两行
+//!     确定性转写 OwnerRequest → 建 run → 提交 planner）/ Planning 对话路由
+//!     （[pi] 答复）/ 挂起升级包呈现与决策精确解析（"重试"/"放弃"/其余 Revise）/
+//!     [orchestrator] 自主流转状态行 / 断点恢复（state.json）。详见 chat.rs。
 //! - `run`    --request <request.json> --run-dir <dir>
-//!             [--time-limit N] [--review-time-limit N] [--planner-time-limit N]
-//!             [--image IMG] [--no-ctl]
 //!     初始化 GovernanceRun（request.submit 首轮 + ws 基线）→ `run_governance_loop`
 //!     推进到挂起/终态。
 //! - `feed`   --run-dir <dir> --decision revise|retry|abandon
@@ -26,19 +29,18 @@
 //! planner pi 的 converse system prompt（容器 + llm-calls 记录，见
 //! alfred-planner::converse 的 `converse_system_prompt`）。P2-1：内存注入端到端生效。
 //! `--help/-h` 与 `--version/-V` 打印后退出 0。输出保持 `[driver] 当前状态` 状态行。
-
 use std::path::{Path, PathBuf};
 
 use alfred_cli::governance::{
-    audit, default_governance_dir, feed_owner_message, load_governance_run,
-    persist_governance_run, run_governance_loop, state_label, GovernanceContext,
+    audit, build_governance_context, default_governance_dir, feed_owner_message,
+    init_governance_run, load_governance_run, persist_governance_run, run_governance_loop,
+    state_label,
 };
-use alfred_core::conversation::{append_to_disk, ConversationRole, ConversationSource};
-use alfred_core::governance::{GovernanceOptions, GovernanceRun, OwnerDecision};
+use alfred_core::governance::{GovernanceOptions, OwnerDecision};
 use alfred_core::request::OwnerRequest;
-use alfred_executor::config::{load_executor_model, load_planner_model, load_reviewer_model};
-use alfred_executor::run::ensure_run_workspace;
 use anyhow::{bail, Context, Result};
+
+mod chat;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,6 +50,7 @@ fn main() -> Result<()> {
         "run" => cmd_run(&args[1..]),
         "feed" => cmd_feed(&args[1..]),
         "status" => cmd_status(&args[1..]),
+        "chat" => chat::cmd_chat(&args[1..]),
         "-h" | "--help" => {
             print_help();
             Ok(())
@@ -56,7 +59,7 @@ fn main() -> Result<()> {
             println!("alfred {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        other => bail!("alfred: 未知子命令 {other:?}（run|feed|status；--help 查看用法）"),
+        other => bail!("alfred: 未知子命令 {other:?}（run|feed|status|chat；--help 查看用法）"),
     }
 }
 
@@ -88,6 +91,7 @@ fn print_help() {
     println!("用法: alfred [--append-system-prompt <value>] <子命令> [参数]");
     println!();
     println!("子命令:");
+    println!("  chat    owner 持续会话入口（REPL：需求收集/对话/拍板/断点恢复；[--run-dir <dir>]）");
     println!("  run     初始化治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 路由）");
     println!("  feed    喂属主决策（revise|retry|abandon）并从挂起态续跑");
     println!("  status  只读打印当前治理环状态");
@@ -142,37 +146,8 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let request: OwnerRequest = serde_json::from_str(&text)
         .with_context(|| format!("parse OwnerRequest {}", request_path.display()))?;
 
-    let planner = load_planner_model()?;
-    let executor = load_executor_model()?;
-    let reviewer = load_reviewer_model()?;
-
-    let run_dir = run_dir.unwrap_or_else(default_governance_dir);
-    std::fs::create_dir_all(&run_dir)
-        .with_context(|| format!("create run dir {}", run_dir.display()))?;
-    // R6e：治理 run 初始化单一持久 ws（git init 基线快照）——三容器共享此 ws。
-    ensure_run_workspace(&run_dir)?;
-    std::fs::write(
-        run_dir.join("request.json"),
-        serde_json::to_string_pretty(&request).context("serialize OwnerRequest")?,
-    )
-    .context("write request.json")?;
-    let run_id = run_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("run")
-        .to_string();
-
-    // R6a：对话记录（reviewer 挂载输入数据源，§二.8）——初始需求提交轮。
-    append_to_disk(
-        &run_dir,
-        &run_id,
-        ConversationRole::Owner,
-        alfred_planner::format_request_message(&request),
-        ConversationSource::RequestSubmit,
-    )
-    .map_err(anyhow::Error::msg)
-    .context("append request.submit to conversation.json")?;
-
+    // 模型配置 + run 目录初始化走共享真源（init_governance_run /
+    // build_governance_context，chat 需求收集同路径，不复制第二份）。
     let options = GovernanceOptions {
         image,
         exec_time_limit_secs: time_limit,
@@ -182,20 +157,9 @@ fn cmd_run(args: &[String]) -> Result<()> {
         settle_grace_seconds: 20.0,
         ctl_enabled: !no_ctl,
     };
-    let mut run = GovernanceRun::new(run_id, request, options);
-    let ctx = GovernanceContext {
-        run_dir: run_dir.clone(),
-        planner_model: planner,
-        executor_model: executor,
-        reviewer_model: reviewer,
-        append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
-    };
-
-    audit(
-        &run_dir,
-        "governance_started",
-        &serde_json::json!({ "request_id": run.request.id }),
-    )?;
+    let run_dir = run_dir.unwrap_or_else(default_governance_dir);
+    let mut run = init_governance_run(&run_dir, request, options)?;
+    let ctx = build_governance_context(&run_dir)?;
     let pending_reply = run_governance_loop(&mut run, &ctx)?;
     persist_governance_run(&run_dir, &run)?;
     audit(
@@ -207,7 +171,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
         // P2-2：规划器答复 surface 给 owner 终端（Reply 分支不产计划，对话继续）。
         println!("[pi] {reply}");
         println!(
-            "[alfred] 规划器已答复属主（state=Planning，对话继续）。run_dir: {}；等待属主界面喂入下一轮消息。",
+            "[orchestrator] 规划器已答复属主（state=Planning，对话继续）。run_dir: {}；等待属主界面喂入下一轮消息。",
             run_dir.display()
         );
     }
@@ -271,23 +235,14 @@ fn cmd_feed(args: &[String]) -> Result<()> {
     };
 
     let mut run = load_governance_run(&run_dir)?;
-    let planner = load_planner_model()?;
-    let executor = load_executor_model()?;
-    let reviewer = load_reviewer_model()?;
-    let ctx = GovernanceContext {
-        run_dir: run_dir.clone(),
-        planner_model: planner,
-        executor_model: executor,
-        reviewer_model: reviewer,
-        append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
-    };
+    let ctx = build_governance_context(&run_dir)?;
 
     let outcome = feed_owner_message(&mut run, &ctx, &message, decision)?;
     if let Some(reply) = &outcome.reply {
         // P2-2：规划器答复 surface 给 owner 终端（Planning 态续入对话后 planner 再答复）。
         println!("[pi] {reply}");
         println!(
-            "[alfred] 规划器已答复属主（state=Planning，对话继续）。run_dir: {}；等待属主界面喂入下一轮消息。",
+            "[orchestrator] 规划器已答复属主（state=Planning，对话继续）。run_dir: {}；等待属主界面喂入下一轮消息。",
             run_dir.display()
         );
     }
