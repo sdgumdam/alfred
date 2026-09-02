@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-/// max_tokens 缺省/下限（reasoning 模型思考耗 token：4096 实测被思考吃光致
+/// max_tokens 缺省值（reasoning 模型思考耗 token：4096 实测被思考吃光致
 /// 正文空 / 无 tool_calls —— R6c tier3b planner converse pi 零工具调用根因）。
-/// 治本在 ModelEntry `maxTokens` serde 生效（alias 已接）；此下限对冲 config
-/// 未显式配置 maxTokens 的场景。
+/// 治本在 ModelEntry `maxTokens` serde 生效（alias 已接）；config 未显式配置
+/// maxTokens 时取此缺省，显式配置的值（含小值）原样尊重（§3.1 模型参数只从文件读）。
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// 同 provider 异构审查警告的进程内去重位：load_config 会被
@@ -36,7 +36,7 @@ pub struct ExecutorModel {
     /// provider api_key（只经 env 注入驱动进程，不进 argv、不进容器）。
     pub api_key: String,
     /// max_tokens（reasoning 模型思考耗 token：4096 实测会被思考吃光致正文空/
-/// 无 tool_calls——默认下限 8192，见 R6c tier3b 根因与 R3 验方实测）。
+    /// 无 tool_calls——缺省 8192，见 R6c tier3b 根因与 R3 验方实测）。
     pub max_tokens: u32,
     /// 原始 inspect 模型 id（不经 openai-api/ 前缀包装），如 mockllm/model。
     pub raw_id: bool,
@@ -145,7 +145,7 @@ fn raw_builtin_model(model_id: &str) -> Option<ExecutorModel> {
 ///   否则取 config roles.<role>。
 /// - mockllm 等 inspect 内建模型走 raw id 分支（无 base_url/key）。
 /// - env 覆盖的模型 id 不在 models 列表时，沿用基础角色模型的 provider
-///   （如 glm-5.2 → zhipucoding），max_tokens 取默认下限 8192——让 e2e
+///   （如 glm-5.2 → zhipucoding），max_tokens 取默认 8192——让 e2e
 ///   能以 `ALFRED_REVIEWER_MODEL=glm-4.7` 指定便宜模型，无需改 config。
 fn load_role_model(role: &str) -> Result<ExecutorModel> {
     let cfg = load_config()?;
@@ -171,7 +171,7 @@ fn load_role_model(role: &str) -> Result<ExecutorModel> {
     let (provider_name, max_tokens) = match entry {
         Some(e) => (
             e.provider.clone(),
-            e.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).max(DEFAULT_MAX_TOKENS),
+            e.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         ),
         None => {
             // env 覆盖的模型不在列表：沿用基础角色的 provider；基础角色缺失
