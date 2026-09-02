@@ -20,12 +20,13 @@
 // 规则文法保持 AGT 子集（and/or/==/!=/in/比较/布尔），策略文件可移植回 AGT
 // Python 引擎；command_patterns 是 AGT Claude Code 钩子的对应物。
 //
-// 加载：`pi -e <path>/agt-policy.ts`（沙箱容器内，配合 /workspace/.agt/ 挂载）。
-// 策略：`AGT_POLICY_PATH`（缺省 /workspace/.agt/policy.json）。
-// 审计：`AGT_AUDIT_PATH`（缺省 /workspace/.agt/audit/audit.jsonl，宿主可见）。
-//   R6a：审计输出子目录 /workspace/.agt/audit 单独 rw 挂载（策略目录 ro），
-//   故默认审计路径落在审计子目录下——agent 可写审计但不可改策略。
-// 默认不启用；启用与否属主拍板（见 .plans/AGT评估.md 拍板项）。
+// 加载：`pi -e /tmp/.agt/agt-policy.ts`（沙箱容器内，策略/审计经 env 注入）。
+// 策略：`AGT_POLICY_PATH`（容器内路径由 driver 注入，如 /tmp/.agt/policy.json）。
+// 审计：`AGT_AUDIT_PATH`（审计子目录单独 rw 挂载，JSONL 落宿主——AGT audit
+//   trail；agent 可写审计但不可改策略）。
+// 属主拍板（AGT 默认启用）：三容器默认挂本扩展（executor 边界策略 / planner·
+// reviewer deny-write 策略，见同目录 <role>/policy.json）；ALFRED_AGT_DISABLE=1
+// 显式关闭，ALFRED_AGT_DIR 显式目录覆盖。
 //
 // 导出：default = pi 扩展工厂；evaluateToolCall/parsePolicy/... = 纯求值核心
 // （供 node tests/e2e/agt/agt-policy.test.mjs 确定性断言，无需 pi 运行时）。
