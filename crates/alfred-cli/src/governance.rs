@@ -2,8 +2,9 @@
 //!
 //! `run_governance_loop` 是编排器状态机的驱动循环：从当前状态出发，一路
 //! 推进到挂起态（PlanRejected / Escalated）或终态（Completed / Abandoned）。
-//! 库调用方（codux driver）以非 CLI 形式驱动它——alfred-cli 不再是 owner
-//! 交互入口（删 alfred CLI 六命令后，owner 交互走 codux 终端）。
+//! owner 交互入口 = `alfred chat`（`chat.rs` 持续会话 REPL，复用本库 +
+//! `feed_owner_message`）；`alfred run/feed/status` 为脚本/e2e 技术 driver。
+//! 每次状态进入打印 `[orchestrator]` 流转状态行（owner 可见的协调者路由行为）。
 //!
 //! 确定性：状态转移全部经 `GovernanceRun.apply()`（alfred-core 状态机），
 //! 每次转移落 audit.jsonl + persist state.json（P3 崩溃恢复显式化）；机械失败
