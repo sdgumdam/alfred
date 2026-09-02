@@ -100,16 +100,16 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                 "[chat] run 处于流转中间态（{}），从断点续跑治理环…",
                 state_label(r.state())
             );
-            drive_loop(run.as_mut().expect("run"), &run_dir)?;
+            match drive_loop(run.as_mut().expect("run"), &run_dir) {
+                Ok(()) => {}
+                Err(e) => reload_after_error(&mut run, &run_dir, &e)?,
+            }
         }
     }
 
     let stdin = io::stdin();
     // 终态呈现一次性标记（进入循环后第一次遇到终态时呈现结果，随后是需求收集态）。
-    let mut fresh_terminal = matches!(
-        run.as_ref().map(GovernanceRun::state),
-        Some(GovernanceState::Completed) | Some(GovernanceState::Abandoned)
-    );
+    let mut fresh_terminal = false;
     loop {
         match run.as_ref().map(GovernanceRun::state) {
             // ── 流转中间态：run_governance_loop 返回时必为挂起/终态/Reply 停驻；
@@ -222,7 +222,10 @@ fn feed_and_present(
     decision: OwnerDecision,
     message: &str,
 ) -> Result<()> {
-    let ctx = build_governance_context(run_dir)?;
+    let ctx = match build_governance_context(run_dir) {
+        Ok(ctx) => ctx,
+        Err(e) => return reload_after_error(run, run_dir, &e),
+    };
     let turns_before = conversation_turn_count(run_dir);
     let mut r = run.take().expect("feed state has run");
     match feed_owner_message(&mut r, &ctx, message, decision) {
