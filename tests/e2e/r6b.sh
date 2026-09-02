@@ -751,8 +751,8 @@ if [[ "${R6B_REAL:-0}" == "1" ]]; then
   AGT_DIR="$R6B_RUNS/run-r6b-agt"
   rm -rf "$AGT_DIR"
   mkdir -p "$AGT_DIR"
-  cp tests/e2e/agt/agt-policy.ts "$AGT_DIR/agt-policy.ts"
-  cp tests/e2e/agt/planner-policy.json "$AGT_DIR/policy.json"
+  cp docker/agt/agt-policy.ts "$AGT_DIR/agt-policy.ts"
+  cp docker/agt/planner/policy.json "$AGT_DIR/policy.json"
   export ALFRED_AGT_DIR="$AGT_DIR"
 
   CASE_T="$R6B_RUNS/run-r6b-real-converse"

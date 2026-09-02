@@ -55,9 +55,9 @@ echo "[agt-exec] sandbox image : $IMAGE"
 RUN_DIR="${AGT_EXEC_DEMO_RUN_DIR:-$REPO_ROOT/tests/e2e/.runs/agt-exec-demo}"
 rm -rf "$RUN_DIR"
 mkdir -p "$RUN_DIR/ws/src" "$RUN_DIR/agt/audit"
-# prepare_agt_work 同款拷贝（executor 边界策略 = tests/e2e/agt/policy.json）
-cp tests/e2e/agt/agt-policy.ts "$RUN_DIR/agt/agt-policy.ts"
-cp tests/e2e/agt/policy.json "$RUN_DIR/agt/policy.json"
+# prepare_agt_work 同款拷贝（executor 边界策略 = docker/agt/executor/policy.json）
+cp docker/agt/agt-policy.ts "$RUN_DIR/agt/agt-policy.ts"
+cp docker/agt/executor/policy.json "$RUN_DIR/agt/policy.json"
 
 # --- 4. compose：executor 挂载语义（generate_executor_compose 同构）---
 cat > "$RUN_DIR/exec.compose.yaml" <<YAML

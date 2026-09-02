@@ -55,8 +55,8 @@ echo "[agt] sandbox image : $IMAGE"
 RUN_DIR="${AGT_DEMO_RUN_DIR:-$REPO_ROOT/tests/e2e/.runs/agt-demo}"
 rm -rf "$RUN_DIR"
 mkdir -p "$RUN_DIR/agt"
-cp tests/e2e/agt/agt-policy.ts "$RUN_DIR/agt/agt-policy.ts"
-cp tests/e2e/agt/policy.json "$RUN_DIR/agt/policy.json"
+cp docker/agt/agt-policy.ts "$RUN_DIR/agt/agt-policy.ts"
+cp docker/agt/executor/policy.json "$RUN_DIR/agt/policy.json"
 
 # --- 4. 生成 compose：network none + 挂载 demo 目录到 /workspace ---
 cat > "$RUN_DIR/demo.compose.yaml" <<YAML

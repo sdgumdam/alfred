@@ -11,10 +11,10 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { evaluateToolCall, parsePolicy } from "./agt-policy.ts";
+import { evaluateToolCall, parsePolicy } from "../../../docker/agt/agt-policy.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const policy = parsePolicy(readFileSync(path.join(here, "reviewer-policy.json"), "utf8"));
+const policy = parsePolicy(readFileSync(path.join(here, "../../../docker/agt/reviewer/policy.json"), "utf8"));
 
 let failures = 0;
 function assert(cond, label) {

@@ -297,8 +297,8 @@ if command -v docker >/dev/null 2>&1; then
     mkdir -p "$MT/ws" "$MT/inputs" "$MT/outputs" "$MT/agt/audit"
     printf 'Hello\n' > "$MT/ws/hello.txt"
     printf '{"id":"req"}' > "$MT/inputs/request.json"
-    cp tests/e2e/agt/agt-policy.ts "$MT/agt/agt-policy.ts"
-    cp tests/e2e/agt/reviewer-policy.json "$MT/agt/policy.json"
+    cp docker/agt/agt-policy.ts "$MT/agt/agt-policy.ts"
+    cp docker/agt/reviewer/policy.json "$MT/agt/policy.json"
     # reviewer 挂载矩阵（§1.1 reviewer 行）：ws 全量 ro + /inputs ro + /outputs rw
     # + AGT 策略 ro + 审计子目录 rw
     docker run --rm --network none \
@@ -351,8 +351,8 @@ if [[ "${R6C_REAL:-0}" == "1" ]]; then
   AGT_DIR="$R6C_RUNS/run-r6c-agt"
   rm -rf "$AGT_DIR"
   mkdir -p "$AGT_DIR"
-  cp tests/e2e/agt/agt-policy.ts "$AGT_DIR/agt-policy.ts"
-  cp tests/e2e/agt/reviewer-policy.json "$AGT_DIR/policy.json"
+  cp docker/agt/agt-policy.ts "$AGT_DIR/agt-policy.ts"
+  cp docker/agt/reviewer/policy.json "$AGT_DIR/policy.json"
   export ALFRED_AGT_DIR="$AGT_DIR"
   # Tier 3 真容器：unset Tier 1 的 mockllm 覆盖，走 config.yml 真实模型
   # （ALFRED_REVIEWER_MODEL=mockllm/model 会吞掉真模型；roles 已按属主指定

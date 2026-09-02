@@ -16,10 +16,10 @@ import {
   evaluateToolCall,
   parsePolicy,
   pathEscapesWorkspace,
-} from "./agt-policy.ts";
+} from "../../../docker/agt/agt-policy.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const policy = parsePolicy(readFileSync(path.join(here, "policy.json"), "utf8"));
+const policy = parsePolicy(readFileSync(path.join(here, "../../../docker/agt/executor/policy.json"), "utf8"));
 
 let failures = 0;
 function assert(cond, label) {
@@ -115,7 +115,7 @@ const d13 = evaluateToolCall(rePolicy, bash("echo hi"));
 assert(d13.decision === "deny" && d13.rule === "bad-re", "非法正则 → 按命中 → deny（fail-closed）");
 
 console.log("== planner-policy.json 语义（target_path 拦写） ==");
-const plannerPolicy = parsePolicy(readFileSync(path.join(here, "planner-policy.json"), "utf8"));
+const plannerPolicy = parsePolicy(readFileSync(path.join(here, "../../../docker/agt/planner/policy.json"), "utf8"));
 
 // §2.4 两分支产出：instructions.json（Instructions 接管）与 reply.txt（Reply 对话继续）都经 /outputs → allow
 const p1 = evaluateToolCall(plannerPolicy, write("/outputs/instructions.json"));
