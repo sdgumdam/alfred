@@ -17,7 +17,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 - [核心架构](#核心架构)
 - [构建与测试](#构建与测试)
 - [配置](#配置)
-- [库 API 与 alfred bin](#库-api-与-alfred-binowner-交互走-codux-终端)
+- [库 API 与 alfred bin](#库-api-与-alfred-binowner-交互走-alfred-chat)
 - [治理环流程](#治理环流程)
 - [端到端测试](#端到端测试)
 - [安全边界](#安全边界)
@@ -29,8 +29,9 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 
 ```
 属主（人）
-  └─ alfred 库（Rust；治理环驱动 alfred-cli::governance，owner 交互走 codux 终端
-       → feed_owner_message；编排器状态机在 alfred-core 内，进程内调用）
+  └─ alfred 库（Rust；治理环驱动 alfred-cli::governance，owner 交互走 `alfred chat`
+       持续会话（codux 调度的常驻 REPL）→ run_governance_loop / feed_owner_message；
+       编排器状态机在 alfred-core 内，进程内调用）
        ├─ planner：容器内 pi 对话 agent（converse 建图 / maintain 会话文档），
        │    经 sandbox_agent_bridge 桥调模型（容器断网 + 宿主代发）→ 产出 → DagSpec
        ├─ 执行：生成宿主侧容器驱动脚本（driver.py，非 eval Task）→ spawn `python3 driver.py`
@@ -52,7 +53,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 | `alfred-planner` | 规划器（converse 建图 / maintain 会话文档维护 / 打回伪装 disguise）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
 | `alfred-executor` | 执行侧：生成 Inspect 容器管理驱动（`driver.py` 非 eval Task）、沙箱 compose、spawn/poll 驱动（done 记录）、产物采集、配置加载 |
 | `alfred-reviewer` | 审查侧：计划/执行审查都在独立 reviewer 容器内完成（driver.py 容器 pi，判忠实度 PlanVerdict / 验收 ExecVerdict） |
-| `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message`，owner 交互经 codux 终端）+ 真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status，消费前置 `--append-system-prompt`，注入的项目上下文追加到 planner pi 系统提示） |
+| `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message` / `init_governance_run` / `build_governance_context`）+ 真实 `alfred` bin（**owner 持续会话入口 `chat`**：需求收集/对话路由/拍板/断点恢复的确定性 REPL，codux 调度的常驻会话进程）+ codux 可调度 CLI driver：run/feed/status（脚本/e2e 技术接口，消费前置 `--append-system-prompt`，注入的项目上下文追加到 planner pi 系统提示） |
 
 ---
 
@@ -92,20 +93,52 @@ env 覆盖：
 
 ---
 
-## 库 API 与 alfred bin（owner 交互走 codux 终端）
+## 库 API 与 alfred bin（owner 交互走 alfred chat）
 
-alfred 出库 API（编排器状态机驱动）+ 真实 `alfred` bin（codux 终端 wrapper
-可调度的 CLI driver，照 omp.rs 范式，不发明面板）：
+alfred 出库 API（编排器状态机驱动）+ 真实 `alfred` bin（照 omp.rs 范式，不发明
+面板）：
 
 - `governance::run_governance_loop(&mut GovernanceRun, &GovernanceContext)`：
   初始化 / 从当前状态推进治理环，直到挂起态（PlanRejected / Escalated）或终态
-  （Completed / Abandoned）。
+  （Completed / Abandoned）。每次状态进入打印 `[orchestrator]` 流转状态行
+  （owner 可见的协调者路由行为）。
 - `governance::feed_owner_message(&mut run, &ctx, message, decision)`：
-  owner 决策入口（codux 终端调它）：设属主消息（revise 重规划 / Planning 态续入
-  对话）、maintain② 固化关键结论、落 conversation.json，按挂起态路由续跑，返回
-  新状态给调用方显示。`decision` ∈ retry | revise | abandon（retry/abandon 消息可选）。
+  owner 决策入口：设属主消息（revise 重规划 / Planning 态续入对话）、maintain②
+  固化关键结论、落 conversation.json，按挂起态路由续跑，返回新状态 + 规划器答复
+  给调用方显示。`decision` ∈ retry | revise | abandon（retry/abandon 消息可选）。
+- `governance::init_governance_run(run_dir, request, options)` /
+  `governance::build_governance_context(run_dir)`：run 目录初始化与驱动上下文
+  组装（`run` 子命令与 `chat` 需求收集共用的单一初始化真源）。
 
-真实 `alfred` bin（`crates/alfred-cli/src/main.rs`，codux 可调度 CLI driver）驱动治理环：
+### alfred chat（owner 持续会话入口）
+
+codux 终端调度的**常驻 REPL 进程**（读 stdin 行 → 打印 → 循环，Ctrl-D/EOF 退出）：
+
+```bash
+alfred chat [--run-dir <dir>]
+```
+
+确定性循环壳（不发明治理机制；LLM 只在被治理容器里），按当前 run 状态路由：
+
+- **入口定位**：显式 `--run-dir` 优先；否则默认 state 基目录（`$ALFRED_STATE_DIR`
+  或 `~/.local/state/alfred/runs`）取 updated_at 最新 run 按态呈现；多挂起 run
+  并存时列出清单要求 `--run-dir` 消歧；REPL 横幅常显 run_dir。
+- **需求收集态**（无 run / 终态后新需求）：第一行=需求 → `[orchestrator]` 确定性
+  转写（title=首行 ≤40 字、id=`chat-<ts>`）→ 追问验收标准（"按需求"=用需求原文）
+  → 建 run → 提交 planner（与 `run` 同一初始化真源）。
+- **Planning 态**（pi 答复后停驻）：行=owner 消息 → feed Revise 续入对话 →
+  `[pi]` 答复（答复与建图计划摘要都从 conversation.json ConverseReply 语义轮
+  呈现）；整行精确 "放弃" → Abandon（属主放弃恒可选）。
+- **挂起态**（escalated/plan_rejected）：升级包呈现（产物摘要 + 审查意见，按态取
+  verdict 历史 / audit 升级事件，owner 全可见）→ 整行精确匹配："重试"→Retry、
+  "放弃"→Abandon、**其余一律 Revise + 整行作属主消息**（最安全分支：进 planner
+  它会追问澄清）。
+- **终态**：呈现结果 + "新需求请直接说"（回需求收集态）。
+- **断点恢复**：run 从 state.json 恢复（每转移 persist）；流转中间态无需属主输入
+  直接续跑；feed/loop 出错 catch + reload 续会话不退进程。
+
+真实 `alfred` bin 的技术 driver 子命令（脚本/e2e 接口，保留不动）驱动治理环：
+
 
 ```bash
 # 运行治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 分级路由 → 挂起/完成）
@@ -163,7 +196,7 @@ Planning → PlanReviewing → Executing → ExecReviewing
 | `r2.sh` | 审查侧两用例：执行审查 C / 部分兑现 P（独立 plan-review 两用例已归档，等价覆盖见 r3 case3 / r6b caseA） | 真 LLM + 离线注入 |
 | `r3.sh` | 治理环闭环：正路径全环 / 机械升级闭环（case2b 归档）/ 打回伪装闭环（feed retry）/ 多轮会话文档（feed revise） | 真 LLM + 离线注入 |
 | `r4.sh` | 属主决策 feed 续跑两用例：escalated→feed abandon→Abandoned / plan_rejected→feed retry→重规划→Escalated（决策面板 RPC 已删归档） | 离线注入 |
-| `escape.sh` | 越界写边界两向验证：容器内 /tmp 写不落宿主 + 工作区写穿透宿主（纯 docker，无 LLM） | 纯容器边界 |
+| `chat.sh` | owner 持续会话（`alfred chat`）黑盒：需求收集+确定性转写+建 run+[pi] 答复 / 建图→[orchestrator] 流转→升级包→拍板（重试/修改/放弃 + "不要重试/别放弃/算了/两词同现"精确匹配边界）/ 终态→新需求回收集态 / run 发现与多挂起消歧；`CHAT_REAL=1` 附加真容器真 LLM REPL 对话 | 离线注入（+ CHAT_REAL=1 真 LLM） |
 | `agt/agt-policy.test.mjs` | AGT 策略求值原型确定性测试（29 断言） | 无 LLM 无容器 |
 | `agt/demo.sh` | AGT 实机演示：沙箱容器内 pi + 策略扩展拦截 `rm -rf`（审计 deny+allow） | 真容器真 LLM（可选演示） |
 | `agt-default.sh` | AGT 默认启用黑盒：二进制落盘内置策略（byte 级 == `docker/agt/`）+ compose 挂载 + driver 注入 + 容器内审计 allow；`ALFRED_AGT_DISABLE=1` 不挂不加载；`AGT_DEFAULT_REAL=1` 附加真容器全链 Completed + 越界写对抗探针（审计 deny） | Tier 1 确定性（mock 驱动）/ Tier 2 真 LLM |
@@ -171,14 +204,14 @@ Planning → PlanReviewing → Executing → ExecReviewing
 **统一入口**：
 
 ```bash
-bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → escape → agt → agt-default，全绿才算过
+bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → chat → escape → agt → agt-default，全绿才算过
 ```
 
 skeleton.sh 头部注释如实说明两种模式：真容器真 LLM（r1 / r2 case1·1b / r3 case1 /
-escape）覆盖"真实执行与审查"；离线注入（r3 case2·3·4 / r4 case1·2，
+escape）覆盖"真实执行与审查"；离线注入（r3 case2·3·4 / r4 case1·2 / chat case1-4，
 `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE`）覆盖"确定性状态机路径"（机械升级、
-伪装打回、feed 属主决策），绕过 planner LLM 保证确定性；agt 为无 LLM 确定性原型测试。
-每步日志落 `tests/e2e/.runs/skeleton-<ts>/<step>.log`。
+伪装打回、feed 属主决策、chat owner 会话路由），绕过 planner LLM 保证确定性；
+agt 为无 LLM 确定性原型测试。
 
 ---
 
@@ -202,13 +235,13 @@ crates/
   alfred-planner/   converse / maintain / disguise / container / task_gen / llm
   alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
   alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
-  alfred-cli/       src/{main.rs (alfred bin: run/feed/status), governance.rs, lib.rs}
+  alfred-cli/       src/{main.rs (alfred bin: chat/run/feed/status), chat.rs, governance.rs, lib.rs}
 docker/
   Dockerfile        沙箱镜像（inspect 基座 + Node 22 + pi-coding-agent 0.84.3）
   agt/              AGT 内置默认策略资产（三角色 policy.json + 共享 agt-policy.ts，编译期内嵌）
   pi-sandbox.compose.yaml  零挂载参考基座（network none）
 tests/
-  e2e/              r1-r4 / escape / skeleton / agt/
+  e2e/              r1-r4 / chat / escape / skeleton / agt/
 .plans/             实施计划 + 各阶段交付/验证报告 + AGT评估.md（gitignore 面，不进版本历史）
 ```
 
