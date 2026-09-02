@@ -13,8 +13,9 @@
 //! - 执行驱动进程只注入 executor 一个 provider 凭据（经 env：`{PROVIDER}_API_KEY`
 //!   + `ALFRED_EXEC_API_KEY`，env_clear + 白名单，不进 argv），容器内经桥只能
 //!   解析 executor 模型。
-//! - forward_generation_config 默认 False；宿主 Model 配置定死 max_tokens（≥8192，
-//!   glm-5.2 是 reasoning 模型）。
+//! - forward_generation_config 默认 False；宿主 Model config 未显式配置 maxTokens
+//!   时缺省 8192（glm-5.2 是 reasoning 模型，4096 会被思考吃光），显式配置的值
+//!   （含小值）原样尊重。
 //! - 完成判定看 driver.done.json done 记录；进程消失无 done = crash。
 
 pub mod artifact;

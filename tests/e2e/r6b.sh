@@ -32,6 +32,9 @@
 #   caseG P2-1 append 透传（--append-system-prompt <memory> → planner converse
 #         system prompt：llm-calls 记录的 converse system prompt 含注入内存 + 基础
 #         建图 schema 仍在；run 与 feed 各验一轮）
+#   caseH maintain Err 回退（feed revise 坏 run：planner 容器不可达 → maintain
+#         回退旧 session_doc + audit maintain_warning(trigger=owner_message) +
+#         owner.message 轮照落 + converse 失败升级属主不悄悄放行）
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -639,6 +642,85 @@ for r in converse:
     assert memory in system, f"{r}: 注入内存标记未透传: {system!r}"
 PY
   echo "PASS(caseG2): feed --append-system-prompt → 新一轮 converse system prompt 含注入内存 + 基础 schema"
+
+  # ---- Case H：maintain Err 回退（feed/plan_review 维护者②的坏 run 行为覆盖）----
+  # caseD 坏 run 范式：先离线跑出非空 session_doc（feed revise 离线 maintain 成功 →
+  # key_conclusions 固化；REPLY_FILE 分支保持 Planning），再 env -u ALFRED_OFFLINE 跑
+  # feed revise——maintain 走容器路径（dummy provider，容器内 LLM 不可达 → 驱动超时
+  # Err）→ 回退旧 session_doc + audit 记 maintain_warning(trigger=owner_message)，
+  # owner.message 轮照落；随后 converse 容器同样失败 → planning_error_escalated 升级
+  # 挂起（不悄悄放行）。断言可观测副产物：maintain_warning、旧 session_doc 保留
+  # （key_conclusions 不丢）、owner.message 轮 + owner_message 设入、升级终态。
+  CASE_H="$R6B_RUNS/run-r6b-maintain-err-fallback"
+  rm -rf "$CASE_H"
+  mkdir -p "$CASE_H"
+  cat > "$CASE_H/request.json" <<'JSON'
+{
+  "id": "req-r6b-c7",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+  "created_at": "2026-09-01T00:00:00Z"
+}
+JSON
+  printf '收到需求。技术选型确认一下：内容用 Rust 实现，可以吗？\n' > "$CASE_H/reply.txt"
+  printf '好，定下来：技术选型用 Rust。\n' > "$CASE_H/reply2.txt"
+  printf '补充：技术选型用 Rust\n' > "$CASE_H/msg1.txt"
+  printf '补充：错误处理要完善\n' > "$CASE_H/msg2.txt"
+  echo "[r6b] caseH: driver run（离线 Reply → Planning）+ feed revise（离线 maintain 固化 key_conclusions） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_H/reply.txt" \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
+    --request "$CASE_H/request.json" \
+    --run-dir "$CASE_H" \
+    --time-limit 60 \
+    --review-time-limit 60 \
+    --planner-time-limit 60
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_H/reply2.txt" \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
+    --run-dir "$CASE_H" \
+    --decision revise \
+    --message "$CASE_H/msg1.txt"
+
+  echo "[r6b] caseH: driver feed revise（坏 run：env -u ALFRED_OFFLINE → maintain 容器 Err → 回退） ..."
+  env -u ALFRED_OFFLINE -u ALFRED_OFFLINE_PLAN_FILE -u ALFRED_OFFLINE_REPLY_FILE \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
+    --run-dir "$CASE_H" \
+    --decision revise \
+    --message "$CASE_H/msg2.txt"
+
+  python3 - "$CASE_H" <<'PY' || { echo "FAIL(caseH): maintain Err 回退断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+# ① audit.jsonl 出现 maintain_warning（trigger=owner_message + 回退旧 doc）——该回退
+#    分支首次被 e2e 行为覆盖；错误文案随环境（docker 有无/超时）不同，不逐字断言。
+warnings = []
+for line in open(os.path.join(run, "audit.jsonl")):
+    rec = json.loads(line)
+    if rec["event"] == "maintain_warning":
+        warnings.append(rec["data"])
+assert len(warnings) == 1, f"maintain_warning events={warnings}"
+assert warnings[0]["trigger"] == "owner_message", f"trigger={warnings[0]['trigger']}"
+assert warnings[0]["fallback"] == "keep_previous_session_doc", f"fallback={warnings[0]['fallback']}"
+# ② 旧 session_doc 保留：feed#1 离线 maintain 固化的 key_conclusions 不因 maintain
+#    Err 丢失/清空（keep_previous_session_doc 回退语义的可观测面）。
+state = json.load(open(os.path.join(run, "state.json")))
+assert state["session_doc"]["key_conclusions"] == ["补充：技术选型用 Rust"], \
+    f"key_conclusions={state['session_doc']['key_conclusions']}"
+# ③ owner.message 轮照落 + owner_message 设入坏 feed 的属主消息（回退不吞消息轮）。
+assert state["owner_message"] == "补充：错误处理要完善", f"owner_message={state['owner_message']}"
+conv = json.load(open(os.path.join(run, "conversation.json")))
+sources = [t["source"] for t in conv["turns"]]
+assert sources == ["request.submit", "converse.reply", "owner.message", "converse.reply", "owner.message"], \
+    f"sources={sources}"
+assert conv["turns"][-1]["role"] == "owner" and conv["turns"][-1]["content"] == "补充：错误处理要完善", \
+    f"last turn={conv['turns'][-1]}"
+# ④ 治理环不悄悄放行：converse 容器失败 → planning_error_escalated 升级挂起。
+assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
+esc = [json.loads(l)["data"] for l in open(os.path.join(run, "audit.jsonl"))
+       if json.loads(l)["event"] == "planning_error_escalated"]
+assert esc, "planning_error_escalated missing（converse 失败未升级属主）"
+PY
+  echo "PASS(caseH): maintain Err 回退（maintain_warning + 旧 session_doc 保留 + owner.message 轮 + 升级不悄悄放行）"
 
   unset ALFRED_CONFIG
 
