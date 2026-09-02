@@ -5,9 +5,11 @@
 //! done 记录 → 产物采集（持久 ws git diff）→ 写 state.json + audit.jsonl。
 //!
 //! AGT 拦写层（属主钉死项：权限控制不让写文件——工具给到，越界写由工具级策略
-//! 拦）：照 planner/reviewer 范式——`prepare_agt_work` 拷策略到 `<run>/agt/` +
-//! compose 挂 `/tmp/.agt` ro（审计子目录 rw）+ driver env 注入 `-e` 扩展，容器
-//! 内 pi 的 tool_call 命中策略即拒（越界写/rm -rf/sudo/秘密读取）并落审计。
+//! 拦；属主拍板默认启用）：照 planner/reviewer 范式——`prepare_agt_work` 落策略
+//! 到 `<run>/agt/` + compose 挂 `/tmp/.agt` ro（审计子目录 rw）+ driver env 注入
+//! `-e` 扩展，容器内 pi 的 tool_call 命中策略即拒（越界写/rm -rf/sudo/秘密读取）
+//! 并落审计。未设 `ALFRED_AGT_DIR` 用内置默认策略（`docker/agt/executor/`）；
+//! `ALFRED_AGT_DISABLE=1` 显式关闭（见 crate::agt）。
 //!
 //! 依据（三容器 Inspect 统一管）：属主 08-27「容器统一用 Inspect AI 管理」——
 //! 容器经 Inspect 容器管理接口（DockerSandboxEnvironment + sandbox_agent_bridge
@@ -16,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use crate::agt::{assets, prepare_agt_work, AgtSource};
 use alfred_core::artifact::Artifact;
 use alfred_core::assignment::TaskAssignment;
 use alfred_core::contract::SandboxProfile;
@@ -52,11 +55,9 @@ pub struct RunOptions {
     pub settle_grace_seconds: f64,
     /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
-    /// AGT 策略 + 扩展目录（源：含 agt-policy.ts + policy.json）。拷贝到
-    /// `<run>/agt/`（策略 ro + 审计子目录 rw）挂 `/tmp/.agt`，容器内 pi 经
-    /// `-e` 加载扩展拦截 tool_call（越界写/危险命令，审计 JSONL 落宿主）。
-    /// None = 不挂 AGT、不加载扩展（`ALFRED_AGT_DIR` 未设，测试/最小环境）。
-    pub agt_dir: Option<PathBuf>,
+    /// AGT 拦写层源（默认内置策略；`ALFRED_AGT_DIR` 显式目录沿用覆盖；
+    /// `ALFRED_AGT_DISABLE=1` 关）。Off = 不挂 AGT、不加载扩展。
+    pub agt: AgtSource,
 }
 
 impl Default for RunOptions {
@@ -77,7 +78,7 @@ impl Default for RunOptions {
             port_base: 13100,
             settle_grace_seconds: 20.0,
             ctl_enabled: true,
-            agt_dir: None,
+            agt: AgtSource::Builtin,
         }
     }
 }
@@ -193,49 +194,6 @@ fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
     Ok(())
 }
 
-/// AGT 目录解析：`ALFRED_AGT_DIR`（executor 边界策略目录）；未设 → None。
-/// 与 planner/reviewer 共用同一 env（策略文件内容不同：executor 用
-/// `tests/e2e/agt/policy.json` 的沙箱边界策略——workspace-write-only /
-/// no-sudo / recursive-delete / host-secret-read / no-host-path-touch）。
-pub fn resolve_agt_dir() -> Option<PathBuf> {
-    std::env::var("ALFRED_AGT_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-}
-
-/// AGT 拦写层准备（照 planner/reviewer 范式）：拷贝源 agt 目录（agt-policy.ts +
-/// policy.json）到 `<work>/agt/`，建审计子目录 `audit/`（rw 挂载源，审计 JSONL
-/// 落宿主）。None → 不挂 AGT。
-pub fn prepare_agt_work(work: &Path, agt_dir: &Option<PathBuf>) -> Result<Option<PathBuf>> {
-    let Some(src) = agt_dir else {
-        return Ok(None);
-    };
-    let dest = work.join("agt");
-    std::fs::create_dir_all(&dest)
-        .with_context(|| format!("create executor agt dir {}", dest.display()))?;
-    std::fs::create_dir_all(dest.join("audit")).with_context(|| {
-        format!(
-            "create executor agt audit dir {}",
-            dest.join("audit").display()
-        )
-    })?;
-    std::fs::copy(src.join("agt-policy.ts"), dest.join("agt-policy.ts")).with_context(|| {
-        format!(
-            "copy agt extension {} -> {}",
-            src.join("agt-policy.ts").display(),
-            dest.join("agt-policy.ts").display()
-        )
-    })?;
-    std::fs::copy(src.join("policy.json"), dest.join("policy.json")).with_context(|| {
-        format!(
-            "copy agt policy {} -> {}",
-            src.join("policy.json").display(),
-            dest.join("policy.json").display()
-        )
-    })?;
-    Ok(Some(dest))
-}
 
 
 ///
@@ -274,11 +232,11 @@ pub fn execute_run(
     // R6e：git 基线（幂等）——executor 改动相对基线可见，reviewer 挂 ws 全量 ro 自己看 git diff。
     init_workspace_git(&workspace_host)?;
 
-    // AGT 拦写层（属主钉死项：权限控制不让写文件）：拷贝策略 + 扩展到
-    // `<run>/agt/`（策略 ro），审计子目录 rw（审计 JSONL 落宿主）。照
-    // planner/reviewer 接入范式（prepare_agt_work + /tmp/.agt 挂载 + env 注入
-    // `-e` 扩展）；None = 不挂（`ALFRED_AGT_DIR` 未设，测试/最小环境）。
-    let agt_work = prepare_agt_work(run_dir, &opts.agt_dir)?;
+    // AGT 拦写层（默认启用）：落策略 + 扩展到 `<run>/agt/`（策略 ro），审计
+    // 子目录 rw（审计 JSONL 落宿主）。未设 env = 内置默认策略；`ALFRED_AGT_DIR`
+    // 显式目录沿用覆盖；`ALFRED_AGT_DISABLE=1` 不挂。照 planner/reviewer 范式
+    // （prepare_agt_work + /tmp/.agt 挂载 + env 注入 `-e` 扩展）。
+    let agt_work = prepare_agt_work(run_dir, &opts.agt, assets::EXECUTOR_POLICY)?;
     // 2) 执行前工作区快照（文件比对基线）
     let before = snapshot_workspace(&workspace_host)?;
 

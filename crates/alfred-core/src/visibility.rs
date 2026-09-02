@@ -169,9 +169,9 @@ pub enum WritePolicy {
     /// 结构性拒绝写类工具（write/edit/rename/delete/mkdir/move/copy/create +
     /// bash 写重定向）——planner/reviewer；每次被拒决策落 AGT 审计 JSONL。
     DenyWrite,
-    /// AGT 边界策略（`tests/e2e/agt/policy.json`：workspace-write-only / no-sudo /
-    /// no-host-path-touch / host-secret-read / recursive-delete）——executor
-    /// 默认启用（M2 已定 a）。
+    /// AGT 边界策略（`docker/agt/executor/policy.json`：workspace-write-only /
+    /// no-sudo / no-host-path-touch / host-secret-read / recursive-delete）——
+    /// executor 默认启用（M2 已定 a；属主拍板 AGT 默认启用）。
     AgtBoundary,
 }
 

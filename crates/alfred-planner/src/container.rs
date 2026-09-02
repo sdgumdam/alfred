@@ -25,6 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
+use alfred_executor::agt::{assets, prepare_agt_work, resolve_agt_source, AgtSource};
 use alfred_core::request::OwnerRequest;
 use alfred_core::session::SessionDoc;
 use alfred_executor::compose_gen::canonicalize_workspace;
@@ -65,9 +66,9 @@ pub struct PlannerContainerOptions {
     pub settle_grace_seconds: f64,
     /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
-    /// AGT 策略 + 扩展目录（挂 `/tmp/.agt` ro；含 policy.json + agt-policy.ts）。
-    /// None = 不挂 AGT、不加载扩展（测试/最小环境）。
-    pub agt_dir: Option<PathBuf>,
+    /// AGT 拦写层源（默认内置策略；`ALFRED_AGT_DIR` 显式目录沿用覆盖；
+    /// `ALFRED_AGT_DISABLE=1` 关）。Off = 不挂 AGT、不加载扩展。
+    pub agt: AgtSource,
 }
 
 impl Default for PlannerContainerOptions {
@@ -79,7 +80,7 @@ impl Default for PlannerContainerOptions {
             time_limit_secs: 600,
             settle_grace_seconds: 20.0,
             ctl_enabled: true,
-            agt_dir: None,
+            agt: AgtSource::Builtin,
         }
     }
 }
@@ -94,18 +95,11 @@ impl PlannerContainerOptions {
             time_limit_secs: opts.planner_time_limit_secs,
             settle_grace_seconds: opts.settle_grace_seconds,
             ctl_enabled: opts.ctl_enabled,
-            agt_dir: resolve_agt_dir(),
+            agt: resolve_agt_source(),
         }
     }
 }
 
-/// AGT 目录解析：`ALFRED_AGT_DIR`（规划器拦写策略目录）；未设 → None。
-pub fn resolve_agt_dir() -> Option<PathBuf> {
-    std::env::var("ALFRED_AGT_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-}
 
 /// planner 容器运行结果（宿主侧读取）。
 #[derive(Debug, Clone)]
@@ -286,9 +280,11 @@ fn run_planner_container(
             .with_context(|| format!("write planner contract placeholder {}", contract_path.display()))?;
     }
 
-    // AGT 拦写层：拷贝策略 + 扩展到 `<work>/agt/`（策略 ro），审计子目录 rw
-    // （审计 JSONL 落宿主）。None = 不挂 AGT。
-    let agt_work = prepare_agt_work(&work, &opts.agt_dir)?;
+    // AGT 拦写层（默认启用）：落策略 + 扩展到 `<work>/agt/`（策略 ro），审计
+    // 子目录 rw（审计 JSONL 落宿主）。未设 env = 内置默认策略（planner 用
+    // `docker/agt/planner/policy.json`）；`ALFRED_AGT_DIR` 显式目录沿用覆盖；
+    // `ALFRED_AGT_DISABLE=1` 不挂。
+    let agt_work = prepare_agt_work(&work, &opts.agt, assets::PLANNER_POLICY)?;
 
     // E1/E3：挂载路径必须 canonicalize 成绝对路径（相对路径被 docker 静默变
     // named volume；colima 只共享 ~）。
@@ -491,33 +487,6 @@ fn render_planner_compose(
     Ok(out)
 }
 
-/// AGT 拦写层准备：拷贝源 agt 目录（agt-policy.ts + policy.json）到 `<work>/agt/`，
-/// 建审计子目录 `audit/`（rw 挂载源）。None → 不挂 AGT。
-fn prepare_agt_work(work: &Path, agt_dir: &Option<PathBuf>) -> Result<Option<PathBuf>> {
-    let Some(src) = agt_dir else {
-        return Ok(None);
-    };
-    let dest = work.join("agt");
-    std::fs::create_dir_all(&dest)
-        .with_context(|| format!("create planner agt dir {}", dest.display()))?;
-    std::fs::create_dir_all(dest.join("audit"))
-        .with_context(|| format!("create planner agt audit dir {}", dest.join("audit").display()))?;
-    std::fs::copy(src.join("agt-policy.ts"), dest.join("agt-policy.ts")).with_context(|| {
-        format!(
-            "copy agt extension {} -> {}",
-            src.join("agt-policy.ts").display(),
-            dest.join("agt-policy.ts").display()
-        )
-    })?;
-    std::fs::copy(src.join("policy.json"), dest.join("policy.json")).with_context(|| {
-        format!(
-            "copy agt policy {} -> {}",
-            src.join("policy.json").display(),
-            dest.join("policy.json").display()
-        )
-    })?;
-    Ok(Some(dest))
-}
 
 /// 内嵌 planner compose 模板（R6a 落码，唯一真源）。
 const PLANNER_COMPOSE_TMPL: &str = include_str!("../../../docker/planner.compose.yaml.tmpl");

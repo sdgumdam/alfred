@@ -8,6 +8,8 @@
 //!    `driver.done.json` done 记录。
 //! 4. `artifact`：容器 workspace 卷的文件比对（前后快照 diff）。
 //! 5. `config`：R1 最小 executor 配置（roles.executor → 模型 → provider）。
+//! 6. `agt`：AGT 拦写层共享真源（三容器同一机制：内置默认资产 + env 解析 +
+//!    staging；planner/reviewer 经本 crate 复用，默认启用、`ALFRED_AGT_DISABLE=1` 关）。
 //!
 //! P1/P2 审计约束（R0报告）：
 //! - 执行驱动进程只注入 executor 一个 provider 凭据（经 env：`{PROVIDER}_API_KEY`
@@ -18,6 +20,7 @@
 //!   （含小值）原样尊重。
 //! - 完成判定看 driver.done.json done 记录；进程消失无 done = crash。
 
+pub mod agt;
 pub mod artifact;
 pub mod compose_gen;
 pub mod config;

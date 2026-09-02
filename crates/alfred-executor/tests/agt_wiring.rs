@@ -1,9 +1,11 @@
 //! alfred-executor 黑盒测试：executor run 路径 AGT 接线（属主钉死项：权限控制
-//! 不让写文件——工具给到，越界写由工具级策略在 tool_call 处拦截）。
+//! 不让写文件——工具给到，越界写由工具级策略在 tool_call 处拦截；属主拍板
+//! **默认启用**，`ALFRED_AGT_DISABLE=1` opt-out）。
 //!
 //! 可观测行为（run 路径三处接线，照 planner/reviewer 范式）：
-//!   1. `prepare_agt_work`：拷贝 agt-policy.ts + policy.json 到 `<work>/agt/` +
-//!      建 `audit/` 子目录（rw 挂载源）；None → 不挂。
+//!   1. `prepare_agt_work`（alfred_executor::agt）：Builtin 落内嵌默认资产（
+//!      `docker/agt/`）到 `<work>/agt/` + 建 `audit/` 子目录（rw 挂载源）；
+//!      Dir 拷显式目录（`ALFRED_AGT_DIR` 覆盖面）；Off → 不挂。
 //!   2. `generate_executor_compose`：AGT 目录 Some → `/tmp/.agt:ro` 策略卷 +
 //!      `/tmp/.agt/audit:rw` 审计卷（R6a 拆分挂载：可写审计不可改策略）；
 //!      None → 无 AGT 卷行。
@@ -17,13 +19,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use alfred_executor::agt::{assets, prepare_agt_work, resolve_agt_source, AgtSource};
 use alfred_executor::compose_gen::{generate_executor_compose, ExecutorMounts};
-use alfred_executor::run::{prepare_agt_work, resolve_agt_dir};
 use alfred_executor::task_gen::{generate_task_py, TaskGenParams};
 
-/// 仓库内 AGT 源目录（agt-policy.ts + policy.json；executor 用沙箱边界策略）。
-fn agt_src_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/agt")
+/// 内置默认资产真源文件（拷贝保真断言的对照面）。
+fn agt_asset(policy_rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/agt").join(policy_rel)
+}
+
+/// 显式目录模式（`ALFRED_AGT_DIR` 覆盖面）的源目录：仓库资产拷贝合成
+/// （源目录契约 = agt-policy.ts + policy.json 同目录）。
+fn stage_explicit_dir(label: &str) -> PathBuf {
+    let dir = temp_dir_under_home(label);
+    fs::copy(agt_asset("agt-policy.ts"), dir.join("agt-policy.ts")).unwrap();
+    fs::copy(agt_asset("executor/policy.json"), dir.join("policy.json")).unwrap();
+    dir
 }
 
 /// compose 生成的 canonicalize 校验要求目录在 HOME 下（E3：colima 只共享 ~），
@@ -47,23 +58,24 @@ fn make_workspace(label: &str) -> PathBuf {
 }
 
 #[test]
-fn prepare_agt_work_copies_policy_and_creates_audit_dir() {
+fn prepare_agt_work_builtin_stages_embedded_assets() {
     let work = temp_dir_under_home("prepare");
-    let staged = prepare_agt_work(&work, &Some(agt_src_dir())).expect("prepare agt work");
-    let staged = staged.expect("Some(agt dir) → staged dir");
+    let staged = prepare_agt_work(&work, &AgtSource::Builtin, assets::EXECUTOR_POLICY)
+        .expect("prepare agt work");
+    let staged = staged.expect("Builtin → staged dir");
 
     assert_eq!(staged, work.join("agt"));
     let copied_ext = fs::read(staged.join("agt-policy.ts")).expect("copied extension");
     let copied_policy = fs::read(staged.join("policy.json")).expect("copied policy");
     assert_eq!(
         copied_ext,
-        fs::read(agt_src_dir().join("agt-policy.ts")).expect("source extension"),
-        "extension 拷贝保真"
+        fs::read(agt_asset("agt-policy.ts")).expect("repo extension asset"),
+        "extension 落盘保真（内嵌 == 仓库资产）"
     );
     assert_eq!(
         copied_policy,
-        fs::read(agt_src_dir().join("policy.json")).expect("source policy"),
-        "policy 拷贝保真"
+        fs::read(agt_asset("executor/policy.json")).expect("repo policy asset"),
+        "policy 落盘保真（内嵌 == 仓库资产）"
     );
     assert!(staged.join("audit").is_dir(), "审计子目录必须存在（rw 挂载源）");
 
@@ -71,11 +83,12 @@ fn prepare_agt_work_copies_policy_and_creates_audit_dir() {
 }
 
 #[test]
-fn prepare_agt_work_none_is_noop() {
-    let work = temp_dir_under_home("prepare-none");
-    let staged = prepare_agt_work(&work, &None).expect("None → Ok(None)");
-    assert!(staged.is_none(), "无 AGT 目录 → 不挂");
-    assert!(!work.join("agt").exists(), "None 不得创建 agt 目录");
+fn prepare_agt_work_off_is_noop() {
+    let work = temp_dir_under_home("prepare-off");
+    let staged = prepare_agt_work(&work, &AgtSource::Off, assets::EXECUTOR_POLICY)
+        .expect("Off → Ok(None)");
+    assert!(staged.is_none(), "Off → 不挂");
+    assert!(!work.join("agt").exists(), "Off 不得创建 agt 目录");
 
     let _ = fs::remove_dir_all(&work);
 }
@@ -84,7 +97,8 @@ fn prepare_agt_work_none_is_noop() {
 fn compose_mounts_agt_policy_ro_and_audit_rw() {
     let ws = make_workspace("compose");
     let work = ws.parent().unwrap().to_path_buf();
-    let staged = prepare_agt_work(&work, &Some(agt_src_dir()))
+    let src = stage_explicit_dir("compose-dir");
+    let staged = prepare_agt_work(&work, &AgtSource::Dir(src), assets::EXECUTOR_POLICY)
         .expect("prepare agt work")
         .expect("staged dir");
 
@@ -217,22 +231,34 @@ impl Drop for EnvGuard {
 }
 
 #[test]
-fn resolve_agt_dir_reads_alfred_agt_dir_env() {
+fn resolve_agt_source_reads_alfred_agt_dir_env_and_disable_wins() {
     let _lock = GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _g = EnvGuard::set("ALFRED_AGT_DIR", "/tmp/some-agt-dir");
     assert_eq!(
-        resolve_agt_dir(),
-        Some(PathBuf::from("/tmp/some-agt-dir")),
-        "ALFRED_AGT_DIR 设置时必须解析出目录"
+        resolve_agt_source(),
+        AgtSource::Dir(PathBuf::from("/tmp/some-agt-dir")),
+        "ALFRED_AGT_DIR 设置时必须解析出显式目录（覆盖面沿用）"
+    );
+    // opt-out 优先级最高：DISABLE=1 压过显式目录。
+    let _d = EnvGuard::set("ALFRED_AGT_DISABLE", "1");
+    assert_eq!(
+        resolve_agt_source(),
+        AgtSource::Off,
+        "ALFRED_AGT_DISABLE=1 → Off（压过 ALFRED_AGT_DIR）"
     );
 }
 
 #[test]
-fn resolve_agt_dir_unset_is_none() {
+fn resolve_agt_source_unset_defaults_builtin() {
     let _lock = GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("ALFRED_AGT_DIR");
-    assert_eq!(resolve_agt_dir(), None, "未设 ALFRED_AGT_DIR → None（默认不挂）");
-    // 空串等价未设（与 planner/reviewer 语义一致）。
+    std::env::remove_var("ALFRED_AGT_DISABLE");
+    assert_eq!(
+        resolve_agt_source(),
+        AgtSource::Builtin,
+        "未设任何 AGT env → 内置默认策略（属主拍板：默认启用）"
+    );
+    // 空串等价未设（沿用原语义）。
     let _g = EnvGuard::set("ALFRED_AGT_DIR", "");
-    assert_eq!(resolve_agt_dir(), None, "空串 ALFRED_AGT_DIR → None");
+    assert_eq!(resolve_agt_source(), AgtSource::Builtin, "空串 ALFRED_AGT_DIR → 内置默认");
 }

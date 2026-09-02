@@ -26,12 +26,14 @@
 //! reviewer 容器挂 **ws 全量 ro** + 对话记录，能读所有产物文件（含 git 历史/
 //! 隐藏目录/超截断内容）——审查者看全量信息防合谋（属主原话 08-18/08-21）。
 //!
-//! AGT 拦写层（§1.2 reviewer 行）：全工具给全 + DenyWrite 结构性拒绝
-//! （write/edit/rm 类 tool_call 拒绝，审计 JSONL）；策略挂载进 compose
-//! （`/tmp/.agt` ro + 审计子目录 rw），ws ro 是第二道保险。
+//! AGT 拦写层（§1.2 reviewer 行，属主拍板默认启用）：全工具给全 + DenyWrite
+//! 结构性拒绝（write/edit/rm 类 tool_call 拒绝，审计 JSONL）；策略挂载进 compose
+//! （`/tmp/.agt` ro + 审计子目录 rw），ws ro 是第二道保险。未设 `ALFRED_AGT_DIR`
+//! 用内置默认策略（`docker/agt/reviewer/`）；`ALFRED_AGT_DISABLE=1` 显式关闭。
 
 use std::path::{Path, PathBuf};
 
+use alfred_executor::agt::{assets, prepare_agt_work, resolve_agt_source, AgtSource};
 use alfred_core::conversation::ConversationLog;
 use alfred_core::contract::Contract;
 use alfred_core::dagspec::DagSpec;
@@ -76,10 +78,9 @@ pub struct ReviewerContainerOptions {
     pub settle_grace_seconds: f64,
     /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
-    /// AGT 策略 + 扩展目录（源：含 agt-policy.ts + policy.json）。拷贝到
-    /// `<work>/agt/`（策略 ro + 审计子目录 rw）挂 `/tmp/.agt`。
-    /// None = 不挂 AGT、不加载扩展（测试/最小环境）。
-    pub agt_dir: Option<PathBuf>,
+    /// AGT 拦写层源（默认内置策略；`ALFRED_AGT_DIR` 显式目录沿用覆盖；
+    /// `ALFRED_AGT_DISABLE=1` 关）。Off = 不挂 AGT、不加载扩展。
+    pub agt: AgtSource,
 }
 
 impl Default for ReviewerContainerOptions {
@@ -91,7 +92,7 @@ impl Default for ReviewerContainerOptions {
             time_limit_secs: 300,
             settle_grace_seconds: 20.0,
             ctl_enabled: true,
-            agt_dir: None,
+            agt: AgtSource::Builtin,
         }
     }
 }
@@ -107,18 +108,9 @@ impl ReviewerContainerOptions {
             time_limit_secs: opts.review_time_limit_secs,
             settle_grace_seconds: opts.settle_grace_seconds,
             ctl_enabled: opts.ctl_enabled,
-            agt_dir: resolve_agt_dir(),
+            agt: resolve_agt_source(),
         }
     }
-}
-
-/// AGT 目录解析：`ALFRED_AGT_DIR`（reviewer 拦写策略目录）；未设 → None。
-/// 与 planner 共用同一 env（策略文件内容不同：reviewer 用 deny-write 策略）。
-pub fn resolve_agt_dir() -> Option<PathBuf> {
-    std::env::var("ALFRED_AGT_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
 }
 
 /// reviewer 容器运行结果（宿主侧读取）。
@@ -387,9 +379,11 @@ fn run_reviewer_container(
             .with_context(|| format!("write reviewer input {}", path.display()))?;
     }
 
-    // AGT 拦写层：拷贝策略 + 扩展到 `<work>/agt/`（策略 ro），审计子目录 rw
-    // （审计 JSONL 落宿主）。None = 不挂 AGT。
-    let agt_work = prepare_agt_work(work, &opts.agt_dir)?;
+    // AGT 拦写层（默认启用）：落策略 + 扩展到 `<work>/agt/`（策略 ro），审计
+    // 子目录 rw（审计 JSONL 落宿主）。未设 env = 内置默认策略（reviewer 用
+    // `docker/agt/reviewer/policy.json`）；`ALFRED_AGT_DIR` 显式目录沿用覆盖；
+    // `ALFRED_AGT_DISABLE=1` 不挂。
+    let agt_work = prepare_agt_work(work, &opts.agt, assets::REVIEWER_POLICY)?;
 
     // E1/E3：挂载路径必须 canonicalize 成绝对路径（相对路径被 docker 静默变
     // named volume；colima 只共享 ~）。
@@ -513,33 +507,6 @@ fn run_reviewer_container(
     })
 }
 
-/// AGT 拦写层准备：拷贝源 agt 目录（agt-policy.ts + policy.json）到 `<work>/agt/`，
-/// 建审计子目录 `audit/`（rw 挂载源）。None → 不挂 AGT。
-fn prepare_agt_work(work: &Path, agt_dir: &Option<PathBuf>) -> Result<Option<PathBuf>> {
-    let Some(src) = agt_dir else {
-        return Ok(None);
-    };
-    let dest = work.join("agt");
-    std::fs::create_dir_all(&dest)
-        .with_context(|| format!("create reviewer agt dir {}", dest.display()))?;
-    std::fs::create_dir_all(dest.join("audit"))
-        .with_context(|| format!("create reviewer agt audit dir {}", dest.join("audit").display()))?;
-    std::fs::copy(src.join("agt-policy.ts"), dest.join("agt-policy.ts")).with_context(|| {
-        format!(
-            "copy agt extension {} -> {}",
-            src.join("agt-policy.ts").display(),
-            dest.join("agt-policy.ts").display()
-        )
-    })?;
-    std::fs::copy(src.join("policy.json"), dest.join("policy.json")).with_context(|| {
-        format!(
-            "copy agt policy {} -> {}",
-            src.join("policy.json").display(),
-            dest.join("policy.json").display()
-        )
-    })?;
-    Ok(Some(dest))
-}
 
 /// run 级 verdict 历史挂载行（矩阵 §1.1 第 8 行：审查记录/verdict，reviewer 独有 ro）。
 ///

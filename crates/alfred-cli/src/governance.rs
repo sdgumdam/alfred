@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use alfred_executor::agt::resolve_agt_source;
 use alfred_core::conversation::{
     append_to_disk, load_conversation, ConversationRole, ConversationSource,
 };
@@ -567,9 +568,10 @@ fn execution_step(
         port_base: run.options.port_base,
         settle_grace_seconds: run.options.settle_grace_seconds,
         ctl_enabled: run.options.ctl_enabled,
-        // AGT 拦写层（executor 行，属主钉死项：权限控制不让写文件）：与
-        // planner/reviewer 共用 `ALFRED_AGT_DIR`；未设 = 不挂（最小环境）。
-        agt_dir: alfred_executor::run::resolve_agt_dir(),
+        // AGT 拦写层（executor 行，属主拍板项：权限控制不让写文件 + 默认启用）：
+        // 与 planner/reviewer 共用解析语义——`ALFRED_AGT_DISABLE=1` 关，
+        // `ALFRED_AGT_DIR` 显式目录覆盖，未设 = 内置默认策略（alfred_core::agt）。
+        agt: resolve_agt_source(),
     };
     match execute_run(&opts, &ctx.executor_model, &run.request) {
         Ok(outcome) => {
