@@ -52,6 +52,22 @@ pub fn python_binary() -> String {
     "python3".to_string()
 }
 
+/// cwd 无关绝对化：相对路径按当前进程 cwd 拼成绝对路径，绝对路径原样返回。
+///
+/// 不用 `fs::canonicalize`：不要求路径已存在（done 记录等写入前路径），也不改写
+/// symlink（macOS `/tmp` → `/private/tmp`）。凡交给子进程按其 cwd 解析的路径——
+/// spawn argv（driver.py）、嵌入生成脚本的 done 记录路径——必须经此：spawn 后
+/// 子进程 cwd 切到 work_dir，相对路径会被二次解析（路径双拼，e2e 传绝对路径只是
+/// 恰好不触发）。
+pub fn absolutize_cwd(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(path)
+}
+
 /// 容器驱动进程的 launch 记录。
 #[derive(Debug, Clone)]
 pub struct DriverLaunch {
@@ -80,6 +96,9 @@ pub enum DriverOutcome {
 
 /// 生成宿主侧容器驱动脚本并 spawn（非 eval）。
 ///
+/// 路径契约：`driver_py` / `work_dir` 在本层 cwd 无关绝对化——调用方传相对/绝对
+/// 均正确（子进程 cwd 切到 work_dir 后，相对 argv 会被二次解析成双拼）。
+///
 /// 驱动脚本自身经 Inspect 容器管理接口（DockerSandboxEnvironment +
 /// sandbox_agent_bridge + exec_remote）起容器、驱动容器内 pi、写 done 记录。
 /// 本函数只负责 spawn + 记录 pid + done_marker 路径，不等待。
@@ -92,6 +111,10 @@ pub fn spawn_container_driver(
     model: &ExecutorModel,
     work_dir: &Path,
 ) -> Result<DriverLaunch> {
+    // spawn 层绝对化（见 `absolutize_cwd`）：先于 done 记录 / 日志文件 / argv /
+    // current_dir 全部使用——cwd 切换后相对路径不再被子进程二次解析。
+    let work_dir = absolutize_cwd(work_dir);
+    let driver_py = absolutize_cwd(driver_py);
     let done_marker = work_dir.join("driver.done.json");
     // 清陈旧 done 记录（重跑/续跑幂等）。
     if done_marker.exists() {
