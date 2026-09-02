@@ -187,7 +187,7 @@ escape）覆盖"真实执行与审查"；离线注入（r3 case2·3·4 / r4 case
 | 密钥不进容器 | 容器内 models.json 哑 key；真实 key 只留宿主 driver 进程（env_clear + 白名单注入） | R0 审计（docker inspect env 零命中） |
 | 越界写拦截 | 只挂 workspace 卷；工作区外路径在容器 overlay，不落宿主 | `tests/e2e/escape.sh`（两向验证 PASS） |
 | 审查隔离 | 非声明性由挂载面保证：契约全本/验收标准/对话记录不挂给执行者容器；reviewer 容器独立挂 ws 全量 ro + 对话记录判分；规划器不感知审查者/执行者 | r2/r3 e2e 断言 |
-| 工具级策略（原型，默认关） | AGT 风格 pi 扩展拦 `tool_call`（rm -rf / sudo / 秘密读取 / 越界写） | `tests/e2e/agt/`（确定性 29 断言 + 实机演示）——启用与否属主定，见 `.plans/AGT评估.md` |
+| 工具级策略（AGT 拦写层，opt-in） | AGT 风格 pi 扩展拦 `tool_call`（rm -rf / sudo / 秘密读取 / 越界写）：executor run 路径已接（`ALFRED_AGT_DIR` 注入 → 容器挂 `/tmp/.agt` ro + 审计子目录 rw，driver env 注入 `-e` 扩展；未设 env = 不挂），planner/reviewer 同范式 | `tests/e2e/agt/`（确定性 29 断言 + 实机演示 + `exec-demo.sh` executor 实机拦截演示：越界写被拒 + 审计 deny、工作区写放行）——启用与否属主定，见 `.plans/AGT评估.md` |
 
 ---
 
