@@ -245,7 +245,10 @@ pub fn feed_owner_message(
     // 有消息 → maintain② + 设 owner_message + 落对话轮；无消息（Retry）→ 跳过消息轮。
     if !driving_message.is_empty() {
         // 1. maintain②：属主消息固化为关键结论（先 maintain——喂旧 doc，得新 doc）。
-        run.session_doc = maintain(
+        // maintain 失败（如 LLM 输出格式漂移致解析失败）→ 回退旧 session_doc，
+        // 不废整条 run；审计记 maintain_warning（trigger=owner_message），治理环
+        // 照常推进（与 plan_review_step ① 的回退同构）。
+        match maintain(
             &MaintainOptions {
                 run_dir: ctx.run_dir.clone(),
                 model: ctx.planner_model.clone(),
@@ -258,7 +261,20 @@ pub fn feed_owner_message(
             MaintainTrigger::OwnerMessage {
                 message: driving_message.clone(),
             },
-        )?;
+        ) {
+            Ok(updated) => run.session_doc = updated,
+            Err(e) => {
+                audit(
+                    &ctx.run_dir,
+                    "maintain_warning",
+                    &serde_json::json!({
+                        "trigger": "owner_message",
+                        "error": format!("{e:#}"),
+                        "fallback": "keep_previous_session_doc",
+                    }),
+                )?;
+            }
+        }
 
         // 2. 设置 owner_message（planning_step 下一轮 converse 读它；重规划/改需求语义）。
         run.owner_message = Some(driving_message.clone());
