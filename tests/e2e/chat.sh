@@ -317,9 +317,19 @@ assert any(t["role"] == "planner" and t["source"] == "converse.reply" and t["con
            for t in log["turns"]), "无 planner converse.reply 轮"
 PY
   [[ -n "$(ls "$REAL/llm-calls" 2>/dev/null)" ]] || fail chat-real "llm-calls/ 无真实调用证据"
-  case "$(state_of "$REAL")" in
-    planning|plan_rejected|escalated|completed|abandoned) ;;
-    *) fail chat-real "run 落在非法状态 $(state_of "$REAL")" ;;
+  # 两轮流脚本（改口→确认建图）输入下，run 终态不得落在 escalated——escalated =
+  # driver 升级（planning_error 等），历史上正是 planner outputs 跨轮残留把两轮
+  # 路径钉死成 100% planning_error_escalated。断言收紧锁死改口→建图路径；若真
+  # 升级必须是 execution/plan_review 来源（非 planning 侧）才放行。
+  REAL_STATE="$(state_of "$REAL")"
+  case "$REAL_STATE" in
+    planning|plan_rejected|completed|abandoned) ;;
+    escalated)
+      SOURCE="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('escalation_source') or 'none')" "$REAL/state.json")"
+      [[ "$SOURCE" != "planning" ]] || fail chat-real "两轮输入终态 escalated 且来源 planning（改口→建图路径断裂）"
+      [[ "$SOURCE" != "none" ]] || fail chat-real "两轮输入终态 escalated 且无升级来源"
+      ;;
+    *) fail chat-real "run 落在非法状态 $REAL_STATE" ;;
   esac
   pass chat-real "真容器真 LLM REPL 对话（state=$(state_of "$REAL")）"
 else
