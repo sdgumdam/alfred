@@ -6,7 +6,9 @@
 //!
 //! 流程（照 R6b planner 容器驱动模式）：
 //!   1. 输入落盘：request / dagspec（计划审查）/ session（全源，非投影）/
-//!      conversation / contract 写到 `<work>/inputs/`。
+//!      conversation / contract 写到 `<work>/inputs/`；run 级 verdict 历史
+//!      （plan-verdicts.json / exec-verdicts.json，矩阵第 8 行"审查记录/verdict"）
+//!      按存在性挂 `/inputs/` ro（首轮无历史 → 注释行占位，E1 防静默建目录）。
 //!   2. 渲染 `reviewer.compose.yaml.tmpl`（ws 全量 ro + 对话记录 + 契约全字段
 //!      + AGT 拦写层 ro + 输出卷 rw）→ 生成 reviewer driver.py
 //!      （`templates/reviewer_driver.py.tmpl`，token 注入，非 eval Task）→ spawn
@@ -51,6 +53,10 @@ pub const INPUTS_DIR: &str = "inputs";
 pub const OUTPUTS_DIR: &str = "outputs";
 /// 容器内 verdict 产出文件名（容器内写 `/outputs/verdict.json`）。
 pub const VERDICT_OUTPUT_FILE: &str = "/outputs/verdict.json";
+/// run 级计划审查结论历史文件名（治理环 persist 落盘 → 挂 `/inputs/plan-verdicts.json` ro）。
+pub const PLAN_VERDICTS_FILE: &str = "plan-verdicts.json";
+/// run 级执行审查结论历史文件名（治理环 persist 落盘 → 挂 `/inputs/exec-verdicts.json` ro）。
+pub const EXEC_VERDICTS_FILE: &str = "exec-verdicts.json";
 
 /// reviewer 容器选项（R6c；编排器从 `GovernanceOptions` 派生，见 [`from_governance`]）。
 ///
@@ -199,6 +205,8 @@ pub const PLAN_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把计划审查结
 - /inputs/session.json —— 会话文档（记忆，JSON 对象：key_file_paths / key_conclusions / review_summary）
 - /inputs/conversation.json —— 属主↔规划器对话记录（JSON 对象，turns[] 含 role/content/source）
 - /inputs/contract.json —— 计划节点的契约（JSON 对象，prompt + acceptance_criteria）
+- /inputs/plan-verdicts.json —— 先前轮次计划审查结论历史（JSON 数组，每项 {"pass","reason"}；空数组 = 无历史，重审轮回看先前判了什么）
+- /inputs/exec-verdicts.json —— 先前轮次执行审查结论历史（JSON 数组，每项 {"grade","failure_class","rationale"}）
 - /workspace —— 工作区全量（只读；可按需跨查计划引用的文件是否存在）
 
 按上面 SYSTEM_PROMPT 的规则判忠实度，把结论写入 /outputs/verdict.json。
@@ -246,6 +254,8 @@ pub const EXEC_REVIEW_DRIVER_PROMPT: &str = r#"你的任务：把执行审查结
 - /inputs/contract.json —— 契约（JSON 对象：prompt + acceptance_criteria + reviewer_models）
 - /inputs/sandbox.json —— 执行者挂载语义（JSON 对象：workspace_subdirs —— 首个子目录 = 执行者的 /workspace 根，即契约"workspace 根/根目录"的落点）
 - /inputs/conversation.json —— 属主↔规划器对话记录（JSON 对象，turns[]）
+- /inputs/plan-verdicts.json —— 计划审查结论历史（JSON 数组，每项 {"pass","reason"}；回看该计划此前是否被打回及理由）
+- /inputs/exec-verdicts.json —— 先前轮次执行审查结论历史（JSON 数组，每项 {"grade","failure_class","rationale"}；重跑轮回看先前判分）
 - /workspace —— 执行者产物（ws 全量只读）：用 read/bash/glob 检查产物文件；
   对照 git 基线（run 开始时 `git init` + 空提交）用 `git status` / `git diff` /
   `git log` 看执行者新建/改了什么（含未提交文件），判断产物 vs 验收标准
@@ -274,12 +284,10 @@ fn plan_review_inputs(
     };
     // 契约全字段（矩阵 §1.1 第 7 行）：计划首节点的 contract（计划审查审的就是
     // 计划内嵌契约的忠实度；无节点时落空对象占位，保证 bind mount 源存在）。
+    // 投影真源 = DagSpec::contract_json（与 planner 回看的 run 级 contract.json 同源）。
     let contract = dagspec
-        .nodes
-        .first()
-        .map(|n| serde_json::to_string_pretty(&n.contract).context("serialize node contract"))
-        .transpose()?
-        .unwrap_or_else(|| "{}".to_string());
+        .contract_json()
+        .context("serialize node contract")?;
     // R6f：执行者挂载语义（sandbox.json）——首节点 workspace_subdirs[0] 即该节点
     // 工作区根 /workspace（契约"根目录"落点）。计划审查从 dagspec 已可读，但
     // compose 挂载要求 /inputs/sandbox.json 源存在（bind mount），统一落盘。
@@ -393,7 +401,18 @@ fn run_reviewer_container(
         .canonicalize()
         .with_context(|| format!("canonicalize reviewer outputs {}", outputs_dir.display()))?;
 
-    let compose = render_reviewer_compose(opts, &ws_abs, &inputs_abs, &outputs_abs, agt_work.as_deref())?;
+    // run 级 verdict 历史挂载（矩阵第 8 行：审查记录/verdict，reviewer 独有 ro）。
+    // 源 = 治理 run 根目录（reviewer 工作目录父目录）下 plan-verdicts.json /
+    // exec-verdicts.json，按存在性渲染（E1：不存在 → 注释行，防 docker 静默建目录）。
+    let verdict_mounts = verdict_history_mounts(opts.run_dir.parent())?;
+    let compose = render_reviewer_compose(
+        opts,
+        &ws_abs,
+        &inputs_abs,
+        &outputs_abs,
+        &verdict_mounts,
+        agt_work.as_deref(),
+    )?;
     let compose_path = work.join("compose.yaml");
     std::fs::write(&compose_path, compose)
         .with_context(|| format!("write reviewer compose {}", compose_path.display()))?;
@@ -522,6 +541,35 @@ fn prepare_agt_work(work: &Path, agt_dir: &Option<PathBuf>) -> Result<Option<Pat
     Ok(Some(dest))
 }
 
+/// run 级 verdict 历史挂载行（矩阵 §1.1 第 8 行：审查记录/verdict，reviewer 独有 ro）。
+///
+/// 源文件由治理环 persist 时落盘（state.json 的 plan_verdicts/exec_verdicts 同源
+/// 投影，[`PLAN_VERDICTS_FILE`] / [`EXEC_VERDICTS_FILE`]）。按存在性渲染：docker
+/// 对不存在的宿主文件静默建目录（E1），不存在 → 注释行占位。
+fn verdict_history_mounts(run_root: Option<&Path>) -> Result<String> {
+    let Some(root) = run_root.filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok("    # (reviewer 工作目录无 run 根：不挂 verdict 历史)".to_string());
+    };
+    let mut lines = Vec::new();
+    for (name, container_path) in [
+        (PLAN_VERDICTS_FILE, "/inputs/plan-verdicts.json"),
+        (EXEC_VERDICTS_FILE, "/inputs/exec-verdicts.json"),
+    ] {
+        let path = root.join(name);
+        if path.exists() {
+            let abs = path.canonicalize().with_context(|| {
+                format!("canonicalize reviewer verdict history {}", path.display())
+            })?;
+            lines.push(format!("    - {}:{}:ro", abs.display(), container_path));
+        } else {
+            lines.push(format!(
+                "    # (未落盘 {name}：首轮无历史，不挂载——E1 防静默建目录)"
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 /// 渲染 reviewer compose：R6a 模板占位符 → canonicalize 后绝对路径。
 ///
 /// AGT 目录为 None 时移除 `/tmp/.agt` 挂载行（最小环境不挂拦写层）。
@@ -532,6 +580,7 @@ fn render_reviewer_compose(
     ws_abs: &Path,
     inputs_abs: &Path,
     outputs_abs: &Path,
+    verdict_mounts: &str,
     agt_work: Option<&Path>,
 ) -> Result<String> {
     let mut out = REVIEWER_COMPOSE_TMPL
@@ -560,6 +609,7 @@ fn render_reviewer_compose(
             "{sandbox_path}",
             &inputs_abs.join("sandbox.json").display().to_string(),
         )
+        .replace("{verdict_history_mount}", verdict_mounts)
         .replace("{outputs_dir}", &outputs_abs.display().to_string())
         .replace(
             "image: \"alfred-executor:latest\"",

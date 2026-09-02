@@ -22,6 +22,7 @@ use alfred_executor::run::{execute_run, RunOptions};
 use alfred_planner::converse::{converse, ConverseOptions, ConverseOutcome};
 use alfred_planner::disguise::disguise_rejection;
 use alfred_planner::maintain::{maintain, MaintainOptions, MaintainTrigger};
+use alfred_reviewer::container::{EXEC_VERDICTS_FILE, PLAN_VERDICTS_FILE};
 use alfred_reviewer::exec_review::{execute_exec_review, ExecReviewOptions};
 use alfred_reviewer::plan_review::{execute_plan_review, PlanReviewOptions};
 use alfred_reviewer::ReviewerContainerOptions;
@@ -781,6 +782,17 @@ fn write_run_contract(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<
     std::fs::write(run_dir.join("contract.json"), text).context("write contract.json")
 }
 
+/// 落盘 run 级 verdict 历史文件（矩阵 §1.1 第 8 行：审查记录/verdict）。
+fn write_verdict_history<T: serde::Serialize>(
+    run_dir: &Path,
+    name: &str,
+    verdicts: &[T],
+) -> Result<()> {
+    let text =
+        serde_json::to_string_pretty(verdicts).with_context(|| format!("serialize {name}"))?;
+    std::fs::write(run_dir.join(name), text).with_context(|| format!("write {name}"))
+}
+
 /// 把 converse 产出的 DagSpec 格式化为语义回复（对话记录 converse.reply 轮的 content）。
 ///
 /// M4-a：conversation.json 只承载 owner↔planner 语义轮次——落计划摘要，不落
@@ -802,10 +814,17 @@ pub fn load_governance_run(run_dir: &Path) -> Result<GovernanceRun> {
     serde_json::from_str(&text).with_context(|| format!("parse governance state {}", path.display()))
 }
 
-/// 落盘治理环 state.json。
+/// 落盘治理环 state.json + run 级 verdict 历史投影（plan-verdicts.json /
+/// exec-verdicts.json，矩阵 §1.1 第 8 行 reviewer 挂载输入）。
 pub fn persist_governance_run(run_dir: &Path, run: &GovernanceRun) -> Result<()> {
     let text = serde_json::to_string_pretty(run).context("serialize governance state")?;
-    std::fs::write(run_dir.join("state.json"), text).context("write governance state.json")
+    std::fs::write(run_dir.join("state.json"), text).context("write governance state.json")?;
+    // verdict 历史单一真源 = state.json 的 plan_verdicts/exec_verdicts：每次
+    // persist 整体重写（不追加不删改），与状态机持久化同生命周期——崩溃恢复后
+    // 仍同步。reviewer 容器（container.rs verdict_history_mounts）按存在性挂 ro。
+    write_verdict_history(run_dir, PLAN_VERDICTS_FILE, &run.plan_verdicts)?;
+    write_verdict_history(run_dir, EXEC_VERDICTS_FILE, &run.exec_verdicts)?;
+    Ok(())
 }
 
 /// 追加一行审计事件。

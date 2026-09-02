@@ -19,8 +19,14 @@
 #                        子目录 = 执行者工作区根 /workspace，契约"根目录"的落点）
 #   {agt_dir}          → AGT 策略 + 扩展目录（挂到 /tmp/.agt，ro）
 #   {outputs_dir}      → 容器产出挂载（verdict 写 /outputs，rw）
-# 只读参考卷（矩阵"按需 ro"行）与审查记录/verdict 输入（矩阵第 8 行）由编排器
-# 按运行期需要动态追加，不在本模板写死。
+#   verdict_history_mount（volumes 段占位符；注释里故意不带花括号——本占位符
+#                        替换值是多行，花括号会连注释一起被替换破坏 YAML）
+#                      → run 级 verdict 历史（矩阵第 8 行"审查记录/verdict"，
+#                        reviewer 独有 ro）：plan-verdicts.json / exec-verdicts.json
+#                        按存在性渲染挂载行（治理环 persist 落盘；首轮无历史 → 注释行
+#                        占位——docker 对不存在宿主文件静默建目录，E1）。
+# 只读参考卷（矩阵"按需 ro"行）由编排器按 SandboxProfile.volumes 动态追加，
+# 不在本模板写死。
 services:
   default:
     image: "alfred-executor:latest"
@@ -36,5 +42,6 @@ services:
     - {contract_path}:/inputs/contract.json:ro
     - {dagspec_path}:/inputs/dagspec.json:ro
     - {sandbox_path}:/inputs/sandbox.json:ro
+{verdict_history_mount}
     - {agt_dir}:/tmp/.agt:ro
     - {outputs_dir}:/outputs

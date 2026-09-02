@@ -18,4 +18,5 @@ alfred-executor = { workspace = true }
 alfred-planner = { workspace = true }
 alfred-reviewer = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 anyhow = { workspace = true }

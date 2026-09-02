@@ -12,15 +12,18 @@
      只 spawn 本脚本 + 轮询 done 记录 + 读 bind mount 产物。
 
 MODE == "plan_review": pi reads /inputs/{request.json, dagspec.json, session.json,
-  conversation.json, contract.json, sandbox.json}, judges whether the DagSpec
-  faithfully serves the OwnerRequest, and writes the plan verdict JSON to
+  conversation.json, contract.json, sandbox.json} plus the run-level verdict
+  history when present (/inputs/{plan-verdicts.json, exec-verdicts.json} —
+  earlier rounds' review conclusions), judges whether the DagSpec faithfully
+  serves the OwnerRequest, and writes the plan verdict JSON to
   /outputs/verdict.json.
 MODE == "exec_review": pi reads /inputs/{request.json, contract.json,
-  conversation.json, sandbox.json} and the FULL workspace (/workspace,
-  read-only) to grade the produced artifacts against the acceptance criteria,
-  then writes the exec verdict JSON to /outputs/verdict.json. sandbox.json
-  carries the executor mount semantics (workspace_subdirs[0] = the executor's
-  /workspace root — the "workspace root" the contract refers to).
+  conversation.json, sandbox.json} plus the verdict history when present
+  (/inputs/{plan-verdicts.json, exec-verdicts.json}) and the FULL workspace
+  (/workspace, read-only) to grade the produced artifacts against the
+  acceptance criteria, then writes the exec verdict JSON to /outputs/verdict.json.
+  sandbox.json carries the executor mount semantics (workspace_subdirs[0] = the
+  executor's /workspace root — the "workspace root" the contract refers to).
 
 The AGT write-denial extension (`-e /tmp/.agt/agt-policy.ts`) is loaded when
 AGT_EXT is non-empty; policy and audit paths default to
