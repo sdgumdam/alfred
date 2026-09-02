@@ -287,6 +287,29 @@ assert_state "$CASE6" "abandoned" case6
 pass case6 "PlanRejected 打回呈现（verdict 意见）+ 伪装重试闭环 + 放弃"
 
 # ============================================================================
+# Case 7：超长中文 title 截断（chars() 取前 40 字，中文安全——byte 截断会 panic）
+# ============================================================================
+CASE7="$STATE/run-chat-case7"
+mkdir -p "$CASE7"
+# 60 个中文字符的需求（> 40，且多字节边界多样），验收标准"按需求"
+C7_REQ="$(python3 -c "print('超' * 60)")"
+printf '%s\n按需求\n' "$C7_REQ" | \
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$FIX/reply1.txt" \
+  ALFRED chat --run-dir "$CASE7" > "$LOG/case7.out" 2> "$LOG/case7.err"
+assert_state "$CASE7" "planning" case7
+has "$LOG/case7.out" "需求已确定性转写" case7
+python3 - "$CASE7" <<'PY' || fail case7 "title 应为 chars() 前 40 字截断（无 panic/乱码），description 保留全文"
+import json, sys
+r = json.load(open(sys.argv[1] + "/request.json"))
+expected_title = "超" * 40
+assert r["title"] == expected_title, f"title 应为前 40 字（got {len(r['title'])} chars）"
+assert len(r["title"]) == 40, f"title 应恰 40 chars（got {len(r['title'])}）"
+assert r["description"] == "超" * 60, "description 应保留需求全文（60 chars）"
+assert r["acceptance_criteria"] == r["description"], "按需求 → 验收标准=需求原文"
+PY
+pass case7 "超长中文 title chars() 截断 ≤40（title=40 chars，description 全文，无 panic）"
+
+# ============================================================================
 # 真 LLM REPL 用例（CHAT_REAL=1 门控；照 r3 真容器模式分层）
 # ============================================================================
 if [[ "${CHAT_REAL:-0}" == "1" ]]; then
