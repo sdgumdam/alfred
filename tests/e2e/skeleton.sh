@@ -4,7 +4,8 @@
 #
 # 依次运行：
 #   r1（执行侧）→ r2（审查侧）→ r3（治理环闭环）→
-#   r4（属主决策 feed 续跑两用例）→ escape（越界写边界）→ agt（AGT 策略原型确定性）
+#   r4（属主决策 feed 续跑两用例）→ chat（owner 持续会话 alfred chat 黑盒）→
+#   escape（越界写边界）→ agt（AGT 策略原型确定性）
 #   → agt-default（AGT 默认启用黑盒：内置策略落盘/挂载/注入 + DISABLE opt-out；
 #     Tier 1 确定性，AGT_DEFAULT_REAL=1 附加真 LLM 全链 + 对抗探针）
 # 全部 PASS 才算过；任一失败打印汇总报告并以非零退出（全绿才算过）。
@@ -51,7 +52,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="${SKELETON_LOG_DIR:-$REPO_ROOT/tests/e2e/.runs/skeleton-$TS}"
 mkdir -p "$LOG_DIR"
 
-STEPS=(r1 r2 r3 r4 escape agt agt-default)
+STEPS=(r1 r2 r3 r4 chat escape agt agt-default)
 declare -a FAILED=()
 declare -a TIMES=()
 
