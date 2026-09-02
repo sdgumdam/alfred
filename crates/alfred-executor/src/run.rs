@@ -245,6 +245,9 @@ pub fn execute_run(
     let py = generate_task_py(&TaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),
         contract_prompt: opts.assignment.contract.prompt.clone(),
+        // 挂载翻译锚（task_gen::mount_anchor_prompt）：workspace_subdirs[0] 即
+        // 执行者 /workspace 根——契约目录名不再字面嵌套（src 嵌套歧义治本）。
+        workspace_subdirs: opts.assignment.sandbox.workspace_subdirs.clone(),
         port: opts.port_base,
         pi_model: "inspect-bridge/inspect".to_string(),
         bridge_model: format!("inspect/{}", model.inspect_model_id()),

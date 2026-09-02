@@ -14,6 +14,11 @@
 executor 只出产物：pi 在沙箱内（network none）按契约 prompt 产出工作区改动，
 宿主侧从持久 ws 的 git diff 采集产物（见 alfred-executor run.rs）。本驱动不
 判分、不读验收标准（审查由 reviewer 容器承担）。
+
+发给 pi 的最终 prompt = 契约 prompt + 工作区挂载翻译锚（MOUNT_ANCHOR，
+alfred-executor task_gen.rs::mount_anchor_prompt 生成）：workspace_subdirs[0]
+直接挂为执行者 /workspace 根，契约里该目录名即 /workspace 本身——锚定翻译，
+防「在 src 下创建 f.txt」被误读为 /workspace/src/f.txt（多嵌套一层）。
 """
 
 import json
@@ -40,6 +45,7 @@ from inspect_ai.util._sandbox.context import (
 # ---- alfred 注入配置（token 替换，见 alfred-executor task_gen.rs）----
 COMPOSE_FILE = __COMPOSE_FILE_JSON__
 CONTRACT_PROMPT = __CONTRACT_PROMPT_JSON__
+MOUNT_ANCHOR = __MOUNT_ANCHOR_JSON__
 PORT = int(__PORT__)
 PI_MODEL = __PI_MODEL_JSON__
 # 宿主侧 Inspect 模型 id（桥代发目标）：`inspect/<provider>/<model>` 形态。
@@ -211,7 +217,11 @@ async def _run_container() -> None:
                 ),
                 stream=True,
             )
-            settled, exit_code = await _drive_pi(proc, CONTRACT_PROMPT)
+            # 契约 + 挂载翻译锚：锚定 workspace_subdirs[0] 即 /workspace 根，
+            # 防契约目录名被字面嵌套（src 嵌套歧义治本）。
+            settled, exit_code = await _drive_pi(
+                proc, CONTRACT_PROMPT + "\n\n" + MOUNT_ANCHOR
+            )
             if not settled:
                 raise RuntimeError(f"pi RPC did not settle (exit_code={exit_code})")
     finally:
