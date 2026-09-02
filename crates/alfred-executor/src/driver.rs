@@ -23,7 +23,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -68,12 +68,14 @@ pub fn absolutize_cwd(path: &Path) -> PathBuf {
         .join(path)
 }
 
-/// 容器驱动进程的 launch 记录。
-#[derive(Debug, Clone)]
+/// 容器驱动进程的 launch 记录（持有 `Child`：poll 期 `try_wait()` 收割——
+/// 只存 pid 时子进程崩溃成 zombie，`kill -0` 恒真，crash 被误报成等满超时）。
 pub struct DriverLaunch {
     pub pid: i64,
     /// done 记录文件（驱动脚本写完即结束）。
     pub done_marker: PathBuf,
+    /// 驱动子进程句柄（收割专用；drop 不 kill——超时路径保持旧语义）。
+    child: Child,
 }
 
 /// done 记录（驱动脚本产出；status: "success" | "error" | "timed_out"）。
@@ -90,8 +92,8 @@ pub enum DriverOutcome {
     Done(DriverDone),
     /// 超时（未 done、进程仍活）。
     TimedOut,
-    /// 进程消失且无 done（crash / 被 kill）。
-    Crashed,
+    /// 进程已退出且无 done（crash / 被 kill）；`None` = 信号终止无退出码。
+    Crashed(Option<i32>),
 }
 
 /// 生成宿主侧容器驱动脚本并 spawn（非 eval）。
@@ -101,7 +103,8 @@ pub enum DriverOutcome {
 ///
 /// 驱动脚本自身经 Inspect 容器管理接口（DockerSandboxEnvironment +
 /// sandbox_agent_bridge + exec_remote）起容器、驱动容器内 pi、写 done 记录。
-/// 本函数只负责 spawn + 记录 pid + done_marker 路径，不等待。
+/// 本函数只负责 spawn + 记录 pid + 保留 Child（poll 期收割）+ done_marker 路径，
+/// 不等待。
 ///
 /// env 清洗：env_clear + 白名单 + 单角色 provider 凭据（`{PROVIDER}_API_KEY` /
 /// `{PROVIDER}_BASE_URL` + `ALFRED_EXEC_API_KEY`，不进 argv，`ps` 不可见）。
@@ -151,21 +154,27 @@ pub fn spawn_container_driver(
     Ok(DriverLaunch {
         pid: child.id() as i64,
         done_marker,
+        child,
     })
 }
 
 /// 轮询 done 记录直到 Done / 进程 crash / 超时。
 ///
-/// 完成判定只认 done 记录；进程消失无 done = crash；超时未 done = timed out。
-/// `ctl_enabled` 观测面已随 `inspect ctl` 退役（无 eval 即无 ctl），不再轮询。
-pub fn poll_container_driver(launch: &DriverLaunch, timeout_secs: u64) -> Result<DriverOutcome> {
+/// 完成判定只认 done 记录；进程退出无 done = crash（每轮先 `try_wait()` 收割
+/// Child——不收割则 zombie 的 `kill -0` 恒真，crash 误报成等满超时的
+/// TimedOut）；超时仍未 done 且进程还活 = timed out。`ctl_enabled` 观测面已随
+/// `inspect ctl` 退役（无 eval 即无 ctl），不再轮询。
+pub fn poll_container_driver(
+    launch: &mut DriverLaunch,
+    timeout_secs: u64,
+) -> Result<DriverOutcome> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         if let Some(done) = read_done_marker(&launch.done_marker)? {
             return Ok(DriverOutcome::Done(done));
         }
-        if !process_alive(launch.pid) {
-            return Ok(DriverOutcome::Crashed);
+        if let Some(status) = launch.child.try_wait()? {
+            return Ok(DriverOutcome::Crashed(status.code()));
         }
         if Instant::now() >= deadline {
             return Ok(DriverOutcome::TimedOut);
@@ -252,11 +261,3 @@ fn push_provider_creds(envs: &mut Vec<(String, String)>, m: &ExecutorModel) {
     envs.push(("ALFRED_EXEC_API_KEY".to_string(), m.api_key.clone()));
 }
 
-/// 进程是否存活（`/bin/kill -0 <pid>`）。
-fn process_alive(pid: i64) -> bool {
-    Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}

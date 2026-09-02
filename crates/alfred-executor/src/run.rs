@@ -300,7 +300,7 @@ pub fn execute_run(
     append_audit(run_dir, "run_started", &serde_json::json!({ "run_id": run_id, "task_id": opts.assignment.task_id }))?;
 
     // 4) spawn 宿主侧容器驱动（非 eval）
-    let launch = spawn_container_driver(&driver_py, model, run_dir)?;
+    let mut launch = spawn_container_driver(&driver_py, model, run_dir)?;
     append_audit(
         run_dir,
         "container_driver_launched",
@@ -309,7 +309,7 @@ pub fn execute_run(
 
     // 5) 轮询（timeout = time_limit + 缓冲）
     let poll_timeout = opts.time_limit_secs as u64 + 600;
-    let outcome = match poll_container_driver(&launch, poll_timeout)? {
+    let outcome = match poll_container_driver(&mut launch, poll_timeout)? {
         DriverOutcome::Done(done) => done,
         DriverOutcome::TimedOut => {
             // 失败路径填 error（P3）：state.json 落 timed_out 原因后仍以 Err 上报
@@ -324,10 +324,11 @@ pub fn execute_run(
             )?;
             bail!(msg);
         }
-        DriverOutcome::Crashed => {
+        DriverOutcome::Crashed(exit_code) => {
             // 失败路径填 error（P3）：state.json 落 crashed 原因后仍以 Err 上报
             let msg = format!(
-                "container driver process died without a done record (done: {})",
+                "container driver process died without a done record (exit: {:?}, done: {})",
+                exit_code,
                 launch.done_marker.display()
             );
             fail_run(

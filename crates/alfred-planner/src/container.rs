@@ -379,10 +379,10 @@ fn run_planner_container(
 
     // spawn 宿主侧容器驱动（非 eval；桥代发 = sandbox_agent_bridge，宿主侧 Inspect
     // 模型 = planner provider——桥服务调用日志即审计源，见 llm.rs）。
-    let launch = spawn_container_driver(&driver_py_path, model, &work)?;
+    let mut launch = spawn_container_driver(&driver_py_path, model, &work)?;
 
     let poll_timeout = opts.time_limit_secs as u64 + 600;
-    let outcome = match poll_container_driver(&launch, poll_timeout)? {
+    let outcome = match poll_container_driver(&mut launch, poll_timeout)? {
         DriverOutcome::Done(done) => done,
         DriverOutcome::TimedOut => {
             bail!(
@@ -391,9 +391,10 @@ fn run_planner_container(
                 launch.done_marker.display()
             )
         }
-        DriverOutcome::Crashed => {
+        DriverOutcome::Crashed(exit_code) => {
             bail!(
-                "planner container driver crashed (done marker: {})",
+                "planner container driver crashed (exit: {:?}, done marker: {})",
+                exit_code,
                 launch.done_marker.display()
             )
         }
