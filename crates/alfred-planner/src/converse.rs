@@ -73,6 +73,7 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 - 每个节点的 contract.prompt 与 acceptance_criteria 必须非空。
 - 每个节点必须声明非空 workspace_subdirs（sandbox.workspace_subdirs，工作区子目录列表，如 ["src"]）：声明的是该节点可见/可写的工作区范围（节点只能看到这些子目录），这是强制约束；空/缺省声明 = 计划不合格。挂载语义：首个子目录挂为该节点工作区根 /workspace，其余子目录挂为 /workspace/<子目录>。
 - workspace_subdirs 必须声明具体子目录名：按任务产物位置声明（如任务写 src/ 下则声明 ["src"]）；禁止声明 "."（工作区根，挂载语义下根由系统接管，声明子目录必须是具体相对目录）；禁止声明与挂载根同名的目录名（如 "workspace"，避免嵌套歧义）；任务描述（contract.prompt）里"根目录"措辞应与声明的子目录一致（首个子目录即该节点工作区根 /workspace）。
+- 契约 prompt 的产物路径措辞必须按执行者视角自锚定（执行者只看得到挂载结果，看不到宿主 ws 布局）：产物落在首个子目录（即执行者的 /workspace 根）时，表述为"在 /workspace 根下创建 <文件>"，或"在 <首子目录> 下创建"并附明确落点（如"在 src 下创建 hello.txt，落点 /workspace/hello.txt"）；禁止会产生 /workspace/<首子目录>/<文件> 之类多嵌套一层的歧义表述；产物落在其余子目录时写 /workspace/<子目录>/<文件>。
 - 默认用缺省沙箱（volumes 空、runtime null、packages 空、network false），workspace_subdirs 按上条必须非空；除非任务确实需要，才声明额外权限。
 - 计划必须忠实反映属主需求，不要做属主没要求的事。
 - 答复属主时用自然语言直接、清晰，不要夹带建图指令。"#;
