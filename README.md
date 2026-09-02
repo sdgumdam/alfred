@@ -84,6 +84,8 @@ env 覆盖：
 | `ALFRED_INSPECT` | inspect CLI 路径覆盖 |
 | `ALFRED_IMAGE` | 沙箱镜像覆盖（缺省 `alfred-executor:latest`） |
 | `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE=<dag.json>` | 规划器离线确定性直通（e2e 用） |
+| `ALFRED_AGT_DIR=<dir>` | AGT 策略目录覆盖（含 `agt-policy.ts` + `policy.json`；未设 = 内置默认策略 `docker/agt/<role>/`） |
+| `ALFRED_AGT_DISABLE=1` | 显式关闭 AGT 拦写层（opt-out，压过 `ALFRED_AGT_DIR`） |
 
 > 注意：config.yml 含真实 API key，已在 `.gitignore` 面（`~/.config/` 不在仓库内）。
 > 密钥只留在宿主进程；容器内 models.json 用哑 key `sk-none` 指向桥。
@@ -164,11 +166,12 @@ Planning → PlanReviewing → Executing → ExecReviewing
 | `escape.sh` | 越界写边界两向验证：容器内 /tmp 写不落宿主 + 工作区写穿透宿主（纯 docker，无 LLM） | 纯容器边界 |
 | `agt/agt-policy.test.mjs` | AGT 策略求值原型确定性测试（29 断言） | 无 LLM 无容器 |
 | `agt/demo.sh` | AGT 实机演示：沙箱容器内 pi + 策略扩展拦截 `rm -rf`（审计 deny+allow） | 真容器真 LLM（可选演示） |
+| `agt-default.sh` | AGT 默认启用黑盒：二进制落盘内置策略（byte 级 == `docker/agt/`）+ compose 挂载 + driver 注入 + 容器内审计 allow；`ALFRED_AGT_DISABLE=1` 不挂不加载；`AGT_DEFAULT_REAL=1` 附加真容器全链 Completed + 越界写对抗探针（审计 deny） | Tier 1 确定性（mock 驱动）/ Tier 2 真 LLM |
 
 **统一入口**：
 
 ```bash
-bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → escape → agt，全绿才算过
+bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → escape → agt → agt-default，全绿才算过
 ```
 
 skeleton.sh 头部注释如实说明两种模式：真容器真 LLM（r1 / r2 case1·1b / r3 case1 /
@@ -187,7 +190,7 @@ escape）覆盖"真实执行与审查"；离线注入（r3 case2·3·4 / r4 case
 | 密钥不进容器 | 容器内 models.json 哑 key；真实 key 只留宿主 driver 进程（env_clear + 白名单注入） | R0 审计（docker inspect env 零命中） |
 | 越界写拦截 | 只挂 workspace 卷；工作区外路径在容器 overlay，不落宿主 | `tests/e2e/escape.sh`（两向验证 PASS） |
 | 审查隔离 | 非声明性由挂载面保证：契约全本/验收标准/对话记录不挂给执行者容器；reviewer 容器独立挂 ws 全量 ro + 对话记录判分；规划器不感知审查者/执行者 | r2/r3 e2e 断言 |
-| 工具级策略（AGT 拦写层，opt-in） | AGT 风格 pi 扩展拦 `tool_call`（rm -rf / sudo / 秘密读取 / 越界写）：executor run 路径已接（`ALFRED_AGT_DIR` 注入 → 容器挂 `/tmp/.agt` ro + 审计子目录 rw，driver env 注入 `-e` 扩展；未设 env = 不挂），planner/reviewer 同范式 | `tests/e2e/agt/`（确定性 29 断言 + 实机演示 + `exec-demo.sh` executor 实机拦截演示：越界写被拒 + 审计 deny、工作区写放行）——启用与否属主定，见 `.plans/AGT评估.md` |
+| 工具级策略（AGT 拦写层，**默认启用**） | AGT 风格 pi 扩展拦 `tool_call`（rm -rf / sudo / 秘密读取 / 越界写）：三容器默认挂载（策略落盘 → compose 挂 `/tmp/.agt` ro + 审计子目录 rw，driver env 注入 `-e` 扩展）。内置默认策略 `docker/agt/{executor,planner,reviewer}/policy.json` 编译期内嵌随二进制分发；`ALFRED_AGT_DIR` 显式目录覆盖，`ALFRED_AGT_DISABLE=1` 显式关闭 | `tests/e2e/agt/`（确定性求值 + 实机演示 + `exec-demo.sh` 越界写被拒 + 审计 deny）、`tests/e2e/agt-default.sh`（默认启用/显式关闭黑盒：无 env 落盘内置策略 + 容器内审计 allow；DISABLE=1 无 staging 无挂载无注入；真容器探针越界写被拒） |
 
 ---
 
@@ -202,6 +205,7 @@ crates/
   alfred-cli/       src/{main.rs (alfred bin: run/feed/status), governance.rs, lib.rs}
 docker/
   Dockerfile        沙箱镜像（inspect 基座 + Node 22 + pi-coding-agent 0.84.3）
+  agt/              AGT 内置默认策略资产（三角色 policy.json + 共享 agt-policy.ts，编译期内嵌）
   pi-sandbox.compose.yaml  零挂载参考基座（network none）
 tests/
   e2e/              r1-r4 / escape / skeleton / agt/

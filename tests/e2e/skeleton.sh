@@ -5,6 +5,8 @@
 # 依次运行：
 #   r1（执行侧）→ r2（审查侧）→ r3（治理环闭环）→
 #   r4（属主决策 feed 续跑两用例）→ escape（越界写边界）→ agt（AGT 策略原型确定性）
+#   → agt-default（AGT 默认启用黑盒：内置策略落盘/挂载/注入 + DISABLE opt-out；
+#     Tier 1 确定性，AGT_DEFAULT_REAL=1 附加真 LLM 全链 + 对抗探针）
 # 全部 PASS 才算过；任一失败打印汇总报告并以非零退出（全绿才算过）。
 #
 # 两种模式（各脚本头部亦有说明）：
@@ -25,6 +27,9 @@
 #   3) 确定性（无 LLM、无容器）：
 #        - agt : AGT 策略求值原型（node 直测 policy 语义；agt/demo.sh 实机
 #                容器拦截演示是 LLM 依赖的可选演示，不在此链内）
+#        - agt-default : AGT 默认启用黑盒（真 alfred bin 确定性全链：mock 驱动
+#                计划审查容器 + executor mockllm 容器；默认启用与 ALFRED_AGT_
+#                DISABLE=1 两路径断言；AGT_DEFAULT_REAL=1 附加真 LLM 段）
 #
 # 驱动：e2e 经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）
 #   （`cargo run --bin alfred -- run|feed`）。r2 独立 plan-review 两用例、
@@ -46,7 +51,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="${SKELETON_LOG_DIR:-$REPO_ROOT/tests/e2e/.runs/skeleton-$TS}"
 mkdir -p "$LOG_DIR"
 
-STEPS=(r1 r2 r3 r4 escape agt)
+STEPS=(r1 r2 r3 r4 escape agt agt-default)
 declare -a FAILED=()
 declare -a TIMES=()
 
@@ -82,7 +87,7 @@ echo "============================================="
 echo "skeleton.sh 全链汇总"
 for t in "${TIMES[@]}"; do echo "  $t"; done
 if [[ ${#FAILED[@]} -eq 0 ]]; then
-  echo "  结果: ALL GREEN（r1-r4 + escape + agt 全链通过）"
+  echo "  结果: ALL GREEN（r1-r4 + escape + agt + agt-default 全链通过）"
   echo "  日志 : $LOG_DIR"
   echo "============================================="
   exit 0

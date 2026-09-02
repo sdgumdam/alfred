@@ -102,6 +102,8 @@ Environment overrides:
 | `ALFRED_INSPECT` | inspect CLI path override |
 | `ALFRED_IMAGE` | sandbox image override (default `alfred-executor:latest`) |
 | `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE=<dag.json>` | planner offline deterministic bypass (used by e2e) |
+| `ALFRED_AGT_DIR=<dir>` | AGT policy dir override (holding `agt-policy.ts` + `policy.json`; unset = built-in default `docker/agt/<role>/`) |
+| `ALFRED_AGT_DISABLE=1` | explicitly turn the AGT write-interception layer off (opt-out; beats `ALFRED_AGT_DIR`) |
 
 > config.yml holds real API keys and lives outside the repository. Keys stay on
 > the host process only; the in-container models.json uses a dummy `sk-none`
@@ -198,11 +200,12 @@ Tiered routing (§3.3, all six rows in code):
 | `escape.sh` | out-of-workspace-write boundary, two-way: in-container /tmp write does not land on host + workspace write lands on host (pure docker, no LLM) | pure container boundary |
 | `agt/agt-policy.test.mjs` | AGT policy-eval prototype, deterministic (29 assertions) | no LLM, no container |
 | `agt/demo.sh` | AGT live demo: in-sandbox pi + policy extension blocks `rm -rf` (audit deny+allow) | real container + real LLM (optional demo) |
+| `agt-default.sh` | AGT default-on black box: binary stages built-in policies (byte-identical to `docker/agt/`) + compose mounts + driver injection + in-container audit allow; `ALFRED_AGT_DISABLE=1` stages/mounts/injects nothing; `AGT_DEFAULT_REAL=1` adds the real-container full chain (Completed) + out-of-workspace-write adversarial probe (audit deny) | Tier 1 deterministic (mock-driven) / Tier 2 real LLM |
 
 **Unified entry:**
 
 ```bash
-bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → escape → agt; green only if all pass
+bash tests/e2e/skeleton.sh   # r1 → r2 → r3 → r4 → escape → agt → agt-default; green only if all pass
 ```
 
 The `skeleton.sh` header documents both modes honestly: real-container/real-LLM
@@ -223,7 +226,7 @@ land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 | No keys in container | in-container models.json uses a dummy key; real keys stay in the host driver process (`env_clear` + allowlist) | R0 audit (`docker inspect env` zero hits) |
 | Out-of-workspace write blocked | workspace-only volume; paths outside it land on the container overlay, not the host | `tests/e2e/escape.sh` (two-way PASS) |
 | Review isolation | Non-claim, enforced by the mount surface: contract full text / acceptance criteria / conversation transcript are not mounted into the executor container; the reviewer container independently mounts ws full (ro) + conversation transcript for scoring; the planner is unaware of reviewer/executor | r2/r3 e2e assertions |
-| Tool-level policy (prototype, off by default) | AGT-style pi extension intercepts `tool_call` (rm -rf / sudo / secret read / out-of-workspace write) | `tests/e2e/agt/` (24 deterministic assertions + live demo) — owner decides, see `.plans/AGT评估.md` |
+| Tool-level policy (AGT write-interception layer, **on by default**) | AGT-style pi extension intercepts `tool_call` (rm -rf / sudo / secret read / out-of-workspace write): mounted by default in all three containers (staged policy → compose mounts `/tmp/.agt` ro + audit subdir rw, driver env injects the `-e` extension). Built-in default policies `docker/agt/{executor,planner,reviewer}/policy.json` are embedded at compile time and shipped with the binary; `ALFRED_AGT_DIR` overrides with an explicit dir, `ALFRED_AGT_DISABLE=1` turns it off | `tests/e2e/agt/` (deterministic eval + live demo + `exec-demo.sh` out-of-workspace write denied + audit deny), `tests/e2e/agt-default.sh` (default-on/opt-out black box: no env → staged built-in policies + in-container audit allow; DISABLE=1 → no staging/mounts/injection; real-container probe denies out-of-workspace write) |
 
 ---
 
@@ -238,6 +241,7 @@ crates/
   alfred-cli/       src/{main.rs (alfred bin: run/feed/status), governance.rs, lib.rs}
 docker/
   Dockerfile        sandbox image (inspect base + Node 22 + pi-coding-agent 0.84.3)
+  agt/              AGT built-in default policy assets (three role policy.json + shared agt-policy.ts, embedded at compile time)
   pi-sandbox.compose.yaml   zero-mount reference base (network none)
 tests/
   e2e/              r1-r4 / escape / skeleton / agt/
