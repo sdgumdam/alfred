@@ -30,7 +30,7 @@ use alfred_core::session::SessionDoc;
 use alfred_executor::compose_gen::canonicalize_workspace;
 use alfred_executor::config::ExecutorModel;
 use alfred_executor::driver::{
-    poll_container_driver, spawn_container_driver, DriverOutcome,
+    absolutize_cwd, poll_container_driver, spawn_container_driver, DriverOutcome,
 };
 use anyhow::{bail, Context, Result};
 
@@ -329,7 +329,9 @@ fn run_planner_container(
         ),
         None => (String::new(), String::new(), String::new()),
     };
-    let done_marker = work.join("driver.done.json");
+    // 嵌入 driver.py 的 done 路径必须绝对：驱动进程 cwd 切到 work_dir 后，相对
+    // 路径被二次解析（双拼）——与 spawn 层 absolutize_cwd 同源约束。
+    let done_marker = absolutize_cwd(&work.join("driver.done.json"));
     let driver_py_path = work.join("driver.py");
     let py = generate_planner_task_py(&PlannerTaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),

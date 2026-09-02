@@ -24,7 +24,7 @@ use crate::compose_gen::{
     CONTAINER_WORKSPACE_DIR,
 };
 use crate::config::ExecutorModel;
-use crate::driver::{poll_container_driver, spawn_container_driver, DriverOutcome};
+use crate::driver::{absolutize_cwd, poll_container_driver, spawn_container_driver, DriverOutcome};
 use crate::task_gen::{generate_task_py, TaskGenParams};
 
 /// 单次运行选项。
@@ -238,7 +238,9 @@ pub fn execute_run(
         .canonicalize()
         .with_context(|| format!("canonicalize {}", compose_path.display()))?;
 
-    let done_marker = run_dir.join("driver.done.json");
+    // 嵌入 driver.py 的 done 路径必须绝对：驱动进程 cwd 切到 work_dir 后，相对
+    // 路径被二次解析（双拼）——与 spawn 层 absolutize_cwd 同源约束。
+    let done_marker = absolutize_cwd(&run_dir.join("driver.done.json"));
     let driver_py = run_dir.join("driver.py");
     let py = generate_task_py(&TaskGenParams {
         compose_file: compose_abs.to_string_lossy().into_owned(),
