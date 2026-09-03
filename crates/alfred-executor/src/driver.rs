@@ -31,23 +31,38 @@ use serde_json::Value;
 
 use crate::config::ExecutorModel;
 
-/// 宿主侧 Python 解析链（P1 恢复）：`ALFRED_PYTHON` 环境变量优先，其次本仓
-/// venv `.plans/r0-lab/venv/bin/python`（相对当前目录存在时），再 PATH 上的
-/// `python3`。
+/// 宿主侧 Python 解析链（P1 恢复 + codux PTY 根治）：`ALFRED_PYTHON` 环境变量
+/// 优先；其次本仓 venv `.plans/r0-lab/venv/bin/python`——**相对
+/// `std::env::current_exe()`（canonicalize 解析 symlink 后）定位的仓根解析**
+/// （exe → 上两级到仓根 → venv python）；最后 PATH 上的 `python3`。
 ///
-/// 返回绝对路径或裸命令名。venv 分支经 `current_dir()` 拼绝对路径——spawn 时
-/// 子进程 cwd 是 run_dir（`~/.local/state/alfred/runs/...`），相对 `.plans/...`
-/// 会在 run_dir 下解析而 miss。裸 `python3` 由 spawn 时父进程 PATH 解析，不受
-/// 子进程 cwd 影响。
+/// 为什么不相对 `current_dir()`：属主在 codux 终端跑 alfred chat 时 cwd 是任意
+/// 项目目录（≠ alfred 仓），相对 cwd 拼出的 venv 路径必 miss → 回退 PATH 上的
+/// `python3`——codux PTY 的 PATH 上可能挂着坏 python（Python 2 风格 SyntaxError，
+/// 文件本身合法 UTF-8、venv py3.12 编译通过）→ driver.py 起不来。相对 exe 解析
+/// 对 symlink 安装（codux wrapper PATH 命中 `~/.local/bin/alfred` →
+/// `target/debug/alfred`）同样成立：**macOS `current_exe()` 返回调用路径本身、
+/// 不解析 symlink**（实测，`_NSGetExecutablePath` 语义），故先
+/// `fs::canonicalize` 解析出真实 exe 再向上两级即达仓根。canonicalize 后的路径
+/// 不再含 symlink，`..` 语义与字面一致。exe 定位的 venv 不存在（如未来
+/// `cargo install` 到 CARGO_HOME）→ 保持 PATH 回退。
+///
+/// 返回绝对路径或裸命令名。裸 `python3` 由 spawn 时父进程 PATH 解析，不受子进程
+/// cwd 影响。
 pub fn python_binary() -> String {
     if let Ok(p) = std::env::var("ALFRED_PYTHON") {
         return p;
     }
-    let venv_python = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".plans/r0-lab/venv/bin/python");
-    if venv_python.is_file() {
-        return venv_python.to_string_lossy().into_owned();
+    // exe 相对 venv：canonicalize 解析 symlink 安装（~/.local/bin/alfred 等）→
+    // 真实 exe（<root>/target/{debug,release}/alfred）→ 上两级 = 仓根 → venv python。
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
+            let venv_python = root.join(".plans/r0-lab/venv/bin/python");
+            if venv_python.is_file() {
+                return venv_python.to_string_lossy().into_owned();
+            }
+        }
     }
     "python3".to_string()
 }
