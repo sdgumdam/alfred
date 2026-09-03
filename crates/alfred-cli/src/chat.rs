@@ -6,20 +6,21 @@
 //! 库入口（`run_governance_loop` / `feed_owner_message` / `init_governance_run`）；
 //! LLM 只在被治理容器里（planner/reviewer pi）。
 //!
-//! 状态路由（工单钉死 + ChatPlanAudit 8 点纠偏全采纳）：
-//! - **需求收集态**（无 run / 终态后新需求）：第一行=需求 → `[orchestrator]`
-//!   确定性转写（title=首行 ≤40 字、`chars()` 截断防中文 panic；description=全文）
-//!   → 追问"验收标准"（"按需求"=用需求原文）→ OwnerRequest（id=`chat-<ts>`）→
+//! - **需求收集态**（无 run / 终态后新需求）：一行需求 → OwnerRequest（title=
+//!   首行 ≤40 字、`chars()` 截断防中文 panic；description=全文；acceptance_
+//!   criteria 默认=需求原文——不追问验收标准，pi 对话中需要澄清自然会问）→
 //!   `init_governance_run` 建 run（与 cmd_run 单一初始化真源）→ 提交 planner。
+//!   转写呈现极简：一行"已受理"（id/title/criteria 不再四行块铺陈）。
 //! - **Planning 态**（pi 答复后停驻）：整行=="放弃" → Abandon（P2a 转移表支持，
 //!   属主放弃恒可选）；其余一律 Revise + 整行作 owner 消息续入对话 → `[pi]` 答复。
-//! - **挂起态**（escalated/plan_rejected）：呈现升级包（按态取数：PlanRejected→
-//!   plan_verdicts.last()；Escalated→exec_verdicts.last()+escalation_source；缺
-//!   verdict（unscored 升级）读 audit.jsonl 最近升级事件；owner 全可见用原始
-//!   verdict——禁词净化是 planner 侧投影不适用此处）→ 决策**整行 trim 精确匹配**：
-//!   =="重试"→Retry、=="放弃"→Abandon、其余一律 Revise+整行作 owner 消息（最安全
-//!   分支：进 planner 它会追问澄清；禁子串包含——"不要重试"误路由 Retry 是不可逆
-//!   误动作）。
+//! - **挂起态**（escalated/plan_rejected）：升级包呈现极简（2-3 行：run/态 +
+//!   审查/升级意见 + "回复：重试 / 放弃 / 或直接说修改意见"；按态取数：
+//!   PlanRejected→plan_verdicts.last()；Escalated→exec_verdicts.last()+
+//!   escalation_source；缺 verdict（unscored 升级）读 audit.jsonl 最近升级事件；
+//!   owner 全可见用原始 verdict——禁词净化是 planner 侧投影不适用此处）→
+//!   决策**整行 trim 精确匹配**：=="重试"→Retry、=="放弃"→Abandon、其余一律
+//!   Revise+整行作 owner 消息（最安全分支：进 planner 它会追问澄清；禁子串
+//!   包含——"不要重试"误路由 Retry 是不可逆误动作）。
 //! - **终态**（completed/abandoned）：呈现结果 + "新需求请直接说 / Ctrl-D 退出"
 //!   → 回需求收集态。
 //! - **断点恢复**：run 从 state.json 恢复（P3 每转移 persist）；流转中间态
@@ -72,7 +73,9 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
 
     let (mut run_dir, mut run) = locate_run(run_dir_flag.as_deref())?;
 
-    // REPL 横幅常显 run_dir（P3：owner 永远知道自己在哪个 run 上说话）。
+    // REPL 横幅常显 run_dir（P3：owner 永远知道自己在哪个 run 上说话）；其余
+    // 元数据极简——恢复态一行（run_id + state），需求不复述（升级包/终态呈现时
+    // 仍可见）。
     match &run {
         Some(r) => {
             println!("[chat] ── alfred chat（owner 持续会话；Ctrl-D 退出）──");
@@ -82,11 +85,10 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                 r.run_id,
                 state_label(r.state())
             );
-            println!("[chat] 需求: {}", r.request.title);
         }
         None => {
             println!("[chat] ── alfred chat（owner 持续会话；Ctrl-D 退出）──");
-            println!("[chat] 未发现进行中的治理 run——请直接说需求（新 run 将落默认治理目录）。");
+            println!("[chat] 未发现进行中的治理 run——请直接说需求。");
         }
     }
 
@@ -137,19 +139,21 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                         fresh_terminal = true;
                     }
                 }
-                let Some((requirement, acceptance)) = collect_requirement(&stdin)? else {
+                let Some(requirement) = collect_requirement(&stdin)? else {
                     break;
                 };
-                // 确定性转写（title 按 chars() 截断 ≤40，中文安全）。
+                // 确定性转写（title 按 chars() 截断 ≤40，中文安全）；验收标准
+                // 默认=需求原文——不追问（pi 对话中需要澄清自然会问，Reply 分支）。
                 let request = OwnerRequest::new(
                     short_id("chat"),
                     first_n_chars(&requirement, 40),
+                    requirement.clone(),
                     requirement,
-                    acceptance,
                 );
                 let new_dir = next_new_run_dir(run_dir_flag.as_deref());
+                // 转写呈现极简：一行"已受理"（id/criteria 不再四行块铺陈）。
                 println!("[chat] 新建 run: {}", new_dir.display());
-                print_request_transcript(&request);
+                println!("[chat] 已受理：{}", request.title);
                 let mut r =
                     match init_governance_run(&new_dir, request, GovernanceOptions::default()) {
                         Ok(r) => r,
@@ -231,12 +235,7 @@ fn feed_and_present(
     match feed_owner_message(&mut r, &ctx, message, decision) {
         Ok(outcome) => {
             surface_planner_output(run_dir, &outcome.reply, turns_before);
-            println!(
-                "[chat] 当前状态: {}（attempts={}/{}）",
-                state_label(outcome.state),
-                r.attempts_used,
-                r.mechanical_budget
-            );
+            println!("[chat] 当前状态: {}", state_label(outcome.state));
             *run = Some(r);
         }
         Err(e) => reload_after_error(run, run_dir, &e)?,
@@ -363,10 +362,10 @@ fn parse_planning_decision(line: &str) -> (OwnerDecision, String) {
     }
 }
 
-/// 需求收集（工单两行确定性转写）：第一行=需求（空行重问）；第二行=验收标准
-/// （"按需求"或空行=用需求原文）。EOF → None（会话结束）。
-fn collect_requirement(stdin: &io::Stdin) -> Result<Option<(String, String)>> {
-    let requirement = loop {
+/// 需求收集（单轮直提）：一行=需求（空行重问）。不追问验收标准——默认=需求
+/// 原文（pi 对话中需要澄清自然会问，Reply 分支）。EOF → None（会话结束）。
+fn collect_requirement(stdin: &io::Stdin) -> Result<Option<String>> {
+    loop {
         let Some(line) = read_line(stdin, "[chat] 需求（一行；Ctrl-D 退出）：")? else {
             return Ok(None);
         };
@@ -375,20 +374,8 @@ fn collect_requirement(stdin: &io::Stdin) -> Result<Option<(String, String)>> {
             println!("[chat] 需求为空——请直接说需求。");
             continue;
         }
-        break line;
-    };
-    let acceptance = loop {
-        let Some(line) =
-            read_line(stdin, "[chat] 验收标准（\"按需求\"=用需求原文；Ctrl-D 退出）：")?
-        else {
-            return Ok(None);
-        };
-        match line.trim() {
-            "" | "按需求" => break requirement.clone(),
-            other => break other.to_string(),
-        }
-    };
-    Ok(Some((requirement, acceptance)))
+        return Ok(Some(line));
+    }
 }
 
 /// 新 run 落点：显式 --run-dir 且该目录尚无 state.json（未被既有 run 占据）→ 用它；
@@ -401,56 +388,19 @@ fn next_new_run_dir(explicit: Option<&Path>) -> PathBuf {
     }
 }
 
-/// [orchestrator] 确定性转写呈现（工单：title=首行 ≤40 字、description=全文）。
-fn print_request_transcript(request: &OwnerRequest) {
-    println!("[orchestrator] 需求已确定性转写：");
-    println!("[orchestrator]   id: {}", request.id);
-    println!("[orchestrator]   title: {}", request.title);
-    println!("[orchestrator]   description: {}", request.description);
-    println!(
-        "[orchestrator]   acceptance_criteria: {}",
-        request.acceptance_criteria
-    );
-}
-
-/// 升级包呈现（Escalation，工单④ + P2 字段钉死）：产物摘要 + 审查意见。
+/// 升级包呈现（工单④ 极简化）：2-3 行——挂起标题 + 意见/原因 + 拍板提示。
 ///
 /// 按态取数单一真源：PlanRejected → plan_verdicts.last()（打回 reason）；
-/// Escalated → exec_verdicts.last()（等级/failure_class/意见/证据）+ escalation_source。
-/// 缺 verdict（unscored 升级，如离线/审查容器故障）→ 读 audit.jsonl 最近升级事件。
-/// 属主全可见用原始 verdict（禁词净化是 planner 侧投影，不适用此处）。
+/// Escalated → exec_verdicts.last()（等级/意见/证据一行并呈）+ escalation_source
+/// 摘要。缺 verdict（unscored 升级，如离线/审查容器故障）→ 读 audit.jsonl 最近
+/// 升级事件。属主全可见用原始 verdict（禁词净化是 planner 侧投影，不适用此处）。
+/// 砍掉 run_dir/需求复述/计划节点/attempts 等元数据行（run_dir 横幅已有；attempts
+/// 等细节在 audit.jsonl/state.json 可查）。
 fn present_suspension(run: &GovernanceRun, run_dir: &Path) {
-    println!("[chat] ── 治理挂起，等待属主拍板 ──");
     println!(
-        "[chat] run_dir: {}（产物: {}/ws）",
-        run_dir.display(),
-        run_dir.display()
+        "[chat] ── 治理挂起，等待属主拍板（state={}）──",
+        state_label(run.state())
     );
-    println!(
-        "[chat] run: {}（state={}，attempts={}/{}）",
-        run.run_id,
-        state_label(run.state()),
-        run.attempts_used,
-        run.mechanical_budget
-    );
-    println!("[chat] 需求: {}", run.request.title);
-    match &run.dagspec {
-        Some(dagspec) if !dagspec.nodes.is_empty() => {
-            println!("[chat] 计划: {} 节点", dagspec.nodes.len());
-            for node in &dagspec.nodes {
-                let subdirs = if node.sandbox.workspace_subdirs.is_empty() {
-                    "无声明".to_string()
-                } else {
-                    node.sandbox.workspace_subdirs.join(", ")
-                };
-                println!(
-                    "[chat]   - {}（产物区: {}）：{}",
-                    node.id, subdirs, node.summary
-                );
-            }
-        }
-        _ => println!("[chat] 计划: 尚未产出"),
-    }
     match run.state() {
         GovernanceState::PlanRejected => match run.plan_verdicts.last() {
             Some(v) => println!("[chat] 计划审查意见（打回）：{}", v.reason),
@@ -459,25 +409,19 @@ fn present_suspension(run: &GovernanceRun, run_dir: &Path) {
                 last_escalation_reason(run_dir).unwrap_or_else(|| "未知".into())
             ),
         },
-        GovernanceState::Escalated => {
-            println!("[chat] 升级来源: {:?}", run.escalation_source);
-            match run.exec_verdicts.last() {
-                Some(v) => {
-                    println!(
-                        "[chat] 执行审查结论: 等级 {:?}，failure_class {:?}",
-                        v.value, v.failure_class
-                    );
-                    println!("[chat] 审查意见: {}", v.explanation);
-                    for ev in v.evidence.iter().take(3) {
-                        println!("[chat]   证据: {ev}");
-                    }
-                }
-                None => println!(
-                    "[chat] 升级原因: {}",
-                    last_escalation_reason(run_dir).unwrap_or_else(|| "未知".into())
-                ),
+        GovernanceState::Escalated => match run.exec_verdicts.last() {
+            Some(v) => {
+                println!(
+                    "[chat] 执行审查意见（{:?}，来源 {:?}）：{}",
+                    v.value, run.escalation_source, v.explanation
+                );
             }
-        }
+            None => println!(
+                "[chat] 升级原因: {}（来源 {:?}）",
+                last_escalation_reason(run_dir).unwrap_or_else(|| "未知".into()),
+                run.escalation_source
+            ),
+        },
         _ => {}
     }
 }

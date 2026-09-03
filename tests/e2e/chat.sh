@@ -9,9 +9,9 @@
 # 默认全离线（ALFRED_OFFLINE=1 确定性直通，无 docker 无 LLM；模型配置只加载不
 # 调用，前置与 r4 相同：~/.config/alfred/config.yml 或 env 覆盖）：
 #
-#   case1 需求收集：需求+验收标准("按需求") → OwnerRequest 确定性转写（id=chat-<ts>，
-#         title 首行）→ 建 run → planner 答复分支（ALFRED_OFFLINE_REPLY_FILE）→
-#         [pi] 答复 → Planning 停驻 → EOF 退出
+#   case1 需求收集（单轮直提）：一行需求 → OwnerRequest（id=chat-<ts>，title=
+#         需求原文，验收标准默认=需求原文）→ 建 run → planner 答复分支
+#         （ALFRED_OFFLINE_REPLY_FILE）→ [pi] 答复 → Planning 停驻 → EOF 退出
 #   case2 全流程对话（断点恢复 + 拍板多轮 + 终态新需求）：
 #         恢复 Planning run → 属主消息 → 建图（[orchestrator] 流转状态行 +
 #         [pi] 计划摘要）→ 挂起升级包 → 拍板：重试（Retry）/ "不要重试，改成X"
@@ -119,34 +119,37 @@ JSON
 echo "[chat-e2e] 离线黑盒：state=$STATE"
 
 # ============================================================================
-# Case 1：需求收集 → planner 答复分支 → Planning 停驻 → EOF 退出
+# Case 1：需求收集（单轮直提，无验收追问）→ planner 答复分支 → Planning 停驻 →
+#         EOF 退出
 # ============================================================================
 CASE1="$STATE/run-chat-case1"
 mkdir -p "$CASE1"
 printf 'pi 需要先澄清吗\n' > "$FIX/reply1.txt"
-printf '写一个 hello.txt 内容是 Hello\n按需求\n' | \
+printf '写一个 hello.txt 内容是 Hello\n' | \
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$FIX/reply1.txt" \
   ALFRED chat --run-dir "$CASE1" > "$LOG/case1.out" 2> "$LOG/case1.err"
 [[ -f "$CASE1/state.json" ]] || fail case1 "run 未建立"
 assert_state "$CASE1" "planning" case1
-has "$LOG/case1.out" "需求已确定性转写" case1
-has "$LOG/case1.out" "验收标准" case1
+has "$LOG/case1.out" "已受理：写一个 hello.txt 内容是 Hello" case1
+if grep -q "确定性转写" "$LOG/case1.out"; then fail case1 "转写不应再铺陈四行块"; fi
+if grep -q "验收标准（" "$LOG/case1.out"; then fail case1 "不应再追问验收标准"; fi
 has "$LOG/case1.out" "\[pi\] pi 需要先澄清吗" case1
 has "$LOG/case1.out" "新建 run: $CASE1" case1
 C1_REQ_ID="$(python3 -c "import json;print(json.load(open('$CASE1/request.json'))['id'])")"
 [[ "$C1_REQ_ID" == chat-* ]] || fail case1 "request id 非 chat-<ts>：$C1_REQ_ID"
-python3 - "$CASE1" <<'PY' || fail case1 "title 应为首行原文，验收标准=需求原文"
+python3 - "$CASE1" <<'PY' || fail case1 "title 应为需求原文，验收标准默认=需求原文"
 import json, sys
 r = json.load(open(sys.argv[1] + "/request.json"))
 assert r["title"] == "写一个 hello.txt 内容是 Hello", r["title"]
-assert r["acceptance_criteria"] == r["description"], "按需求 → 验收标准=需求原文"
+assert r["description"] == "写一个 hello.txt 内容是 Hello", r["description"]
+assert r["acceptance_criteria"] == r["description"], "默认验收标准=需求原文"
 PY
 python3 - "$CASE1" <<'PY' || fail case1 "conversation.json 缺 request.submit 首轮"
 import json, sys
 log = json.load(open(sys.argv[1] + "/conversation.json"))
 assert log["turns"][0]["source"] == "request.submit", log["turns"][0]
 PY
-pass case1 "需求收集+确定性转写+建 run+[pi] 答复 → Planning（id=${C1_REQ_ID}）"
+pass case1 "需求单轮直提+建 run+[pi] 答复 → Planning（id=${C1_REQ_ID}）"
 
 # ============================================================================
 # Case 2：断点恢复 → 建图 → [orchestrator] 流转 → 挂起拍板（含 P1 边界）→
@@ -166,7 +169,7 @@ assert_order "$LOG/case2.out" case2 \
   "新建 run: " \
   "规划失败已升级属主"
 # 终态后新 run 的升级包（planning 来源）与拍板提示呈现
-has "$LOG/case2.out" "升级来源: Some(Planning)" case2
+has "$LOG/case2.out" "升级原因: .*（来源 Some(Planning)）" case2
 has "$LOG/case2.out" "回复：重试 / 放弃 / 或直接说修改意见" case2
 assert_state "$CASE1" "abandoned" case2
 # 建图后计划摘要以 [pi] 呈现（P2：ConverseReply 语义轮单一真源）
@@ -212,7 +215,7 @@ pass case3 "自动发现最新挂起 run + 重试 → 重规划建图 → 挂起
 CASE4="$STATE/run-chat-case4"
 mkdir -p "$CASE4"
 # 快速造第二个挂起 run：离线注入指向不存在的计划文件 → planning_error 升级
-printf '再造一个挂起 run\n按需求\n' | \
+printf '再造一个挂起 run\n' | \
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$FIX/definitely-missing.json" \
   ALFRED chat --run-dir "$CASE4" > "$LOG/case4a.out" 2> "$LOG/case4a.err"
 assert_state "$CASE4" "escalated" case4
@@ -232,7 +235,7 @@ pass case4 "多挂起消歧（列出 2 个挂起 run 要求 --run-dir，exit=${C
 # ============================================================================
 CASE5="$STATE/run-chat-case5"
 mkdir -p "$CASE5"
-printf '需求收集后放弃\n按需求\n' | \
+printf '需求收集后放弃\n' | \
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$FIX/reply1.txt" \
   ALFRED chat --run-dir "$CASE5" > "$LOG/case5a.out" 2> "$LOG/case5a.err"
 assert_state "$CASE5" "planning" case5
@@ -249,7 +252,7 @@ pass case5 "Planning 态放弃出口（整行精确匹配 → Abandoned，owner 
 # ============================================================================
 CASE6="$STATE/run-chat-case6"
 mkdir -p "$CASE6"
-printf '写一个 hello.txt\n按需求\n' | \
+printf '写一个 hello.txt\n' | \
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$FIX/reply1.txt" \
   ALFRED chat --run-dir "$CASE6" > "$LOG/case6a.out" 2> "$LOG/case6a.err"
 assert_state "$CASE6" "planning" case6
@@ -291,13 +294,13 @@ pass case6 "PlanRejected 打回呈现（verdict 意见）+ 伪装重试闭环 + 
 # ============================================================================
 CASE7="$STATE/run-chat-case7"
 mkdir -p "$CASE7"
-# 60 个中文字符的需求（> 40，且多字节边界多样），验收标准"按需求"
+# 60 个中文字符的需求（> 40，且多字节边界多样）
 C7_REQ="$(python3 -c "print('超' * 60)")"
-printf '%s\n按需求\n' "$C7_REQ" | \
+printf '%s\n' "$C7_REQ" | \
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$FIX/reply1.txt" \
   ALFRED chat --run-dir "$CASE7" > "$LOG/case7.out" 2> "$LOG/case7.err"
 assert_state "$CASE7" "planning" case7
-has "$LOG/case7.out" "需求已确定性转写" case7
+has "$LOG/case7.out" "已受理：" case7
 python3 - "$CASE7" <<'PY' || fail case7 "title 应为 chars() 前 40 字截断（无 panic/乱码），description 保留全文"
 import json, sys
 r = json.load(open(sys.argv[1] + "/request.json"))
@@ -305,7 +308,7 @@ expected_title = "超" * 40
 assert r["title"] == expected_title, f"title 应为前 40 字（got {len(r['title'])} chars）"
 assert len(r["title"]) == 40, f"title 应恰 40 chars（got {len(r['title'])}）"
 assert r["description"] == "超" * 60, "description 应保留需求全文（60 chars）"
-assert r["acceptance_criteria"] == r["description"], "按需求 → 验收标准=需求原文"
+assert r["acceptance_criteria"] == r["description"], "默认验收标准=需求原文"
 PY
 pass case7 "超长中文 title chars() 截断 ≤40（title=40 chars，description 全文，无 panic）"
 
@@ -327,11 +330,11 @@ if [[ "${CHAT_REAL:-0}" == "1" ]]; then
   # （子壳内 unset 离线注入 env——env 工具无法调用 shell 函数，走 ALFRED 函数本体）
   (
     unset ALFRED_OFFLINE ALFRED_OFFLINE_PLAN_FILE ALFRED_OFFLINE_REPLY_FILE
-    printf '在 workspace 里写一个 hello.txt，内容必须是 Hello。先回复我你的理解，等我确认后再建图\n按需求\n确认无误，直接按验收标准建图\n' | \
+    printf '在 workspace 里写一个 hello.txt，内容必须是 Hello。先回复我你的理解，等我确认后再建图\n确认无误，直接按验收标准建图\n' | \
       ALFRED chat --run-dir "$REAL" > "$LOG/chat-real.out" 2> "$LOG/chat-real.err"
   )
   has "$LOG/chat-real.out" "\[pi\] " chat-real
-  has "$LOG/chat-real.out" "确定性转写" chat-real
+  has "$LOG/chat-real.out" "已受理：" chat-real
   has "$LOG/chat-real.out" "会话结束" chat-real
   python3 - "$REAL" <<'PY' || fail chat-real "conversation.json 应含真实 planner ConverseReply 轮"
 import json, sys
