@@ -27,8 +27,8 @@ use alfred_core::session::SessionDoc;
 use alfred_executor::config::ExecutorModel;
 use anyhow::{bail, Context, Result};
 
-use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord};
 use crate::disguise::sanitize_review_summary;
+use crate::llm::{log_llm_call, ChatMessage, LlmCallRecord};
 
 /// 会话文档对规划器的投影（方案B：第三段 review_summary → owner_feedback，内容中性化）。
 /// 磁盘上 state.json 的会话文档保持原名 review_summary（审计真源不变），只改喂给
@@ -153,41 +153,41 @@ pub fn converse(
     owner_message: &str,
 ) -> Result<ConverseOutcome> {
     let messages = build_messages(request, doc, owner_message, &opts.append_system_prompt);
-    let (outcome, response, offline, transport) =
-        if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
-            || std::env::var("ALFRED_PLANNER_OFFLINE").as_deref() == Ok("1")
-        {
-            // 离线模式保留：不经容器/宿主 pi（确定性直通）；两分支由注入文件二选一。
-            let (outcome, response) = converse_offline(request)?;
-            (outcome, response, true, "offline")
-        } else {
-            // 宿主 pi 化：宿主 pi 读 stdin prompt 跑 converse（模型经 run 级
-            // models.json 单源投影），宿主读 outputs 产出（instructions.json |
-            // reply.txt，收割强制恰好一个）。
-            let out = crate::host::run_converse_on_host(
-                &opts.host,
-                &opts.model,
-                request,
-                doc,
-                owner_message,
-                &opts.append_system_prompt,
-            )?;
-            let outcome = match out.produced_file.as_str() {
-                crate::host::CONVERSE_OUTPUT_FILE => {
-                    let dagspec = instructions_to_dagspec(&out.output_text, request)?;
-                    ConverseOutcome::Instructions {
-                        dagspec,
-                        record_path: PathBuf::new(),
-                    }
-                }
-                crate::host::CONVERSE_REPLY_FILE => ConverseOutcome::Reply {
-                    reply: out.output_text.trim().to_string(),
+    let (outcome, response, offline, transport) = if std::env::var("ALFRED_OFFLINE").as_deref()
+        == Ok("1")
+        || std::env::var("ALFRED_PLANNER_OFFLINE").as_deref() == Ok("1")
+    {
+        // 离线模式保留：不经容器/宿主 pi（确定性直通）；两分支由注入文件二选一。
+        let (outcome, response) = converse_offline(request)?;
+        (outcome, response, true, "offline")
+    } else {
+        // 宿主 pi 化：宿主 pi 读 stdin prompt 跑 converse（模型经 run 级
+        // models.json 单源投影），宿主读 outputs 产出（instructions.json |
+        // reply.txt，收割强制恰好一个）。
+        let out = crate::host::run_converse_on_host(
+            &opts.host,
+            &opts.model,
+            request,
+            doc,
+            owner_message,
+            &opts.append_system_prompt,
+        )?;
+        let outcome = match out.produced_file.as_str() {
+            crate::host::CONVERSE_OUTPUT_FILE => {
+                let dagspec = instructions_to_dagspec(&out.output_text, request)?;
+                ConverseOutcome::Instructions {
+                    dagspec,
                     record_path: PathBuf::new(),
-                },
-                other => bail!("converse host pi produced unexpected output file {other}"),
-            };
-            (outcome, out.output_text, false, "host_pi")
+                }
+            }
+            crate::host::CONVERSE_REPLY_FILE => ConverseOutcome::Reply {
+                reply: out.output_text.trim().to_string(),
+                record_path: PathBuf::new(),
+            },
+            other => bail!("converse host pi produced unexpected output file {other}"),
         };
+        (outcome, out.output_text, false, "host_pi")
+    };
 
     let record = LlmCallRecord {
         ts: alfred_core::util::now_rfc3339(),
@@ -206,10 +206,7 @@ pub fn converse(
             dagspec,
             record_path,
         },
-        ConverseOutcome::Reply { reply, .. } => ConverseOutcome::Reply {
-            reply,
-            record_path,
-        },
+        ConverseOutcome::Reply { reply, .. } => ConverseOutcome::Reply { reply, record_path },
     })
 }
 
@@ -324,8 +321,8 @@ fn converse_offline(request: &OwnerRequest) -> Result<(ConverseOutcome, String)>
 
 /// 离线模式读注入的计划文件（DagSpec JSON）。
 fn read_offline_plan(path: &str) -> Result<DagSpec> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read offline plan {}", path))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read offline plan {}", path))?;
     serde_json::from_str(&text).with_context(|| format!("parse offline plan {}", path))
 }
 

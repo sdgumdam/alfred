@@ -14,6 +14,7 @@ pub mod converse;
 pub mod disguise;
 pub mod host;
 pub mod llm;
+pub mod maintain;
 
 pub use converse::{
     build_messages, converse, instructions_to_dagspec, ConverseOptions, ConverseOutcome,

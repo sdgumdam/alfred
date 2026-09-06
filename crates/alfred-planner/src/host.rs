@@ -48,7 +48,68 @@ pub const CONVERSE_OUTPUT_FILE: &str = "instructions.json";
 /// 属主答复产出文件名（§2.4 答复分支）。
 pub const CONVERSE_REPLY_FILE: &str = "reply.txt";
 /// run 级 pi 配置目录名（`<run_dir>/planner/pi-config`，内含 `agent/models.json`）。
-const PI_CONFIG_DIR: &str = "pi-config";
+pub(crate) const PI_CONFIG_DIR: &str = "pi-config";
+/// AGT 审计 JSONL 相对 planner 工作目录的路径（`<run>/planner/agt/audit/audit.jsonl`）。
+const AGT_AUDIT_REL: &str = "agt/audit/audit.jsonl";
+
+/// planner AGT 审计文件路径（key_file_paths 真实数据源：维护者增量提取的读取对象）。
+pub fn planner_audit_path(run_dir: &Path) -> PathBuf {
+    run_dir.join(PLANNER_WORK_DIR).join(AGT_AUDIT_REL)
+}
+
+/// AGT 审计 JSONL 当前行数快照（converse 前调用，供轮次增量提取）。
+///
+/// 缺文件（首轮 / AGT 关闭）记 0——不存在"读不出增量"的静默分支。
+pub fn snapshot_audit_lines(run_dir: &Path) -> u64 {
+    use std::io::BufRead;
+    match std::fs::File::open(planner_audit_path(run_dir)) {
+        Ok(f) => std::io::BufReader::new(f)
+            .lines()
+            .map_while(|l| l.ok())
+            .count() as u64,
+        Err(_) => 0,
+    }
+}
+
+/// AGT 审计 JSONL 的单行记录（提取所需字段子集；宽进——多余字段忽略）。
+#[derive(serde::Deserialize)]
+struct AgtAuditLine {
+    tool_name: String,
+    #[serde(default)]
+    path: Option<String>,
+    decision: String,
+}
+
+/// converse 后审计增量提取：本轮新增 allow read 的**宿主路径**（确定性提取+去重）。
+///
+/// key_file_paths 真实数据源（维护者重做）：planner 宿主 pi 每轮真实读过的路径，
+/// 从 AGT 审计 allow read 记录提取。**deny 记录不提取**（deny 路径本身泄露治理面）。
+/// 审计行文本只进本函数的解析器，不进任何 LLM prompt。
+pub fn extract_allow_read_paths(run_dir: &Path, since_lines: u64) -> Vec<String> {
+    let text = match std::fs::read_to_string(planner_audit_path(run_dir)) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for (idx, line) in text.lines().enumerate() {
+        if (idx as u64) < since_lines {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<AgtAuditLine>(line) else {
+            continue;
+        };
+        if entry.decision != "allow" || entry.tool_name != "read" {
+            continue;
+        }
+        if let Some(p) = entry.path {
+            let p = p.trim();
+            if !p.is_empty() {
+                seen.insert(p.to_string());
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
 
 /// planner 宿主驱动选项（编排器从 `GovernanceOptions` + config 解析面派生）。
 #[derive(Debug, Clone)]
@@ -116,13 +177,17 @@ struct PiModel<'a> {
 /// 模型单一真源：provider/model 从 config.yml 解析面（[`ExecutorModel`]）投影——
 /// pi 只认 models.json，编排器按 config 生成即收编。`auth.json` 空对象占位
 /// （PiHostFormCheck：无此文件偶发 "No API key found"）。
-fn write_pi_config(pi_config_dir: &Path, model: &ExecutorModel) -> Result<()> {
+pub(crate) fn write_pi_config(pi_config_dir: &Path, model: &ExecutorModel) -> Result<()> {
     let agent_dir = pi_config_dir.join("agent");
     std::fs::create_dir_all(&agent_dir)
         .with_context(|| format!("create pi config dir {}", agent_dir.display()))?;
     if !pi_config_dir.join("auth.json").exists() {
-        std::fs::write(pi_config_dir.join("auth.json"), "{}")
-            .with_context(|| format!("write pi auth {}", pi_config_dir.join("auth.json").display()))?;
+        std::fs::write(pi_config_dir.join("auth.json"), "{}").with_context(|| {
+            format!(
+                "write pi auth {}",
+                pi_config_dir.join("auth.json").display()
+            )
+        })?;
     }
     let models_json = serde_json::to_string_pretty(&serde_json::json!({
         "providers": {
@@ -139,8 +204,7 @@ fn write_pi_config(pi_config_dir: &Path, model: &ExecutorModel) -> Result<()> {
     }))
     .context("serialize pi models.json")?;
     let path = agent_dir.join("models.json");
-    std::fs::write(&path, models_json)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, models_json).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -193,10 +257,7 @@ pub fn run_converse_on_host(
         match std::fs::remove_file(outputs_dir.join(f)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("remove stale planner output {}", f))
-            }
+            Err(e) => return Err(e).with_context(|| format!("remove stale planner output {}", f)),
         }
     }
 
@@ -217,82 +278,22 @@ pub fn run_converse_on_host(
 
     // prompt（stdin）= 会话文档投影 + 属主本轮消息 + request id。
     let projection = crate::converse::project_session_doc(doc);
-    let session = serde_json::to_string_pretty(&projection)
-        .context("serialize projected SessionDoc")?;
+    let session =
+        serde_json::to_string_pretty(&projection).context("serialize projected SessionDoc")?;
     let prompt = format!(
         "需求 id：{}\n\n会话文档（记忆）：\n{session}\n\n属主本轮消息：\n{owner_message}",
         request.id
     );
 
-    // spawn：pi -p --no-session -nc --system-prompt <sys> -e <agt> --provider --model
-    let mut cmd = Command::new("pi");
-    cmd.arg("-p")
-        .arg("--no-session")
-        .arg("-nc")
-        .arg("--system-prompt")
-        .arg(&system_prompt)
-        .arg("--provider")
-        .arg(&model.provider)
-        .arg("--model")
-        .arg(&model.model)
-        .current_dir(&opts.project_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(ext) = &agt_ext {
-        cmd.arg("-e").arg(ext);
-        cmd.env("AGT_POLICY_PATH", work.join("agt/policy.json"));
-        cmd.env("AGT_AUDIT_PATH", work.join("agt/audit/audit.jsonl"));
-    }
-    // PI_CODING_AGENT_DIR = 配置目录本身（models.json 直接在其下；pi 默认 ~/.pi/agent）。
-    cmd.env("PI_CODING_AGENT_DIR", pi_config_dir.join("agent"));
-    cmd.env("AGT_WORKSPACE_DIR", &opts.project_root);
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| "spawn host pi for planner converse (is `pi` on PATH?)")?;
-    // prompt 经 stdin（JSON 会话文档不经 argv——ps 不可见且免引号转义）。
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .context("pi stdin")?
-        .write_all(prompt.as_bytes())
-        .context("write planner converse prompt to pi stdin")?;
-    // stdin 落 drop 即 EOF → pi 处理完 prompt 退出。
-
-    // 自限时：time_limit_secs 到点 kill（容器时代 driver anyio.fail_after 的宿主
-    // 形态）。轮询收割 child，避免僵尸；超时先 terminate 再等待回收。
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(opts.time_limit_secs as u64);
-    let output = loop {
-        match child.try_wait()? {
-            Some(status) => {
-                break std::process::Output {
-                    status,
-                    stdout: child.stdout.take().map(|mut s| { let mut b = Vec::new(); use std::io::Read; let _ = s.read_to_end(&mut b); b }).unwrap_or_default(),
-                    stderr: child.stderr.take().map(|mut s| { let mut b = Vec::new(); use std::io::Read; let _ = s.read_to_end(&mut b); b }).unwrap_or_default(),
-                };
-            }
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!(
-                        "planner host pi timed out after {}s",
-                        opts.time_limit_secs
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-        }
-    };
-    if !output.status.success() {
-        bail!(
-            "planner host pi exited with {} (stderr: {})",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim().chars().take(2000).collect::<String>()
-        );
-    }
+    let _pi_stdout = spawn_planner_pi(
+        opts,
+        model,
+        &work,
+        &pi_config_dir,
+        agt_ext.as_deref(),
+        &system_prompt,
+        &prompt,
+    )?;
 
     // 收割：两分支候选恰好一个非空（多/零显式报错，无静默出口）。
     let mut produced: Vec<(&str, String)> = Vec::new();
@@ -307,12 +308,9 @@ pub fn run_converse_on_host(
         [(f, text)] => ((*f).to_string(), text.clone()),
         [] => bail!(
             "planner host pi produced none of {CONVERSE_OUTPUT_FILE}, {CONVERSE_REPLY_FILE} \
-             (pi stdout: {})",
-            String::from_utf8_lossy(&output.stdout).trim().chars().take(2000).collect::<String>()
+             (pi stdout: {_pi_stdout})"
         ),
-        _ => bail!(
-            "planner host pi produced multiple outputs: 两分支只能二选一"
-        ),
+        _ => bail!("planner host pi produced multiple outputs: 两分支只能二选一"),
     };
     if output_text.trim().is_empty() {
         bail!("planner host pi produced empty output in {produced_file}");
@@ -324,6 +322,108 @@ pub fn run_converse_on_host(
     })
 }
 
+/// 宿主 pi 单次会话驱动（converse 与 maintain 的公共收割原语，照 host.rs converse
+/// spawn 形态单一真源）：spawn `pi -p --no-session -nc`，stdin 喂 prompt，自限时
+/// 轮询收割，settle 后返回 stdout 文本（产出文件由调用方按各自路径规则收割）。
+pub(crate) fn spawn_planner_pi(
+    opts: &PlannerHostOptions,
+    model: &ExecutorModel,
+    work: &Path,
+    pi_config_dir: &Path,
+    agt_ext: Option<&Path>,
+    system_prompt: &str,
+    prompt: &str,
+) -> Result<String> {
+    // spawn：pi -p --no-session -nc --system-prompt <sys> -e <agt> --provider --model
+    let mut cmd = Command::new("pi");
+    cmd.arg("-p")
+        .arg("--no-session")
+        .arg("-nc")
+        .arg("--system-prompt")
+        .arg(system_prompt)
+        .arg("--provider")
+        .arg(&model.provider)
+        .arg("--model")
+        .arg(&model.model)
+        .current_dir(&opts.project_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(ext) = agt_ext {
+        cmd.arg("-e").arg(ext);
+        cmd.env("AGT_POLICY_PATH", work.join("agt/policy.json"));
+        cmd.env("AGT_AUDIT_PATH", work.join(AGT_AUDIT_REL));
+    }
+    // PI_CODING_AGENT_DIR = 配置目录本身（models.json 直接在其下；pi 默认 ~/.pi/agent）。
+    cmd.env("PI_CODING_AGENT_DIR", pi_config_dir.join("agent"));
+    cmd.env("AGT_WORKSPACE_DIR", &opts.project_root);
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| "spawn host pi for planner (is `pi` on PATH?)")?;
+    // prompt 经 stdin（JSON 会话文档不经 argv——ps 不可见且免引号转义）。
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .context("pi stdin")?
+        .write_all(prompt.as_bytes())
+        .context("write planner prompt to pi stdin")?;
+    // 自限时：time_limit_secs 到点 kill（容器时代 driver anyio.fail_after 的宿主
+    // 形态）。轮询收割 child，避免僵尸；超时先 terminate 再等待回收。
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(opts.time_limit_secs as u64);
+    let output = loop {
+        match child.try_wait()? {
+            Some(status) => {
+                break std::process::Output {
+                    status,
+                    stdout: child
+                        .stdout
+                        .take()
+                        .map(|mut s| {
+                            let mut b = Vec::new();
+                            use std::io::Read;
+                            let _ = s.read_to_end(&mut b);
+                            b
+                        })
+                        .unwrap_or_default(),
+                    stderr: child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut b = Vec::new();
+                            use std::io::Read;
+                            let _ = s.read_to_end(&mut b);
+                            b
+                        })
+                        .unwrap_or_default(),
+                };
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("planner host pi timed out after {}s", opts.time_limit_secs);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    };
+    if !output.status.success() {
+        bail!(
+            "planner host pi exited with {} (stderr: {})",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(2000)
+                .collect::<String>()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// 宿主侧 AGT 层准备：策略 + 扩展落 `<work>/agt/`，并把 planner 不可知策略的
 /// 占位符按本 run 渲染（`{run_dir}`/`{outputs_dir}`/… → 真实 run 目录派生的
 /// 绝对/相对前缀；渲染语义见 [`render_planner_policy`]）。
@@ -331,7 +431,7 @@ pub fn run_converse_on_host(
 /// 容器时代 `prepare_agt_work` 只搬文件（占位符由挂载语义隐含）；宿主形态 cwd=
 /// 项目根，策略需要 run 产物的绝对前缀 + 相对前缀双形态（模型可能给相对路径）。
 /// 返回扩展文件路径（`AgtSource::Off` → None，不加载扩展）。
-fn prepare_host_agt(
+pub(crate) fn prepare_host_agt(
     work: &Path,
     source: &AgtSource,
     outputs_dir: &Path,
@@ -358,8 +458,12 @@ fn prepare_host_agt(
             .with_context(|| format!("read agt policy {}", dir.join("policy.json").display()))?,
         AgtSource::Off => unreachable!("handled above"),
     };
-    std::fs::write(dest.join("policy.json"), policy_text)
-        .with_context(|| format!("write planner agt policy {}", dest.join("policy.json").display()))?;
+    std::fs::write(dest.join("policy.json"), policy_text).with_context(|| {
+        format!(
+            "write planner agt policy {}",
+            dest.join("policy.json").display()
+        )
+    })?;
     let ext_src = match source {
         AgtSource::Dir(dir) => dir.join("agt-policy.ts"),
         _ => return Ok(Some(install_builtin_ext(&dest))),
@@ -376,8 +480,11 @@ fn prepare_host_agt(
 
 /// 内置扩展落盘（Builtin 分支；编译期内嵌，单一真源 `docker/agt/agt-policy.ts`）。
 fn install_builtin_ext(dest: &Path) -> PathBuf {
-    std::fs::write(dest.join("agt-policy.ts"), alfred_executor::agt::assets::EXTENSION_TS)
-        .expect("write builtin agt extension");
+    std::fs::write(
+        dest.join("agt-policy.ts"),
+        alfred_executor::agt::assets::EXTENSION_TS,
+    )
+    .expect("write builtin agt extension");
     dest.join("agt-policy.ts")
 }
 
@@ -418,9 +525,7 @@ fn render_planner_policy(
     let out_abs = absolut(outputs_dir)?;
     let agt_work = absolut(&run_dir.join(PLANNER_WORK_DIR).join("agt"))?;
     let ws_prefix = format!("{ws}/");
-    let rel = |abs: &str| -> String {
-        abs.strip_prefix(&ws_prefix).unwrap_or(abs).to_string()
-    };
+    let rel = |abs: &str| -> String { abs.strip_prefix(&ws_prefix).unwrap_or(abs).to_string() };
     let (run_rel, out_rel) = (rel(&run_abs), rel(&out_abs));
 
     // bash 侧边界正则（条件字符串与 command_patterns 前后参照 reviewer 范式）：
@@ -463,8 +568,9 @@ fn render_planner_policy(
 fn regex_escape(s: &str) -> String {
     s.chars()
         .map(|c| match c {
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^'
-            | '$' => format!("\\{c}"),
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+                format!("\\{c}")
+            }
             _ => c.to_string(),
         })
         .collect()
@@ -501,14 +607,25 @@ mod tests {
             raw_id: false,
         };
         write_pi_config(&dir, &model).unwrap();
-        let models: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("agent/models.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(models["providers"]["zhipucoding"]["baseUrl"], "https://example.invalid/v4");
-        assert_eq!(models["providers"]["zhipucoding"]["models"][0]["id"], "glm-5.2");
-        assert_eq!(models["providers"]["zhipucoding"]["models"][0]["maxTokens"], 8192);
-        assert_eq!(std::fs::read_to_string(dir.join("auth.json")).unwrap(), "{}");
+        let models: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("agent/models.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            models["providers"]["zhipucoding"]["baseUrl"],
+            "https://example.invalid/v4"
+        );
+        assert_eq!(
+            models["providers"]["zhipucoding"]["models"][0]["id"],
+            "glm-5.2"
+        );
+        assert_eq!(
+            models["providers"]["zhipucoding"]["models"][0]["maxTokens"],
+            8192
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("auth.json")).unwrap(),
+            "{}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -531,14 +648,23 @@ mod tests {
             &project_root,
         )
         .unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&rendered).expect("rendered policy is valid JSON");
+        let doc: serde_json::Value =
+            serde_json::from_str(&rendered).expect("rendered policy is valid JSON");
 
         // 无占位符残留（新 {…} 形态 + 旧 __…__ 形态都不得出现）。
         for token in [
-            "{run_dir}", "{run_dir_rel}", "{outputs_dir}", "{outputs_dir_rel}",
-            "{agt_work}", "{workspace_dir}", "{run_dir_pattern}",
+            "{run_dir}",
+            "{run_dir_rel}",
+            "{outputs_dir}",
+            "{outputs_dir_rel}",
+            "{agt_work}",
+            "{workspace_dir}",
+            "{run_dir_pattern}",
             "{outputs_redirect_allow}",
-            "__RUNS_DIR__", "__OUTPUTS_DIR__", "__AGT_WORK__", "__WORKSPACE_DIR__",
+            "__RUNS_DIR__",
+            "__OUTPUTS_DIR__",
+            "__AGT_WORK__",
+            "__WORKSPACE_DIR__",
         ] {
             assert!(!rendered.contains(token), "占位符未渲染: {token}");
         }
@@ -558,11 +684,15 @@ mod tests {
             .expect("deny-governance-files rule");
         let prefixes = gov["path_prefixes"].as_array().unwrap();
         assert!(
-            prefixes.iter().any(|p| p.as_str() == Some(run_abs.as_str())),
+            prefixes
+                .iter()
+                .any(|p| p.as_str() == Some(run_abs.as_str())),
             "path_prefixes 缺真实 run 绝对前缀 {run_abs}: {prefixes:?}"
         );
         assert!(
-            prefixes.iter().any(|p| p.as_str() == Some(agt_work_abs.as_str())),
+            prefixes
+                .iter()
+                .any(|p| p.as_str() == Some(agt_work_abs.as_str())),
             "path_prefixes 缺 agt 工作目录前缀"
         );
 
