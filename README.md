@@ -199,7 +199,7 @@ Planning → PlanReviewing → Executing → ExecReviewing
 | `r3.sh` | 治理环闭环：正路径全环 / 机械升级闭环（case2b 归档）/ 打回伪装闭环（feed retry）/ 多轮会话文档（feed revise） | 真 LLM + 离线注入 |
 | `r4.sh` | 属主决策 feed 续跑两用例：escalated→feed abandon→Abandoned / plan_rejected→feed retry→重规划→Escalated（决策面板 RPC 已删归档） | 离线注入 |
 | `chat.sh` | owner 持续会话（`alfred chat`）黑盒：需求收集+确定性转写+建 run+[pi] 答复 / 建图→[orchestrator] 流转→升级包→拍板（重试/修改/放弃 + "不要重试/别放弃/算了/两词同现"精确匹配边界）/ Planning 态放弃出口 / PlanRejected 打回呈现+伪装重试 / 终态→新需求回收集态 / run 发现与多挂起消歧；`CHAT_REAL=1` 附加真容器真 LLM REPL 对话 | 离线注入（+ CHAT_REAL=1 真 LLM） |
-| `agt/agt-policy.test.mjs` | AGT 策略求值原型确定性测试（29 断言） | 无 LLM 无容器 |
+| `agt/agt-policy.test.mjs` | AGT 策略求值确定性测试（59 断言；planner 段含不可知隔离负向断言：真实 run 目录派生前缀命中 + outputs 白名单穿越封堵 + bash 写族 deny + 拒绝反馈中性） | 无 LLM 无容器 |
 | `agt/demo.sh` | AGT 实机演示：沙箱容器内 pi + 策略扩展拦截 `rm -rf`（审计 deny+allow） | 真容器真 LLM（可选演示） |
 | `agt-default.sh` | AGT 默认启用黑盒：二进制落盘内置策略（byte 级 == `docker/agt/`）+ compose 挂载 + driver 注入 + 容器内审计 allow；`ALFRED_AGT_DISABLE=1` 不挂不加载；`AGT_DEFAULT_REAL=1` 附加真容器全链 Completed + 越界写对抗探针（审计 deny） | Tier 1 确定性（mock 驱动）/ Tier 2 真 LLM |
 
