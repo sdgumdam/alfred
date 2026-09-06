@@ -32,7 +32,8 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
   └─ alfred 库（Rust；治理环驱动 alfred-cli::governance，owner 交互走 `alfred chat`
        持续会话（codux 调度的常驻 REPL）→ run_governance_loop / feed_owner_message；
        编排器状态机在 alfred-core 内，进程内调用）
-       ├─ planner：容器内 pi 对话 agent（converse 建图 / maintain 会话文档），
+       ├─ planner：容器内 pi 对话 agent（converse 建图；maintain 会话文档**待重做**——
+       │    半实现已回退），
        │    经 sandbox_agent_bridge 桥调模型（容器断网 + 宿主代发）→ 产出 → DagSpec
        ├─ 执行：生成宿主侧容器驱动脚本（driver.py，非 eval Task）→ spawn `python3 driver.py`
        │    └─ Inspect 容器管理接口：起 docker 沙箱（network_mode: none + 只挂 workspace）
@@ -50,8 +51,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 | crate | 职责 |
 |---|---|
 | `alfred-core` | 跨组件共享实体（唯一真源）：OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc + **治理环状态机**（`governance.rs`，§3.3 路由表落码） |
-| `alfred-planner` | 规划器（converse 建图 / maintain 会话文档维护 / 打回伪装 disguise）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
-| `alfred-executor` | 执行侧：生成 Inspect 容器管理驱动（`driver.py` 非 eval Task）、沙箱 compose、spawn/poll 驱动（done 记录）、产物采集、配置加载 |
+| `alfred-planner` | 规划器（converse 建图 / 打回伪装 disguise；maintain 会话文档维护**待重做**——半实现已回退）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
 | `alfred-reviewer` | 审查侧：计划/执行审查都在独立 reviewer 容器内完成（driver.py 容器 pi，判忠实度 PlanVerdict / 验收 ExecVerdict） |
 | `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message` / `init_governance_run` / `build_governance_context`）+ 真实 `alfred` bin（**owner 持续会话入口 `chat`**：需求收集/对话路由/拍板/断点恢复的确定性 REPL，codux 调度的常驻会话进程）+ codux 可调度 CLI driver：run/feed/status（脚本/e2e 技术接口，消费前置 `--append-system-prompt`，注入的项目上下文追加到 planner pi 系统提示） |
 
@@ -103,8 +103,8 @@ alfred 出库 API（编排器状态机驱动）+ 真实 `alfred` bin（照 omp.r
   （Completed / Abandoned）。每次状态进入打印 `[orchestrator]` 流转状态行
   （owner 可见的协调者路由行为）。
 - `governance::feed_owner_message(&mut run, &ctx, message, decision)`：
-  owner 决策入口：设属主消息（revise 重规划 / Planning 态续入对话）、maintain②
-  固化关键结论、落 conversation.json，按挂起态路由续跑，返回新状态 + 规划器答复
+  owner 决策入口：设属主消息（revise 重规划 / Planning 态续入对话）、落
+  conversation.json，按挂起态路由续跑，返回新状态 + 规划器答复
   给调用方显示。`decision` ∈ retry | revise | abandon（retry/abandon 消息可选）。
 - `governance::init_governance_run(run_dir, request, options)` /
   `governance::build_governance_context(run_dir)`：run 目录初始化与驱动上下文
@@ -180,9 +180,11 @@ Planning → PlanReviewing → Executing → ExecReviewing
 - **审查本身出错**（unscored / driver error）→ 升级属主，不悄悄放行。
 - **打回伪装（P7）**：计划审查打回的 reason 被转写为属主口吻消息（禁词检查：
   reject/verdict/审查/打回 等结构化信号不得出现），再喂给规划器重规划。
-- **会话文档（P6）**：maintain 在 ① 计划审查结论落定、② 属主补充新需求 两时机更新
-  SessionDoc 三段（key_file_paths / key_conclusions / review_summary）；喂给规划器时
-  投影中性化（review_summary → owner_feedback，禁词净化）。
+- **会话文档（P6，维护者待重做）**：原 maintain 在 ① 计划审查结论落定、
+  ② 属主补充新需求 两时机更新 SessionDoc 三段（key_file_paths / key_conclusions /
+  review_summary）——**该半实现已回退**（新架构下重做：宿主 pi + 定期 + 真实数据源）；
+  SessionDoc schema 保留，喂给规划器时投影中性化（review_summary → owner_feedback，
+  禁词净化），当前恒为空文档。
 
 ---
 
@@ -232,7 +234,7 @@ agt 为无 LLM 确定性原型测试。
 ```
 crates/
   alfred-core/      实体 + 状态机 + 路由 + GraphBuilder
-  alfred-planner/   converse / maintain / disguise / container / task_gen / llm
+  alfred-planner/   converse / disguise / container / task_gen / llm（maintain 已回退待重做）
   alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
   alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
   alfred-cli/       src/{main.rs (alfred bin: chat/run/feed/status), chat.rs, governance.rs, lib.rs}

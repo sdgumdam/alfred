@@ -38,8 +38,9 @@ Owner (human)
   └─ alfred library (Rust; governance driver alfred-cli::governance, owner
        interaction goes through the codux terminal → feed_owner_message; the
        orchestrator state machine lives in alfred-core, called in-process)
-       ├─ planner: in-container pi conversation agent (converse graph-building /
-       │            maintain session-doc), calls the model through the bridge
+       ├─ planner: in-container pi conversation agent (converse graph-building;
+       │            maintain session-doc **pending redo** — half-implementation
+       │            rolled back), calls the model through the bridge
        │            (container offline + host relays) → output → DagSpec
        ├─ execution: generate a host-side container driver script (driver.py,
        │             not an eval Task) → spawn `python3 driver.py`
@@ -65,7 +66,7 @@ Owner (human)
 | crate | responsibility |
 |---|---|
 | `alfred-core` | Shared cross-crate entities (single source of truth): OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc + the **governance state machine** (`governance.rs`, §3.3 routing table in code) |
-| `alfred-planner` | Planner (converse graph-building / maintain session-doc / disguise rejection); in-container pi conversation agent (bridge-relayed LLM) with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
+| `alfred-planner` | Planner (converse graph-building / disguise rejection; maintain session-doc **pending redo** — half-implementation rolled back); in-container pi conversation agent (bridge-relayed LLM) with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
 | `alfred-executor` | Execution side: generates the Inspect container-management driver (`driver.py`, not an eval Task), the sandbox compose, spawn/poll the driver (done record), artifact collection, config loading |
 | `alfred-reviewer` | Review side: plan/exec review both run in a dedicated reviewer container (driver.py in-container pi, judging fidelity → PlanVerdict / acceptance → ExecVerdict) |
 | `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal) + real `alfred` bin (codux-schedulable CLI driver: run/feed/status, consumes leading `--append-system-prompt`; the injected project context is appended to the planner pi's system prompt) |
@@ -124,8 +125,8 @@ omp.rs pattern — no invented panel):
   (Completed / Abandoned).
 - `governance::feed_owner_message(&mut run, &ctx, message, decision)`:
   owner-decision entry (called by the codux terminal): sets the owner message
-  (revise replans / resumes dialogue from Planning), maintain② persists key
-  conclusions, appends conversation.json, routes by suspended state and
+  (revise replans / resumes dialogue from Planning), appends conversation.json,
+  routes by suspended state and
   resumes the loop, returning the new state for the caller to display.
   `decision` ∈ retry | revise | abandon (message optional for retry/abandon).
 
@@ -179,10 +180,13 @@ Tiered routing (§3.3, all six rows in code):
 - **Disguised rejection (P7)**: the plan-review reason is rewritten into an
   owner-voice message (a forbidden-signal check rejects review/verdict/否决/打回
   etc.) before it is fed back to the planner for replanning.
-- **Session document (P6)**: `maintain` updates the three-section SessionDoc
-  (key_file_paths / key_conclusions / review_summary) at ① plan-review
-  conclusion and ② owner-supplement; the projection fed to the planner is
-  neutralized (`review_summary` → `owner_feedback`, forbidden-signal scrubbed).
+- **Session document (P6, maintainer pending redo)**: the original `maintain`
+  updated the three-section SessionDoc (key_file_paths / key_conclusions /
+  review_summary) at ① plan-review conclusion and ② owner-supplement —
+  **that half-implementation has been rolled back** (to be redone under the new
+  architecture: host pi + periodic + real data sources); the SessionDoc schema is
+  kept, the projection fed to the planner is neutralized (`review_summary` →
+  `owner_feedback`, forbidden-signal scrubbed), and the doc is currently always empty.
 
 ---
 
@@ -235,7 +239,7 @@ land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 ```
 crates/
   alfred-core/      entities + state machine + routing + GraphBuilder
-  alfred-planner/   converse / maintain / disguise / container / task_gen / llm
+  alfred-planner/   converse / disguise / container / task_gen / llm (maintain rolled back, pending redo)
   alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
   alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
   alfred-cli/       src/{main.rs (alfred bin: run/feed/status), governance.rs, lib.rs}
