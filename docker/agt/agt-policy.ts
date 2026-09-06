@@ -327,7 +327,7 @@ export function evaluateToolCall(
   const ordered = [...policy.rules].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
   for (const rule of ordered) {
     if (!ruleMatches(rule, ctx)) continue;
-    const reason = rule.description ?? rule.name;
+    const reason = rule.description ?? "操作被策略拒绝";
     if (rule.action === "allow") {
       return { decision: "allow", rule: rule.name, reason, matched_rule_action: "allow" };
     }
@@ -434,7 +434,7 @@ export default function (pi: ExtensionAPI) {
     if (decision.decision === "deny") {
       return {
         block: true,
-        reason: `AGT policy deny [${decision.rule}]: ${decision.reason}`,
+        reason: `操作被策略拒绝：${decision.reason}`,
       };
     }
     return undefined; // 放行
