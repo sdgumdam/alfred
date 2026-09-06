@@ -432,11 +432,11 @@ fn render_planner_policy(
     );
     // - 真实 run 目录（绝对/相对双形态）在命令文本中出现即拦（含 planner/agt
     //   工作目录——run 目录子路径，无需单列）。
-    //   补非字面形态（复审②）：`../` 穿越串、
-    //   `~/` / `$HOME`、`.alfred/runs`（run 根相对形态字面串）——这些形态不命中字面
-    //   绝对/相对前缀，模型可用它们引用 run 目录绕过枚举。
+    //   补非字面形态（复审②）：`../` 穿越串、`~/` / `$HOME`、`.alfred/runs`——
+    //   与 policy.json 静态形态同语义（JS 合法形态；宿主单源只渲染 run 派生值，
+    //   outputs 子树负向断言（carve 免误杀合法写）留在 policy.json 静态层）。
     let run_dir_pattern = format!(
-        r#"(?:{}|{}|\.\./|~/|\$HOME\b|\.alfred/runs)"#,
+        r#"(?:{}|{}|\.\.[/\\]|~/|\$(?:HOME\b|\{{HOME\}})|\.alfred/runs)"#,
         regex_escape(&run_abs),
         regex_escape(&run_rel),
     );
