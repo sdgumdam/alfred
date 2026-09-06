@@ -2,18 +2,18 @@
 //!
 //! 职责（施工清单 §2.1/§2.4/§2.5）：
 //! 1. `converse`：对话 agent——会话文档 + 属主消息 → 建图指令序列 → DagSpec
-//!    （容器内 pi 对话 agent（桥代发 LLM），每次调用落盘 llm-calls/；
-//!    `ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1` 离线确定性直通）。
+//!    （宿主 pi 化：`host::run_converse_on_host` spawn 宿主 `pi -p` 单次短会话，
+//!    cwd=治理对象项目根、模型经 run 级 models.json 单源投影，每次调用落盘
+//!    llm-calls/；`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1` 离线确定性直通）。
 //! 2. `disguise`：计划打回的伪装转写（P7）——属主口吻消息 + 禁词检查。
 //!
 //! 隔离（§2.2/§2.4）：规划器不感知审查者/执行者；converse 只吃会话文档 +
 //! 属主消息；reviewer_models 由编排器从 config 系统注入（E5），规划器不填。
 
-pub mod container;
 pub mod converse;
 pub mod disguise;
+pub mod host;
 pub mod llm;
-pub mod task_gen;
 
 pub use converse::{
     build_messages, converse, instructions_to_dagspec, ConverseOptions, ConverseOutcome,

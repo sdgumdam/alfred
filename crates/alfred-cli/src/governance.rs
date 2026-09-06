@@ -27,10 +27,9 @@ use alfred_executor::config::{
 use alfred_executor::run::{ensure_run_workspace, execute_run, RunOptions};
 use alfred_planner::converse::{converse, ConverseOptions, ConverseOutcome};
 use alfred_planner::disguise::disguise_rejection;
-use alfred_reviewer::container::{EXEC_VERDICTS_FILE, PLAN_VERDICTS_FILE};
+use alfred_reviewer::host::{EXEC_VERDICTS_FILE, PLAN_VERDICTS_FILE, ReviewerHostOptions};
 use alfred_reviewer::exec_review::{execute_exec_review, ExecReviewOptions};
 use alfred_reviewer::plan_review::{execute_plan_review, PlanReviewOptions};
-use alfred_reviewer::ReviewerContainerOptions;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
@@ -322,7 +321,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
     let opts = ConverseOptions {
         run_dir: ctx.run_dir.clone(),
         model: ctx.planner_model.clone(),
-        container: alfred_planner::container::PlannerContainerOptions::from_governance(
+        host: alfred_planner::host::PlannerHostOptions::from_governance(
             ctx.run_dir.clone(),
             &run.options,
         ),
@@ -399,7 +398,32 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
     }
 }
 
-/// PlanReviewing：reviewer 容器判忠实度 → pass/打回/出错升级。
+/// reviewer 宿主 pi 的 cwd（治理对象项目根）。
+///
+/// 宿主形态：run 目录挂项目根之下（如 `<项目>/alfred-runs/<run_id>/`），项目根
+/// = run 目录所属仓库根——向上找 Cargo.toml/pyproject.toml/.git 边界，兜底 run
+/// 目录父目录链上第一个存在的祖先（保证 pi cwd 在项目内，宿主材料/run 产物都
+/// 经绝对路径可达）。
+fn project_root_for(run_dir: &Path) -> PathBuf {
+    let mut cur = run_dir.to_path_buf();
+    while let Some(parent) = cur.parent() {
+        cur = parent.to_path_buf();
+        let has_marker = cur.join(".git").exists()
+            || cur.join("Cargo.toml").exists()
+            || cur.join("package.json").exists()
+            || cur.join("pyproject.toml").exists();
+        if has_marker {
+            return cur;
+        }
+    }
+    // 无边界标记（如 e2e 临时目录直接落在 ~ 下）：退回 run 目录父目录。
+    run_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| run_dir.to_path_buf())
+}
+
+/// PlanReviewing：宿主 pi reviewer 判忠实度 → pass/打回/出错升级。
 fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
     let dagspec = run
         .dagspec
@@ -409,9 +433,13 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
     let opts = PlanReviewOptions {
         run_dir: review_dir.clone(),
         time_limit_secs: run.options.review_time_limit_secs,
-        // R6c：reviewer 容器路径（ws 全量 ro + 对话记录）；离线（ALFRED_OFFLINE=1）
-        // 由 execute_plan_review 内部跳过（unscored → 升级属主）。
-        container: ReviewerContainerOptions::from_governance(review_dir, &run.options),
+        // 宿主 pi 路径（reviewer 全可见 + AGT 拦写；离线 ALFRED_OFFLINE=1 由
+        // execute_plan_review 内部跳过 → unscored → 升级属主）。
+        host: ReviewerHostOptions::from_governance(
+            review_dir,
+            project_root_for(&ctx.run_dir),
+            &run.options,
+        ),
     };
     let outcome = execute_plan_review(
         &opts,
@@ -555,14 +583,14 @@ fn execution_step(
     }
 }
 
-/// ExecReviewing：执行审查改调 reviewer 容器（ws 全量 ro + 对话记录）→ §3.3 路由。
+/// ExecReviewing：执行审查改调宿主 pi reviewer（ws 全量自由读 + 对话记录）→ §3.3 路由。
 ///
 /// R6d：不再读执行容器内嵌 verdict（scorer 已移除，执行容器只出产物）。
-/// 执行审查由 `execute_exec_review`（alfred-reviewer）在独立 reviewer 容器内
-/// 判产物 vs 验收标准——容器挂 **ws 全量 ro**（执行者产物 run/ws，git 基线），
-/// 审查者自己读 ws 全量（含超过旧 scorer 4000B/文件截断的内容）。
-/// 离线回退（ALFRED_OFFLINE=1 或 ALFRED_EXEC_REVIEW_OFFLINE=1）：不跑容器
-/// （无 docker）——执行容器无审查结论 → 升级属主（§六继承项，不悄悄放行）。
+/// 执行审查由 `execute_exec_review`（alfred-reviewer）由宿主 pi 判产物 vs 验收
+/// 标准——reviewer 全量自由读 run/ws（执行者产物，git 基线），含超过旧 scorer
+/// 4000B/文件截断的内容。
+/// 离线回退（ALFRED_OFFLINE=1 或 ALFRED_EXEC_REVIEW_OFFLINE=1）：不跑 pi——
+/// 执行无审查结论 → 升级属主（§六继承项，不悄悄放行）。
 fn exec_review_step(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
@@ -579,7 +607,7 @@ fn exec_review_step(
     let (verdict, unscored_reason) = if offline {
         (
             None,
-            "offline: 执行审查容器跳过（ALFRED_OFFLINE/ALFRED_EXEC_REVIEW_OFFLINE=1，执行 eval 无内嵌 scorer）"
+            "offline: 执行审查宿主 pi 跳过（ALFRED_OFFLINE/ALFRED_EXEC_REVIEW_OFFLINE=1，执行 eval 无内嵌 scorer）"
                 .to_string(),
         )
     } else {
@@ -597,11 +625,16 @@ fn exec_review_step(
             .map_err(anyhow::Error::msg)
             .ok()
             .flatten();
-        // R6e：执行审查看 run 级单一持久 ws（git 基线）——executor 产物在 run/ws，
-        // 不再挂 exec-{n}/workspace；reviewer 挂 ws 全量 ro 自己看 git diff。
+        // R6e：执行审查看 run 级单一持久 ws（git 基线）——executor 产物在 run/ws；
+        // reviewer 全量自由读 ws 自己看 git diff。
         let ws_dir = ctx.run_dir.join("ws");
         let exec_review_dir = ctx.run_dir.join("exec-review");
-        let opts = ExecReviewOptions::from_governance(exec_review_dir, ws_dir, &run.options);
+        let opts = ExecReviewOptions::from_governance(
+            exec_review_dir,
+            ws_dir,
+            project_root_for(&ctx.run_dir),
+            &run.options,
+        );
         let outcome = execute_exec_review(
             &opts,
             &ctx.reviewer_model,

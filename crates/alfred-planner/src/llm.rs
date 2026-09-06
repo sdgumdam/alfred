@@ -47,7 +47,7 @@ pub struct LlmCallRecord {
     pub role: String,
     pub model: String,
     pub offline: bool,
-    /// 调用通道：`"container_bridge"`（容器内 pi 经桥代发）| `"offline"`（离线确定性直通）。
+    /// 调用通道：`"host_pi"`（宿主 pi 单次会话）| `"offline"`（离线确定性直通）。
     /// 旧记录无此字段 → 反序列化缺省空串（向后兼容）。
     #[serde(default)]
     pub transport: String,

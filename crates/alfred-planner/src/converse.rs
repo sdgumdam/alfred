@@ -9,10 +9,10 @@
 //!   答复侧，对话产出建图指令后交编排器接管）。
 //!
 //! 两种模式：
-//! - 真 LLM（默认）：宿主 Rust 驱动 planner 容器（pi agent 在容器内读挂载输入、
-//!   按两分支规则产 /outputs/instructions.json 或 /outputs/reply.txt），宿主按
-//!   产出文件分派两分支 → GraphBuilder → DagSpec 或答复；每次调用落盘
-//!   llm-calls/（P9 证据）。
+//! - 真 LLM（默认）：宿主 pi 驱动（`host::run_converse_on_host`：宿主 `pi -p`
+//!   单次短会话，cwd=治理对象项目根，按两分支规则产 outputs/instructions.json 或
+//!   outputs/reply.txt），宿主按产出文件分派两分支 → GraphBuilder → DagSpec 或
+//!   答复；每次调用落盘 llm-calls/（P9 证据）。
 //! - 离线（`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1`）：确定性直通，
 //!   两分支由注入文件二选一——`ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json>` → 建图指令分支；
 //!   `ALFRED_OFFLINE_REPLY_FILE=<reply.txt>` → 答复分支；仍把 would-be 请求
@@ -53,8 +53,8 @@ pub(crate) fn project_session_doc(doc: &SessionDoc) -> SessionDocProjection {
     }
 }
 
-/// 规划器建图 schema 提示词（唯一真源）：converse 的 system prompt 与容器侧
-/// planner 任务（R6b）共用同一份。容器内 pi 按这份规则产建图指令序列。
+/// 规划器建图 schema 提示词（唯一真源）：converse 的 system prompt 基础段。
+/// 宿主 pi（与离线审计面）按这份规则产建图指令序列。
 pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划器，是对话 agent。把属主需求拆成一个任务 DAG（每个节点 = 契约 + 沙箱档案）。你只与属主对话。
 
 你的输入：会话文档（记忆）+ 属主本轮消息。
@@ -81,8 +81,8 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 /// 合成 converse 的 system prompt（基础建图 schema + codux 注入的项目上下文）。
 ///
 /// codux wrapper 每轮注入 `--append-system-prompt <memory>`（项目上下文）；P2-1
-/// 方案 A 真正透传：追加到 planner pi 的 system prompt——容器驱动
-/// （`container::run_converse_in_container`）与 llm-calls 审计记录
+/// 方案 A 真正透传：追加到 planner pi 的 system prompt——宿主驱动
+/// （`host::run_converse_on_host`）与 llm-calls 审计记录
 /// （`build_messages`）共用同一份。空注入 = 原样返回基础 schema（行为不变）。
 pub(crate) fn converse_system_prompt(append_system_prompt: &str) -> String {
     let append = append_system_prompt.trim();
@@ -97,12 +97,11 @@ pub(crate) fn converse_system_prompt(append_system_prompt: &str) -> String {
 }
 
 /// converse 选项。
-#[derive(Debug, Clone)]
 pub struct ConverseOptions {
     pub run_dir: PathBuf,
     pub model: ExecutorModel,
-    /// R6b：planner 容器驱动选项（起容器跑 converse；桥代发 LLM）。
-    pub container: crate::container::PlannerContainerOptions,
+    /// 宿主 pi 化：planner 宿主驱动选项（cwd=项目根、AGT、pi-config 派生面）。
+    pub host: crate::host::PlannerHostOptions,
     /// codux wrapper 注入的项目上下文（`--append-system-prompt`，经
     /// `ALFRED_APPEND_SYSTEM_PROMPT` 读入）；追加到 planner pi 的 converse
     /// system prompt（P2-1：内存注入端到端生效）。空串 = 不追加。
@@ -112,9 +111,14 @@ pub struct ConverseOptions {
 impl ConverseOptions {
     pub fn new(run_dir: PathBuf, model: ExecutorModel) -> Self {
         Self {
+            host: crate::host::PlannerHostOptions {
+                run_dir: run_dir.clone(),
+                project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                time_limit_secs: 600,
+                agt: alfred_executor::agt::resolve_agt_source(),
+            },
             run_dir,
             model,
-            container: crate::container::PlannerContainerOptions::default(),
             append_system_prompt: String::new(),
         }
     }
@@ -153,14 +157,15 @@ pub fn converse(
         if std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
             || std::env::var("ALFRED_PLANNER_OFFLINE").as_deref() == Ok("1")
         {
-            // 离线模式保留：不经容器（现状直通）；两分支由注入文件二选一。
+            // 离线模式保留：不经容器/宿主 pi（确定性直通）；两分支由注入文件二选一。
             let (outcome, response) = converse_offline(request)?;
             (outcome, response, true, "offline")
         } else {
-            // R6b：容器内 pi 读输入跑 converse（桥代发 LLM），宿主读 /outputs 产出
-            // （/outputs/instructions.json 或 /outputs/reply.txt，driver.py 已强制恰好一个）。
-            let out = crate::container::run_converse_in_container(
-                &opts.container,
+            // 宿主 pi 化：宿主 pi 读 stdin prompt 跑 converse（模型经 run 级
+            // models.json 单源投影），宿主读 outputs 产出（instructions.json |
+            // reply.txt，收割强制恰好一个）。
+            let out = crate::host::run_converse_on_host(
+                &opts.host,
                 &opts.model,
                 request,
                 doc,
@@ -168,20 +173,20 @@ pub fn converse(
                 &opts.append_system_prompt,
             )?;
             let outcome = match out.produced_file.as_str() {
-                crate::container::CONVERSE_OUTPUT_FILE => {
+                crate::host::CONVERSE_OUTPUT_FILE => {
                     let dagspec = instructions_to_dagspec(&out.output_text, request)?;
                     ConverseOutcome::Instructions {
                         dagspec,
                         record_path: PathBuf::new(),
                     }
                 }
-                crate::container::CONVERSE_REPLY_FILE => ConverseOutcome::Reply {
+                crate::host::CONVERSE_REPLY_FILE => ConverseOutcome::Reply {
                     reply: out.output_text.trim().to_string(),
                     record_path: PathBuf::new(),
                 },
-                other => bail!("converse container produced unexpected output file {other}"),
+                other => bail!("converse host pi produced unexpected output file {other}"),
             };
-            (outcome, out.output_text, false, "container_bridge")
+            (outcome, out.output_text, false, "host_pi")
         };
 
     let record = LlmCallRecord {
@@ -276,7 +281,7 @@ fn validate_dagspec(dagspec: &DagSpec, request: &OwnerRequest) -> Result<()> {
 /// - `ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json>` → 建图指令分支（validate → DagSpec）。
 /// - `ALFRED_OFFLINE_REPLY_FILE=<reply.txt>` → 答复分支（纯文本）。
 /// 两者同时/都不设 → 显式报错（不静默）。返回 (outcome, response 文本)，
-/// response 供 llm-calls 记录（与容器路径同构）。
+/// response 供 llm-calls 记录（与宿主 pi 路径同构）。
 fn converse_offline(request: &OwnerRequest) -> Result<(ConverseOutcome, String)> {
     let plan_file = std::env::var("ALFRED_OFFLINE_PLAN_FILE").ok();
     let reply_file = std::env::var("ALFRED_OFFLINE_REPLY_FILE").ok();

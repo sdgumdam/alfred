@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ============================================================================
-# R6b e2e：planner 容器化回归（宿主直调 → 容器 Agent）
+# R6b e2e：planner 宿主 pi 化回归（宿主 pi agent，去容器）
 #
 # 三层：
 #   Tier 0（默认，无外部依赖）：cargo test —— 离线 converse 单测 +
-#     容器驱动（compose 渲染 / 模板注入 / 输入落盘）单测。这是"离线路径全绿"
+#     宿主驱动（pi-config 生成 / AGT 策略渲染）单测。这是"离线路径全绿"
 #     的核心。
 #   Tier 1（需 inspect CLI，无需 docker / 无需真 LLM）：ALFRED_OFFLINE 规划 +
 #     mockllm 计划审查（unscored → 升级）——断言 converse 离线产物
 #     （llm-calls/dagspec.json/conversation.json）。inspect 缺失时跳过（打印 SKIP）。
-#   Tier 2（需 inspect + docker + 真模型，验方跑）：R6B_REAL=1 时真容器 converse
-#     产合法 DagSpec（zhipu 真跑）+ ws 只读断言。默认关闭（留给验方）。
+#   Tier 2（需宿主 pi + 真模型，验方跑）：R6B_REAL=1 时真宿主 converse
+#     产合法 DagSpec（zhipu 真跑）+ AGT 审计断言。默认关闭（留给验方）。
 #
 # 模型：Tier 1 用 mockllm（inspect 内建，无需 key）做计划审查——planner 离线
 #   直通、executor 不触发，因此不需要 docker 与真实 provider。
@@ -44,7 +44,7 @@ R6B_RUNS="$REPO_ROOT/tests/e2e/.runs"
 mkdir -p "$R6B_RUNS"
 
 echo "============================================="
-echo "R6b Tier 0：cargo test（离线单测 + 容器驱动单测）"
+echo "R6b Tier 0：cargo test（离线单测 + 宿主驱动单测）"
 echo "============================================="
 cargo test --quiet
 echo "PASS(Tier0): cargo test 全绿"
@@ -643,27 +643,13 @@ PY
   echo "R6b Tier 1 全部通过：离线规划回归 PASS"
 fi
 
-# --- Tier 2：真容器 converse（验方跑） ---
+# --- Tier 2：真宿主 converse（验方跑） ---
 if [[ "${R6B_REAL:-0}" == "1" ]]; then
   echo ""
   echo "============================================="
-  echo "R6b Tier 2：真容器 converse（需 docker 镜像 + 真模型）"
+  echo "R6b Tier 2：真宿主 converse（需宿主 pi + 真模型）"
   echo "============================================="
-  IMAGE="${ALFRED_IMAGE:-alfred-executor:latest}"
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    if docker image inspect r0-lab-pi:latest >/dev/null 2>&1; then
-      docker tag r0-lab-pi:latest "$IMAGE"
-    else
-      docker build -t "$IMAGE" -f docker/Dockerfile docker/
-    fi
-  fi
-  # AGT 拦写层：planner deny-write 策略（写 /workspace 被拒、/outputs 放行）
-  AGT_DIR="$R6B_RUNS/run-r6b-agt"
-  rm -rf "$AGT_DIR"
-  mkdir -p "$AGT_DIR"
-  cp docker/agt/agt-policy.ts "$AGT_DIR/agt-policy.ts"
-  cp docker/agt/planner/policy.json "$AGT_DIR/policy.json"
-  export ALFRED_AGT_DIR="$AGT_DIR"
+  command -v pi >/dev/null || { echo "FAIL(tier2): 宿主 pi 不在 PATH" >&2; exit 1; }
 
   CASE_T="$R6B_RUNS/run-r6b-real-converse"
   rm -rf "$CASE_T"
@@ -677,47 +663,40 @@ if [[ "${R6B_REAL:-0}" == "1" ]]; then
   "created_at": "2026-08-28T00:00:00Z"
 }
 JSON
-  echo "[r6b] caseT: driver run（真容器 planner converse → 真计划审查/执行） ..."
+  echo "[r6b] caseT: driver run（真宿主 planner converse → 真计划审查/执行） ..."
   cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE_T/request.json" \
     --run-dir "$CASE_T" \
     --time-limit 900 \
     --review-time-limit 300 \
-    --planner-time-limit 900 \
-    --image "$IMAGE"
+    --planner-time-limit 900
 
-  python3 - "$CASE_T" <<'PY' || { echo "FAIL(caseT): 真容器 converse 未产合法 DagSpec" >&2; exit 1; }
+  python3 - "$CASE_T" <<'PY' || { echo "FAIL(caseT): 真宿主 converse 未产合法 DagSpec" >&2; exit 1; }
 import json, os, sys
 run = sys.argv[1]
 state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "completed", f"state={state['state_machine']['state']}"
 recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
 rec = json.load(open(os.path.join(run, "llm-calls", recs[0])))
-assert rec["transport"] == "container_bridge", f"transport={rec['transport']}"
+assert rec["transport"] == "host_pi", f"transport={rec['transport']}"
 assert rec["offline"] is False
-# planner 容器工作区存在（ws 只读挂载源）
-assert os.path.isdir(os.path.join(run, "ws")), "planner ws/ 未创建"
+# 宿主驱动产物面：pi-config（模型单源投影）与 outputs 目录存在
+assert os.path.isfile(os.path.join(run, "planner/pi-config/agent/models.json")), "planner pi-config models.json 未生成"
+assert os.path.isdir(os.path.join(run, "planner/outputs")), "planner outputs/ 未创建"
+# AGT 审计存在（扩展加载 + 拦截决策落盘）
+audit = os.path.join(run, "planner/agt/audit/audit.jsonl")
+assert os.path.isfile(audit), "AGT 审计 audit.jsonl 未落盘"
 PY
-  echo "PASS(caseT): 真容器 converse 产合法 DagSpec → 全环 Completed"
-
-  echo ""
-  echo "[r6b] ws 只读实测（容器内写 /workspace 被拒——ro 挂载层）："
-  WS_DIR="$CASE_T/ws"
-  if docker run --rm -v "$WS_DIR":/workspace:ro --network none "$IMAGE" bash -c "echo x > /workspace/probe.txt" >/dev/null 2>&1; then
-    echo "FAIL(ws-ro): 容器内写 /workspace 竟然成功" >&2
-    exit 1
-  fi
-  echo "  PASS: 容器内写 /workspace 被拒（ro 挂载）"
-  unset ALFRED_AGT_DIR
+  echo "PASS(caseT): 真宿主 converse 产合法 DagSpec → 全环 Completed（pi-config/outputs/AGT 审计齐全）"
 fi
 
 echo ""
 echo "============================================="
 echo "R6b e2e 完成"
-echo "  Tier 0 : cargo test 全绿（离线单测 + 容器驱动单测）"
+echo "  Tier 0 : cargo test 全绿（离线单测 + 宿主驱动单测）"
 if [[ -n "$INSPECT" ]]; then
   echo "  Tier 1 : 离线规划回归 PASS"
 fi
-echo "  Tier 2 : ${R6B_REAL:-0}（R6B_REAL=1 时真容器 converse + ws 只读实测）"
+echo "  Tier 2 : ${R6B_REAL:-0}（R6B_REAL=1 时真宿主 converse + AGT 审计实测）"
 echo "============================================="
 exit 0

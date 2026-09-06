@@ -8,8 +8,8 @@
 //!
 //! R6a（三容器挂载矩阵）：`generate_executor_compose` 落矩阵 §1.1 executor 行——
 //! `workspace_subdirs` 子集投影（非空挂载，R6e 块B：空声明防御性报错）+ 参考卷 ro
-//! + AGT 挂载；planner/reviewer 模板见 `docker/planner.compose.yaml.tmpl` /
-//! `docker/reviewer.compose.yaml.tmpl`（静态模板，编排器渲染占位符）。
+//! + AGT 挂载（planner/reviewer 已宿主 pi 化，无 compose；reviewer 模板句由
+//!   reviewer 线处置）。
 
 use std::path::{Path, PathBuf};
 
