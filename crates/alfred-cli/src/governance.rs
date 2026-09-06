@@ -27,8 +27,10 @@ use alfred_executor::config::{
 use alfred_executor::run::{ensure_run_workspace, execute_run, RunOptions};
 use alfred_planner::converse::{converse, ConverseOptions, ConverseOutcome};
 use alfred_planner::disguise::disguise_rejection;
-use alfred_reviewer::host::{EXEC_VERDICTS_FILE, PLAN_VERDICTS_FILE, ReviewerHostOptions};
+use alfred_planner::host::PlannerHostOptions;
+use alfred_planner::maintain::{run_maintain, MaintainTrigger};
 use alfred_reviewer::exec_review::{execute_exec_review, ExecReviewOptions};
+use alfred_reviewer::host::{ReviewerHostOptions, EXEC_VERDICTS_FILE, PLAN_VERDICTS_FILE};
 use alfred_reviewer::plan_review::{execute_plan_review, PlanReviewOptions};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -307,6 +309,73 @@ pub fn feed_owner_message(
     })
 }
 
+/// 维护者选项（converse 同款派生面：run 级 pi-config / AGT / 项目根 cwd）。
+fn maintainer_opts(run: &GovernanceRun, ctx: &GovernanceContext) -> PlannerHostOptions {
+    PlannerHostOptions::from_governance(ctx.run_dir.clone(), &run.options)
+}
+
+/// 触发滚动维护（ConverseDone）：收割更新后的会话文档 + 落 audit + llm-calls
+/// （run_maintain 内部落 role=maintain 记录）。维护失败**显式报错**——记忆坏了
+/// 要可见，不悄悄放行（无静默出口）。
+fn maintain_after_converse(
+    run: &mut GovernanceRun,
+    ctx: &GovernanceContext,
+    read_paths: Vec<String>,
+    reply_summary: &str,
+) -> Result<()> {
+    let trigger = MaintainTrigger::ConverseDone {
+        read_paths,
+        reply_summary: reply_summary.to_string(),
+    };
+    run.session_doc = run_maintain(
+        &maintainer_opts(run, ctx),
+        &ctx.planner_model,
+        &run.session_doc,
+        &trigger,
+    )?;
+    audit(
+        &ctx.run_dir,
+        "maintain_done",
+        &serde_json::json!({
+            "trigger": "converse_done",
+        }),
+    )?;
+    Ok(())
+}
+
+/// 触发审查意见维护（PlanReviewed）：审查理由先经 `disguise_rejection` 转写为
+/// 属主口吻中性文本（disguise 投影——维护者不可见审查语义），再喂维护者落
+/// review_summary（磁盘真源字段名不变，投影层才改名 owner_feedback）。
+fn maintain_after_plan_review(
+    run: &mut GovernanceRun,
+    ctx: &GovernanceContext,
+    reason: &str,
+) -> Result<()> {
+    let dagspec = run
+        .dagspec
+        .clone()
+        .context("maintain_after_plan_review without dagspec")?;
+    let disguised =
+        disguise_rejection(&run.request, &dagspec, reason).map_err(anyhow::Error::msg)?;
+    let trigger = MaintainTrigger::PlanReviewed {
+        disguised_review: disguised,
+    };
+    run.session_doc = run_maintain(
+        &maintainer_opts(run, ctx),
+        &ctx.planner_model,
+        &run.session_doc,
+        &trigger,
+    )?;
+    audit(
+        &ctx.run_dir,
+        "maintain_done",
+        &serde_json::json!({
+            "trigger": "plan_reviewed",
+        }),
+    )?;
+    Ok(())
+}
+
 /// Planning：converse（会话文档 + 属主消息 → §2.4 两分支）+ E5 reviewer_models 注入。
 ///
 /// 返回 `Ok(None)` = 产出计划（已 apply PlanProduced → PlanReviewing，编排环继续）；
@@ -314,6 +383,9 @@ pub fn feed_owner_message(
 /// Planning，编排环返回调用方；答复文本 surface 给调用方（driver 打印，P2-2），
 /// 调用方经下一轮属主消息（revise 语义）续入对话（P1-2）。
 fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Option<String>> {
+    // key_file_paths 真实数据源（维护者重做）：converse 前快照 AGT 审计行数，
+    // converse 落定后增量提取本轮 allow read 宿主路径（确定性提取+去重）。
+    let audit_lines_before = alfred_planner::host::snapshot_audit_lines(&ctx.run_dir);
     let owner_message = match &run.owner_message {
         Some(m) => m.clone(),
         None => alfred_planner::format_request_message(&run.request),
@@ -372,6 +444,12 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
                     "record": record_path,
                 }),
             )?;
+            // ConverseDone 滚动维护（每轮 converse 落定后）：key_file_paths（本轮
+            // AGT 审计 allow read 增量）+ key_conclusions（计划摘要）——下轮 converse
+            // 即用上新记忆。
+            let read_paths =
+                alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_lines_before);
+            maintain_after_converse(run, ctx, read_paths, &format_plan_reply(&dagspec))?;
             run.dagspec = Some(dagspec);
             run.apply(GovernanceEvent::PlanProduced)?;
             Ok(None)
@@ -393,6 +471,10 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
                 "converse_reply",
                 &serde_json::json!({ "record": record_path }),
             )?;
+            // ConverseDone 滚动维护：答复文本作为 reply_summary（key_conclusions 语义）。
+            let read_paths =
+                alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_lines_before);
+            maintain_after_converse(run, ctx, read_paths, &reply)?;
             Ok(Some(reply))
         }
     }
@@ -464,6 +546,9 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                     "plan_review_rejected",
                     &serde_json::json!({ "reason": v.reason }),
                 )?;
+                // PlanReviewed 维护（审查结论落定后）：拒绝理由经 disguise 投影
+                // （属主口吻中性转写——维护者零 reviewer 痕迹）落 review_summary。
+                maintain_after_plan_review(run, ctx, &v.reason)?;
                 run.apply(GovernanceEvent::PlanReviewRejected)?;
             }
         }

@@ -39,9 +39,9 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use alfred_cli::governance::{
-    build_governance_context, default_governance_base, default_governance_dir,
-    feed_owner_message, init_governance_run, load_governance_run, persist_governance_run,
-    run_governance_loop, state_label,
+    build_governance_context, default_governance_base, default_governance_dir, feed_owner_message,
+    init_governance_run, load_governance_run, persist_governance_run, run_governance_loop,
+    state_label,
 };
 use alfred_core::conversation::{load_conversation, ConversationRole, ConversationSource};
 use alfred_core::governance::{GovernanceOptions, GovernanceRun, GovernanceState, OwnerDecision};
@@ -199,7 +199,8 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
             Some(GovernanceState::PlanRejected) | Some(GovernanceState::Escalated) => {
                 let r = run.as_ref().expect("suspended state has run");
                 present_suspension(r, &run_dir);
-                let Some(line) = read_line(&stdin, "[chat] 回复：重试 / 放弃 / 或直接说修改意见：")?
+                let Some(line) =
+                    read_line(&stdin, "[chat] 回复：重试 / 放弃 / 或直接说修改意见：")?
                 else {
                     break;
                 };
@@ -332,7 +333,10 @@ fn locate_run(explicit: Option<&Path>) -> Result<(PathBuf, Option<GovernanceRun>
             suspended.len()
         );
         for (dir, state, ts) in &suspended {
-            eprintln!("[chat]   {}（state={state}, updated_at={ts}）", dir.display());
+            eprintln!(
+                "[chat]   {}（state={state}, updated_at={ts}）",
+                dir.display()
+            );
         }
         bail!("alfred chat: 多个挂起 run 并存，请用 --run-dir 消歧");
     }
@@ -434,7 +438,10 @@ fn present_terminal_result(run: &GovernanceRun, run_dir: &Path) {
                 "[chat] ── run 完成（Completed）：需求「{}」已通过执行审查（验收 C）。",
                 run.request.title
             );
-            println!("[chat] 产物: {}/ws（执行审查已 git diff 验收）", run_dir.display());
+            println!(
+                "[chat] 产物: {}/ws（执行审查已 git diff 验收）",
+                run_dir.display()
+            );
         }
         GovernanceState::Abandoned => {
             println!(

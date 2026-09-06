@@ -86,12 +86,17 @@ fn strip_append_system_prompt(mut args: Vec<String>) -> Vec<String> {
 }
 
 fn print_help() {
-    println!("alfred {} — codux 可调度的治理环 CLI driver", env!("CARGO_PKG_VERSION"));
+    println!(
+        "alfred {} — codux 可调度的治理环 CLI driver",
+        env!("CARGO_PKG_VERSION")
+    );
     println!();
     println!("用法: alfred [--append-system-prompt <value>] <子命令> [参数]");
     println!();
     println!("子命令:");
-    println!("  chat    owner 持续会话入口（REPL：需求收集/对话/拍板/断点恢复；[--run-dir <dir>]）");
+    println!(
+        "  chat    owner 持续会话入口（REPL：需求收集/对话/拍板/断点恢复；[--run-dir <dir>]）"
+    );
     println!("  run     初始化治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 路由）");
     println!("  feed    喂属主决策（revise|retry|abandon）并从挂起态续跑");
     println!("  status  只读打印当前治理环状态");
@@ -113,8 +118,12 @@ fn cmd_run(args: &[String]) -> Result<()> {
     while i < args.len() {
         let flag = args[i].as_str();
         match flag {
-            "--request" | "--run-dir" | "--time-limit" | "--review-time-limit"
-            | "--planner-time-limit" | "--image" => {
+            "--request"
+            | "--run-dir"
+            | "--time-limit"
+            | "--review-time-limit"
+            | "--planner-time-limit"
+            | "--image" => {
                 i += 1;
                 let val = args
                     .get(i)
