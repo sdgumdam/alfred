@@ -142,10 +142,12 @@ fn trigger_payload_section(trigger: &MaintainTrigger) -> String {
 
 /// 运行维护者一轮：喂当前会话文档 + 触发载荷 → 收割更新后的 SessionDoc。
 ///
-/// **离线**（`ALFRED_OFFLINE=1` 或 `ALFRED_MAINTAIN_OFFLINE=1`）：确定性直通——
-/// 不跑 pi，收割注入文件 `ALFRED_MAINTAIN_OFFLINE_FILE`（更新后的完整会话文档
-/// JSON）作为维护产出（e2e 离线回归；llm-calls 照落 transport=offline 记录，
-/// prompt/触发载荷断言面与真跑同构）。不设注入文件 → 显式报错（不静默）。
+/// **离线**（`ALFRED_OFFLINE=1` / `ALFRED_PLANNER_OFFLINE=1` /
+/// `ALFRED_MAINTAIN_OFFLINE=1` 任一）：确定性直通——不跑 pi，收割注入文件
+/// `ALFRED_MAINTAIN_OFFLINE_FILE`
+/// （更新后的完整会话文档 JSON）作为维护产出（e2e 离线回归；llm-calls 照落
+/// transport=offline 记录，prompt/触发载荷断言面与真跑同构）。不设注入文件 →
+/// 恒等直通（文档不变；与 converse 离线直通同构）。
 ///
 /// 真 LLM：宿主 pi 短会话（AGT 拦写+拦读同 converse——维护者同受不可知约束）；
 /// 收割 `session.json` 必须存在且为合法会话文档（无静默出口）；llm-calls 落盘
@@ -157,6 +159,7 @@ pub fn run_maintain(
     trigger: &MaintainTrigger,
 ) -> Result<SessionDoc> {
     let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
+        || std::env::var("ALFRED_PLANNER_OFFLINE").as_deref() == Ok("1")
         || std::env::var("ALFRED_MAINTAIN_OFFLINE").as_deref() == Ok("1");
     if !offline && model.raw_id {
         bail!(
@@ -300,5 +303,54 @@ mod tests {
         assert!(prompt.contains("属主对本轮方案的反馈"));
         assert!(prompt.contains("重新弄一版"));
         assert!(crate::disguise::contains_forbidden_signal(&prompt).is_none());
+    }
+
+    /// 离线闸门三 env 任一命中（MaintainerAudit P1：r1-r4/r6c/r6d/agt-default
+    /// 套件只用 ALFRED_PLANNER_OFFLINE=1——此前维护者闸门不认它，会真跑 LLM）。
+    /// 断言面 = 离线路径真身：raw_id 模型在离线分支不 bail（在线会 bail），
+    /// 且产出 llm-calls role=maintain、transport=offline 记录。
+    #[test]
+    fn offline_gate_honors_planner_offline_var() {
+        use crate::host::PlannerHostOptions;
+        use alfred_core::session::SessionDoc;
+        let keys = ["ALFRED_OFFLINE", "ALFRED_PLANNER_OFFLINE", "ALFRED_MAINTAIN_OFFLINE"];
+        for key in keys {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, "1");
+            let base = std::env::temp_dir().join(format!("alfred-maintain-gate-{}-{}", key.to_lowercase(), std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let opts = PlannerHostOptions {
+                run_dir: base.clone(),
+                project_root: base.clone(),
+                time_limit_secs: 5,
+                agt: alfred_executor::agt::AgtSource::Builtin,
+            };
+            let model = ExecutorModel {
+                provider: "mockllm".into(),
+                model: "mockllm/model".into(),
+                base_url: String::new(),
+                api_key: String::new(),
+                max_tokens: 1024,
+                raw_id: true,
+            };
+            let doc = SessionDoc::default();
+            let trigger = MaintainTrigger::ConverseDone {
+                read_paths: vec![],
+                reply_summary: "答复：确认用 Rust".into(),
+            };
+            let updated = run_maintain(&opts, &model, &doc, &trigger)
+                .unwrap_or_else(|e| panic!("{key}=1 应走离线直通，却报错：{e}"));
+            assert_eq!(updated, doc, "{key}=1 无注入文件 → 恒等直通（文档不变）");
+            let recs: Vec<_> = std::fs::read_dir(base.join("llm-calls"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(!recs.is_empty(), "{key}=1 应落 llm-calls role=maintain 记录");
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

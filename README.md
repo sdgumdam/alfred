@@ -191,7 +191,8 @@ Planning → PlanReviewing → Executing → ExecReviewing
   只在维护成功后推进；**deny 记录不提取**——deny 路径泄露治理面），维护者 LLM
   判关键性落盘。维护者在投影空间工作（owner_feedback 命名+净化），磁盘真源
   字段名 review_summary 不变；喂规划器时投影中性化（review_summary →
-  owner_feedback）。离线：恒等直通或 `ALFRED_MAINTAIN_OFFLINE_FILE` 注入
+  owner_feedback）。离线（`ALFRED_OFFLINE=1` / `ALFRED_PLANNER_OFFLINE=1` /
+  `ALFRED_MAINTAIN_OFFLINE=1` 任一）：恒等直通或 `ALFRED_MAINTAIN_OFFLINE_FILE` 注入
   （e2e r6b caseH 断言滚动语义/数据源/disguise 投影/不可知）。
 
 ---

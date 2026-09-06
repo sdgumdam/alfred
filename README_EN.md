@@ -196,7 +196,8 @@ Tiered routing (§3.3, all six rows in code):
   surface); the maintainer LLM decides which are key. The maintainer works in the
   projected space (owner_feedback naming + scrubbing); the on-disk field name
   review_summary is unchanged; the projection fed to the planner stays neutralized
-  (`review_summary` → `owner_feedback`). Offline: identity passthrough or injection
+  (`review_summary` → `owner_feedback`). Offline (`ALFRED_OFFLINE=1` /
+  `ALFRED_PLANNER_OFFLINE=1` / `ALFRED_MAINTAIN_OFFLINE=1`, any): identity passthrough or injection
   via `ALFRED_MAINTAIN_OFFLINE_FILE` (e2e r6b caseH asserts rolling semantics, data
   source, disguise projection, and unawareness).
 
