@@ -12,16 +12,16 @@ const PLANNER_DRIVER_TEMPLATE: &str = include_str!("../templates/planner_driver.
 pub struct PlannerTaskGenParams {
     /// 沙箱 compose 文件绝对路径（挂载面矩阵，隔离机制）。
     pub compose_file: String,
-    /// "converse" | "maintain"（容器内 pi 的任务模式）。
+    /// planner 容器模式（现仅 "converse"；容器内 pi 的任务模式）。
     pub mode: String,
-    /// 容器侧 system prompt（converse 建图 schema / maintain 会话文档维护，逐字搬自 converse.rs / maintain.rs）。
+    /// 容器侧 system prompt（converse 建图 schema）。
     pub system_prompt: String,
     /// 容器侧 driver prompt（读 /inputs → 按 SYSTEM_PROMPT 规则 → 写 /outputs/<file>）。
     pub driver_prompt: String,
-    /// 容器内主产出文件绝对路径（"/outputs/instructions.json" 或 "/outputs/session.json"）。
+    /// 容器内主产出文件绝对路径（"/outputs/instructions.json"）。
     pub output_file: String,
     /// 容器内次产出文件绝对路径（converse §2.4 两分支答复侧 "/outputs/reply.txt"）；
-    /// 空串 = 单文件（maintain）。
+    /// 空串 = 单文件。
     pub output_file_alt: String,
     /// AGT 扩展路径（"/tmp/.agt/agt-policy.ts"）；空串 = 不加载。
     pub agt_ext: String,

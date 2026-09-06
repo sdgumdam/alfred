@@ -13,11 +13,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::dagspec::DagSpec;
 use crate::request::OwnerRequest;
 use crate::session::SessionDoc;
 use crate::util::now_rfc3339;
 use crate::verdict::{ExecVerdict, PlanVerdict};
-use crate::dagspec::DagSpec;
 
 /// 治理环状态（施工清单 §3.2 六环节 + 续跑挂起态）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +44,10 @@ pub enum GovernanceState {
 impl GovernanceState {
     /// 是否为挂起态（等属主 decide）。
     pub fn is_suspended(&self) -> bool {
-        matches!(self, GovernanceState::PlanRejected | GovernanceState::Escalated)
+        matches!(
+            self,
+            GovernanceState::PlanRejected | GovernanceState::Escalated
+        )
     }
 
     /// 是否为终态。
@@ -338,7 +341,7 @@ pub struct GovernanceRun {
     pub execution_count: u32,
     /// 当前计划（converse 产出；重规划时被替换）。
     pub dagspec: Option<DagSpec>,
-    /// 会话文档（maintain 维护，converse 每轮喂最新）。
+    /// 会话文档（维护者已回退待重做——schema 保留，当前为空文档；converse 每轮照喂）。
     pub session_doc: SessionDoc,
     /// 计划审查结论历史。
     #[serde(default)]
@@ -359,7 +362,11 @@ pub struct GovernanceRun {
 }
 
 impl GovernanceRun {
-    pub fn new(run_id: impl Into<String>, request: OwnerRequest, options: GovernanceOptions) -> Self {
+    pub fn new(
+        run_id: impl Into<String>,
+        request: OwnerRequest,
+        options: GovernanceOptions,
+    ) -> Self {
         Self {
             run_id: run_id.into(),
             request,

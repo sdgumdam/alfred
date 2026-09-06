@@ -5,15 +5,15 @@
 //! 矩阵 §1.1 planner 行（`docker/planner.compose.yaml.tmpl` 落码）。
 //!
 //! 流程：
-//!   1. 输入落盘：会话文档投影 / owner 消息 / request（+ maintain 触发事件）写到
+//!   1. 输入落盘：会话文档投影 / owner 消息 / request 写到
 //!      `<run_dir>/planner/inputs/`（R6a 模板约定：`/inputs/request.json`、
 //!      `/inputs/session.json`、`/inputs/owner_message.txt`、`/inputs/contract.json`）。
 //!   2. 渲染 `planner.compose.yaml.tmpl`（占位符 → canonicalize 后绝对路径，
 //!      实施计划 E1/E3）→ 生成 planner driver.py（`templates/planner_driver.py.tmpl`，
 //!      token 注入，非 eval Task）→ spawn `python3 driver.py`（Inspect 容器管理
 //!      接口：DockerSandboxEnvironment + sandbox_agent_bridge + exec_remote）→
-//!      轮询 done → 容器内 pi 读输入、按 system prompt（照搬 converse.rs /
-//!      maintain.rs 的 schema prompt）产建图指令/会话文档 JSON → 写 `/outputs/` 挂载。
+//!      轮询 done → 容器内 pi 读输入、按 system prompt（照搬 converse.rs 的
+//!      schema prompt）产建图指令/属主答复 JSON → 写 `/outputs/` 挂载。
 //!   3. 宿主读 `/outputs/<file>` 得原始输出文本（调用方解析/校验/落 llm-calls）。
 //!
 //! 桥模式选型（交付记录）：**复用 executor 的 sandbox_agent_bridge**（Inspect
@@ -25,9 +25,9 @@
 
 use std::path::{Path, PathBuf};
 
-use alfred_executor::agt::{assets, prepare_agt_work, resolve_agt_source, AgtSource};
 use alfred_core::request::OwnerRequest;
 use alfred_core::session::SessionDoc;
+use alfred_executor::agt::{assets, prepare_agt_work, resolve_agt_source, AgtSource};
 use alfred_executor::compose_gen::canonicalize_workspace;
 use alfred_executor::config::ExecutorModel;
 use alfred_executor::driver::{
@@ -35,7 +35,6 @@ use alfred_executor::driver::{
 };
 use anyhow::{bail, Context, Result};
 
-use crate::maintain::MaintainTrigger;
 use crate::task_gen::{generate_planner_task_py, PlannerTaskGenParams};
 
 /// planner 容器驱动的工作目录名（`<run_dir>/planner/`）。
@@ -48,8 +47,6 @@ pub const OUTPUTS_DIR: &str = "outputs";
 pub const CONVERSE_OUTPUT_FILE: &str = "/outputs/instructions.json";
 /// converse 答复产出文件名（§2.4 两分支答复侧，容器内写 `/outputs/reply.txt`）。
 pub const CONVERSE_REPLY_FILE: &str = "/outputs/reply.txt";
-/// maintain 产出文件名（容器内写 `/outputs/session.json`）。
-pub const MAINTAIN_OUTPUT_FILE: &str = "/outputs/session.json";
 
 /// planner 容器选项（R6b；编排器从 `GovernanceOptions` 派生，见 [`from_governance`]）。
 #[derive(Debug, Clone)]
@@ -87,7 +84,10 @@ impl Default for PlannerContainerOptions {
 
 impl PlannerContainerOptions {
     /// 从治理环运行选项派生容器选项（`run_dir` 由调用方填）。
-    pub fn from_governance(run_dir: PathBuf, opts: &alfred_core::governance::GovernanceOptions) -> Self {
+    pub fn from_governance(
+        run_dir: PathBuf,
+        opts: &alfred_core::governance::GovernanceOptions,
+    ) -> Self {
         Self {
             run_dir,
             image: opts.image.clone(),
@@ -100,14 +100,13 @@ impl PlannerContainerOptions {
     }
 }
 
-
 /// planner 容器运行结果（宿主侧读取）。
 #[derive(Debug, Clone)]
 pub struct ContainerRunOutput {
-    /// 容器产出的原始文本（converse：建图指令 JSON 数组 或 属主答复；maintain：会话文档 JSON）。
+    /// 容器产出的原始文本（converse：建图指令 JSON 数组 或 属主答复）。
     pub output_text: String,
     /// 实际产出的输出文件（容器内路径；converse：/outputs/instructions.json 或
-    /// /outputs/reply.txt；maintain：/outputs/session.json）。
+    /// /outputs/reply.txt）。
     pub produced_file: String,
     /// 容器驱动状态（"success" / "error" / "timed_out"）。字段名沿用旧名
     /// `eval_status`（state.json 兼容；现承载 driver 状态，非 eval 状态）。
@@ -144,25 +143,6 @@ pub fn run_converse_in_container(
     )
 }
 
-/// maintain 容器驱动：会话文档 + 触发事件 → 更新后会话文档 JSON 文本。
-pub fn run_maintain_in_container(
-    opts: &PlannerContainerOptions,
-    model: &ExecutorModel,
-    doc: &SessionDoc,
-    trigger: &MaintainTrigger,
-) -> Result<ContainerRunOutput> {
-    let inputs = maintain_inputs(doc, trigger)?;
-    run_planner_container(
-        opts,
-        model,
-        "maintain",
-        crate::maintain::MAINTAIN_SYSTEM_PROMPT,
-        MAINTAIN_DRIVER_PROMPT,
-        &[MAINTAIN_OUTPUT_FILE],
-        inputs,
-    )
-}
-
 /// converse 容器侧 driver prompt：读 /inputs → 按 SYSTEM_PROMPT 规则 → 写 /outputs。
 pub const CONVERSE_DRIVER_PROMPT: &str = r#"你的任务：按两分支规则决定产出——建图指令序列 或 给属主的答复，写为文件，而不是聊天回复。
 
@@ -176,17 +156,6 @@ pub const CONVERSE_DRIVER_PROMPT: &str = r#"你的任务：按两分支规则决
 - 若产出建图指令序列：把 JSON 数组写入 /outputs/instructions.json。
 - 若产出给属主的答复：把答复文本写入 /outputs/reply.txt。
 只能写其中一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
-写完即结束。"#;
-
-/// maintain 容器侧 driver prompt：读 /inputs → 按 SYSTEM_PROMPT 规则 → 写 /outputs。
-pub const MAINTAIN_DRIVER_PROMPT: &str = r#"你的任务：把更新后的会话文档 JSON 写入文件，而不是聊天回复。
-
-请按顺序读取输入文件：
-- /inputs/session.json —— 当前会话文档（JSON 对象：key_file_paths / key_conclusions / review_summary）
-- /inputs/trigger.json —— 新信息（JSON 对象，含 kind 与触发内容）
-
-按上面 SYSTEM_PROMPT 的规则，把更新后的完整三字段 JSON 写入 /outputs/session.json。
-只写这一个文件；不要写 /workspace 下的任何文件（工作区只读，写了会被拒绝）。
 写完即结束。"#;
 
 /// converse 输入落盘（R6a 模板约定）：request / 会话文档投影 / 属主消息。
@@ -209,35 +178,10 @@ fn converse_inputs(
     ])
 }
 
-/// maintain 输入落盘：当前会话文档（全字段，maintain 更新真源）+ 触发事件。
-fn maintain_inputs(doc: &SessionDoc, trigger: &MaintainTrigger) -> Result<Vec<(String, String)>> {
-    let trigger_json = match trigger {
-        MaintainTrigger::PlanReviewed { verdict, plan } => serde_json::json!({
-            "kind": "plan_reviewed",
-            "verdict": { "pass": verdict.pass, "reason": verdict.reason },
-            "plan": plan,
-        }),
-        MaintainTrigger::OwnerMessage { message } => serde_json::json!({
-            "kind": "owner_message",
-            "message": message,
-        }),
-    };
-    Ok(vec![
-        (
-            "session.json".to_string(),
-            serde_json::to_string_pretty(doc).context("serialize SessionDoc")?,
-        ),
-        (
-            "trigger.json".to_string(),
-            serde_json::to_string_pretty(&trigger_json).context("serialize MaintainTrigger")?,
-        ),
-    ])
-}
-
 ///
-/// `output_files`：容器内候选产出文件（converse 两分支 = [instructions, reply]；
-/// maintain = [session]）。驱动脚本强制恰好一个被写（多/零都报错）；宿主按候选集
-/// 探测产出（`ContainerRunOutput::produced_file` 区分分支）。
+/// `output_files`：容器内候选产出文件（converse 两分支 = [instructions, reply]）。
+/// 驱动脚本强制恰好一个被写（多/零都报错）；宿主按候选集探测产出
+/// （`ContainerRunOutput::produced_file` 区分分支）。
 #[allow(clippy::too_many_arguments)]
 fn run_planner_container(
     opts: &PlannerContainerOptions,
@@ -266,11 +210,10 @@ fn run_planner_container(
     // （create_dir_all 不清理）——轮 1 reply.txt 残留 + 轮 2 instructions.json 并存时，
     // driver 与宿主双侧"恰好一个候选"检查都误判 wrote both → planning_error_escalated
     // （两轮改口→建图路径 100% 复现）。每次起容器前清空本轮候选产出文件（bind mount
-    // 即时同步，容器内 /outputs 同步干净）；maintain 上一轮 session.json 同病根一并清
-    // ——容器本轮重写后宿主才读，宿主读取路径不受影响，且杜绝失败轮误读陈旧会话文档。
-    let output_host = |f: &str| {
-        outputs_dir.join(f.trim_start_matches("/outputs/").trim_start_matches('/'))
-    };
+    // 即时同步，容器内 /outputs 同步干净）——容器本轮重写后宿主才读，宿主读取
+    // 路径不受影响。
+    let output_host =
+        |f: &str| outputs_dir.join(f.trim_start_matches("/outputs/").trim_start_matches('/'));
     for f in output_files {
         match std::fs::remove_file(output_host(f)) {
             Ok(()) => {}
@@ -296,8 +239,12 @@ fn run_planner_container(
     // 起容器读到的就是 planner 上一轮自己写的契约。
     let contract_path = run_dir.join("contract.json");
     if !contract_path.exists() {
-        std::fs::write(&contract_path, "{}")
-            .with_context(|| format!("write planner contract placeholder {}", contract_path.display()))?;
+        std::fs::write(&contract_path, "{}").with_context(|| {
+            format!(
+                "write planner contract placeholder {}",
+                contract_path.display()
+            )
+        })?;
     }
 
     // AGT 拦写层（默认启用）：落策略 + 扩展到 `<work>/agt/`（策略 ro），审计
@@ -325,7 +272,6 @@ fn run_planner_container(
         &inputs_abs,
         &contract_abs,
         &outputs_abs,
-        mode == "maintain",
         agt_work.as_deref(),
     )?;
     let compose_path = work.join("compose.yaml");
@@ -412,10 +358,7 @@ fn run_planner_container(
     // driver.py 已强制恰好一个候选文件被写；宿主按候选集探测产出（多/零都显式报错）。
     let mut produced: Vec<(&str, String)> = Vec::new();
     for f in output_files {
-        let host = outputs_dir.join(
-            f.trim_start_matches("/outputs/")
-                .trim_start_matches('/'),
-        );
+        let host = outputs_dir.join(f.trim_start_matches("/outputs/").trim_start_matches('/'));
         if let Ok(text) = std::fs::read_to_string(&host) {
             if !text.trim().is_empty() {
                 produced.push((f, text));
@@ -432,7 +375,11 @@ fn run_planner_container(
         ),
         _ => bail!(
             "planner container produced multiple outputs ({}): 两分支只能二选一",
-            produced.iter().map(|(f, _)| *f).collect::<Vec<_>>().join(", ")
+            produced
+                .iter()
+                .map(|(f, _)| *f)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     };
     if output_text.trim().is_empty() {
@@ -458,28 +405,30 @@ fn render_planner_compose(
     inputs_abs: &Path,
     contract_abs: &Path,
     outputs_abs: &Path,
-    mount_trigger: bool,
     agt_work: Option<&Path>,
 ) -> Result<String> {
-    // E1 修复：converse 不产 trigger.json，不能无条件挂载——docker 对不存在的
-    // 宿主文件静默建目录（trigger.json 变目录），maintain 后写同名文件撞目录
-    // （os error 21）。故仅 maintain 挂载，converse 填注释行。
-    let trigger_mount = if mount_trigger {
-        format!("- {}:/inputs/trigger.json:ro", inputs_abs.join("trigger.json").display())
-    } else {
-        "# (converse 模式：不挂载 trigger.json，避免 docker 静默建目录)".to_string()
-    };
+    let trigger_mount =
+        "# (converse 模式：不挂载 trigger.json，避免 docker 静默建目录)".to_string();
+    // converse 不产 trigger.json，不挂载（docker 对不存在的宿主文件静默建目录）。
+    // 填注释行占位（compose 模板 {trigger_mount}）。
     let mut out = PLANNER_COMPOSE_TMPL
         .replace("{ws}", &ws_abs.display().to_string())
-        .replace("{request_path}", &inputs_abs.join("request.json").display().to_string())
-        .replace("{session_path}", &inputs_abs.join("session.json").display().to_string())
+        .replace(
+            "{request_path}",
+            &inputs_abs.join("request.json").display().to_string(),
+        )
+        .replace(
+            "{session_path}",
+            &inputs_abs.join("session.json").display().to_string(),
+        )
         .replace("{contract_path}", &contract_abs.display().to_string())
         .replace("{outputs_dir}", &outputs_abs.display().to_string())
         // P1 修复：属主本轮消息挂载（converse 对话面输入 /inputs/owner_message.txt；
         // 缺此挂载容器读不到属主消息，多轮对话容器模式失效）。
-        .replace("{owner_message_path}", &inputs_abs.join("owner_message.txt").display().to_string())
-        // P2 修复：maintain 触发事件挂载（/inputs/trigger.json；缺此挂载容器读不到
-        // MaintainTrigger，真实模式 PlanReviewed/OwnerMessage 两触发时机失效）。
+        .replace(
+            "{owner_message_path}",
+            &inputs_abs.join("owner_message.txt").display().to_string(),
+        )
         .replace("{trigger_mount}", &trigger_mount)
         .replace(
             "image: \"alfred-executor:latest\"",
@@ -507,7 +456,6 @@ fn render_planner_compose(
 
     Ok(out)
 }
-
 
 /// 内嵌 planner compose 模板（R6a 落码，唯一真源）。
 const PLANNER_COMPOSE_TMPL: &str = include_str!("../../../docker/planner.compose.yaml.tmpl");

@@ -87,7 +87,7 @@ const NEUTRAL_REPLACEMENTS: &[(&str, &str)] = &[
 /// 把审查者理由中和为不含结构化信号词的文本。
 /// 会话文档第三段对规划器的投影字段名（方案B：review_summary → owner_feedback）。
 pub const REVIEW_SUMMARY_PROJECTION_FIELD: &str = "owner_feedback";
-/// review_summary 条目含禁词时的中性兜底模板（投影层与 maintain LLM 路径共用）。
+/// review_summary 条目含禁词时的中性兜底模板（投影层共用）。
 pub const OWNER_FEEDBACK_NEUTRAL_TEMPLATE: &str = "属主对上一轮计划有反馈，请重新理解需求";
 
 /// 净化 review_summary 条目：任一条目含禁词 → 回退中性模板（就地修改）。
@@ -126,8 +126,7 @@ fn request_restatement(request: &OwnerRequest) -> String {
 
 /// 最小兜底模板（需求文本本身含禁词时的最后防线）。
 fn minimal_fallback() -> String {
-    "我重新看了下需求，你给的方案跟我要的不太对，你再按我原来的需求重新弄一版。"
-        .to_string()
+    "我重新看了下需求，你给的方案跟我要的不太对，你再按我原来的需求重新弄一版。".to_string()
 }
 
 /// 生成伪装打回消息（属主口吻）。
