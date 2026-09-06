@@ -434,7 +434,7 @@ fn render_planner_policy(
     //   工作目录——run 目录子路径，无需单列）。
     //   补非字面形态（复审②）：`../` 穿越串、`~/` / `$HOME`、`.alfred/runs`——
     //   与 policy.json 静态形态同语义（JS 合法形态；宿主单源只渲染 run 派生值，
-    //   outputs 子树负向断言（carve 免误杀合法写）留在 policy.json 静态层）。
+    //   planner/outputs 子树负向断言（carve 免误杀合法写）留在 policy.json 静态层）。
     let run_dir_pattern = format!(
         r#"(?:{}|{}|\.\.[/\\]|~/|\$(?:HOME\b|\{{HOME\}})|\.alfred/runs)"#,
         regex_escape(&run_abs),

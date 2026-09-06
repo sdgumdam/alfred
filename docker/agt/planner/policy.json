@@ -35,7 +35,7 @@
       "command_patterns": [
         { "source": "\\.alfred/runs", "flags": "" },
         { "source": "\\.agt/", "flags": "" },
-        { "source": "{run_dir_pattern}(?!(?:/|\\\\)(?:[^/\\\\]*(?:/|\\\\))*(?:outputs|out)(?:/|\\\\|$))", "flags": "" },
+        { "source": "{run_dir_pattern}(?!(?:/|\\\\)(?:[^/\\\\]*(?:/|\\\\))*planner(?:/|\\\\)outputs(?:/|\\\\|$))", "flags": "" },
         { "source": "\\.\\.[/\\\\]|(?<=[\\s;|&])\\.\\.(?=[\\s;|&]|$)|(?<=[\\s=])~(?:/|\\\\|$)|(?<=[\\s=])\\$(?:HOME\\b|\\{HOME\\})", "flags": "" },
         { "source": "(?:verdict|conversation|audit|run[ _-]?dir)", "flags": "i" }
       ],

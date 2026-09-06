@@ -151,9 +151,10 @@ const plannerRunRel = stripPrefix(plannerRun);
 const plannerOutRel = stripPrefix(plannerOut);
 const outputsRedirectAllow =
   `(?:^|[;|&\\s])(?:>>?|tee\\s+(?:-a\\s+)?)\\s*(?:${regexEscape(plannerOut)}|${regexEscape(plannerOutRel)})(?:/[^\\s|;&<>]*)?(?=[\\s]|$)`;
-// 跨段 outputs 子树负向断言（carve）：命中 run 字面前缀、其后各段无 outputs/out
-// 结尾段才拦——outputs 内嵌 run 前缀（<run>/planner/outputs），免误杀合法写。
-const outputsCarve = `(?!(?:/|\\\\)(?:[^/\\\\]*(?:/|\\\\))*(?:outputs|out)(?:/|\\\\|$))`;
+// planner/outputs 子树负向断言（carve）：命中 run 字面前缀、其后无 planner/outputs
+// 子树才拦——合法写只内嵌 run 前缀（<run>/planner/outputs），plan-review /
+// exec-review 的 outputs 子树仍被拦（UnknowFinalAudit P1：审查结论不泄露）。
+const outputsCarve = `(?!(?:/|\\\\)(?:[^/\\\\]*(?:/|\\\\))*planner(?:/|\\\\)outputs(?:/|\\\\|$))`;
 const runDirPattern =
   `(?:${regexEscape(plannerRun)}|${regexEscape(plannerRunRel)}|\\.\\.[/\\\\]|~/|\\$(?:HOME\\b|\\{HOME\\})|\\.alfred/runs)${outputsCarve}`;
 const agtWorkPattern = `(?:${regexEscape(plannerAgtWork)}|\\.agt/)`;
@@ -176,12 +177,12 @@ const renderedPlannerPolicy = plannerPolicyRaw
   .replace("{outputs_dir}", jsonInner(plannerOut))
   .replace("{agt_work}", jsonInner(plannerAgtWork))
   .replace("{workspace_dir}", jsonInner(plannerWs));
-// 复刻体逐规则对齐 policy.json 优先级（防两处漂移的确定性断言）。
+// 复刻体逐规则对齐 policy.json 优先级（真断言防漂移：policy.json 数字改动即红——
+// 静默覆写会让组合遮蔽回归假绿，UnknowFinalAudit P2）。
 const stageDoc = JSON.parse(renderedPlannerPolicy);
 for (const rule of stageDoc.rules) {
-  if (rule.name in PLANNER_PRIORITY) {
-    rule.priority = PLANNER_PRIORITY[rule.name];
-  }
+  assert(rule.name in PLANNER_PRIORITY && rule.priority === PLANNER_PRIORITY[rule.name],
+    `优先级防漂移 ${rule.name}=${rule.priority} === PLANNER_PRIORITY`);
 }
 const plannerPolicy = parsePolicy(JSON.stringify(stageDoc));
 
@@ -219,6 +220,41 @@ for (const gp of [
 ]) {
   const gd = evaluateToolCall(plannerPolicy, read(gp));
   assert(gd.decision === "deny" && gd.reason === "路径不在允许的工作范围", `planner read ${path.basename(gp)} → deny 中性(${gd.decision}/${gd.reason})`);
+}
+
+// UnknowFinalAudit P1 对抗探针（review-outputs 读）：carve 收窄到 planner/outputs
+// 子树后，plan-review/outputs 与 exec-review/outputs（各含 verdict.json = 审查
+// 结论全文）必须 deny——点名与不点名文件的内容原语（grep -r / head / cat 通配 /
+// ls / find）逐条封堵，堵"grep -r pass <run>/plan-review/outputs/"读自家审查结论。
+for (const cmd of [
+  `grep -r pass ${plannerRun}/plan-review/outputs/`,
+  `grep -ri verdict ${plannerRun}/exec-review/outputs/`,
+  `head -5 ${plannerRun}/plan-review/outputs/verdict.json`,
+  `tail -20 ${plannerRun}/exec-review/outputs/verdict.json`,
+  `cat ${plannerRun}/plan-review/outputs/v*`,
+  `cat ${plannerRun}/exec-review/outputs/*`,
+  `less ${plannerRun}/plan-review/outputs/verdict.json`,
+  `wc -l ${plannerRun}/exec-review/outputs/verdict.json`,
+  `ls ${plannerRun}/plan-review/outputs/`,
+  `ls -la ${plannerRun}/exec-review/outputs`,
+  `find ${plannerRun}/plan-review/outputs -name '*.json'`,
+  `stat ${plannerRun}/exec-review/outputs/verdict.json`,
+  `file ${plannerRun}/plan-review/outputs/verdict.json`,
+  `cat "${plannerRun}/plan-review/outputs/verdict.json"`,
+  `cat '${plannerRun}/exec-review/outputs/verdict.json'`,
+]) {
+  const rd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(rd.decision === "deny" && rd.rule === "deny-bash-governance-paths",
+    `对抗探针⑥ review-outputs 读 ${cmd.slice(0, 52)}… → deny（got ${rd.decision}/${rd.rule}）`);
+}
+// read 工具直读 review-outputs → deny（deny-governance-files 前缀命中）
+for (const gp of [
+  `${plannerRun}/plan-review/outputs/verdict.json`,
+  `${plannerRun}/exec-review/outputs/verdict.json`,
+]) {
+  const gd = evaluateToolCall(plannerPolicy, read(gp));
+  assert(gd.decision === "deny" && gd.rule === "deny-governance-files",
+    `对抗探针⑥ read review-outputs ${gp.slice(gp.indexOf("/runs/") + 1)} → deny（got ${gd.decision}/${gd.rule}）`);
 }
 
 // P1 负向断言：outputs 白名单无穿越——相对路径与 ../ 穿越必须落回真实 run 前缀
@@ -295,18 +331,31 @@ for (const cmd of literalEscapeProbes) {
   assert(ld.decision === "deny" && ld.reason === "路径不在允许的工作范围",
     `对抗探针② 非字面形态 ${cmd} → deny（got ${ld.decision}/${ld.rule}）`);
 }
-// ③ 合法写不被 governance 层误杀（carve 精确性——run 字面前缀 + outputs 段命中
-//    时 deny-governance-paths 让路，allow-bash-write-outputs(34) 接住放行）。
+// ③ 合法写不被 governance 层误杀（carve 精确性——run 字面前缀 + planner/outputs
+//    子树命中时 deny-governance-paths 让路，allow-bash-write-outputs(34) 接住放行）。
 const legitOutWrites = [
   `echo '{}' > ${plannerOut}/instructions.json`,
   `echo x > ${plannerOut}/sub/deep/reply.txt`,
   `echo x >> ${plannerOut}/reply.txt`,
   `echo x | tee -a ${plannerOut}/reply.txt`,
+  `echo x | tee -a ${plannerOutRel}/reply.txt`, // 相对形态同放行
 ];
 for (const cmd of legitOutWrites) {
   const gd = evaluateToolCall(plannerPolicy, bash(cmd));
   assert(gd.decision === "allow" && gd.rule === "allow-bash-write-outputs",
     `对抗探针③ 合法 outputs 写不误杀 ${cmd.slice(0, 40)}… → allow（got ${gd.decision}/${gd.rule}）`);
+}
+// ③-2 carve 收窄负向：重定向指向 review-outputs 子树不因 outputs 段放行（P1 回归
+//    面——旧 carve"任意 outputs 段"会整体放行含写）。
+const reviewRedirectProbes = [
+  `echo x > ${plannerRun}/plan-review/outputs/verdict.json`,
+  `echo '{"decision":"deny"}' > ${plannerRun}/exec-review/outputs/verdict.json`,
+  `cat src/x.md >> ${plannerRun}/plan-review/outputs/verdict.json`,
+];
+for (const cmd of reviewRedirectProbes) {
+  const rd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(rd.decision === "deny" && rd.rule === "deny-bash-governance-paths",
+    `对抗探针③-2 review-outputs 重定向写 ${cmd.slice(0, 48)}… → deny（got ${rd.decision}/${rd.rule}）`);
 }
 // ④ 写族漏形态：无空格 `>`（>file）与 fd 限定 `2>` / `1>>` / `&>>` → deny。
 const redirectFormProbes = [
