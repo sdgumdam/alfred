@@ -139,22 +139,51 @@ const plannerAgtWork = path.join(plannerRun, "planner", "agt");
 process.env.AGT_WORKSPACE_DIR = plannerWs;
 const regexEscape = (s) => s.replace(/[\\.+*?()|[\]{}^$]/g, "\\$&");
 const jsonInner = (s) => JSON.stringify(s).slice(1, -1);
+// 复刻体语义 = host.rs render_planner_policy（复审⑤对齐）：相对形态 =
+// strip_prefix(ws + "/")，剥不动（run 根在项目根外，state 布局）退化为绝对串
+// （恒不命中，安全侧：绝对前缀规则仍覆盖）——path.relative 恒产生 ../ 形态，与
+// host.rs 不同，state 布局下 ../ 负向断言认证的是运行时不存在的能力。
+const stripPrefix = (abs) => {
+  const p = abs.startsWith(plannerWs + "/") ? abs.slice(plannerWs.length + 1) : abs;
+  return p;
+};
+const plannerRunRel = stripPrefix(plannerRun);
+const plannerOutRel = stripPrefix(plannerOut);
 const outputsRedirectAllow =
-  `(?:^|[;|&\\s])(?:>>?|tee\\s+(?:-a\\s+)?)\\s*(?:${regexEscape(plannerOut)}|${regexEscape(path.relative(plannerWs, plannerOut))})(?:/[^\\s|;&<>]*)?(?=[\\s]|$)`;
-const runDirPattern = `(?:${regexEscape(plannerRun)}|${regexEscape(path.relative(plannerWs, plannerRun))})`;
+  `(?:^|[;|&\\s])(?:>>?|tee\\s+(?:-a\\s+)?)\\s*(?:${regexEscape(plannerOut)}|${regexEscape(plannerOutRel)})(?:/[^\\s|;&<>]*)?(?=[\\s]|$)`;
+// 跨段 outputs 子树负向断言（carve）：命中 run 字面前缀、其后各段无 outputs/out
+// 结尾段才拦——outputs 内嵌 run 前缀（<run>/planner/outputs），免误杀合法写。
+const outputsCarve = `(?!(?:/|\\\\)(?:[^/\\\\]*(?:/|\\\\))*(?:outputs|out)(?:/|\\\\|$))`;
+const runDirPattern =
+  `(?:${regexEscape(plannerRun)}|${regexEscape(plannerRunRel)}|\\.\\.[/\\\\]|~/|\\$(?:HOME\\b|\\{HOME\\})|\\.alfred/runs)${outputsCarve}`;
 const agtWorkPattern = `(?:${regexEscape(plannerAgtWork)}|\\.agt/)`;
-const plannerPolicy = parsePolicy(
-  plannerPolicyRaw
-    .replace("{outputs_redirect_allow}", jsonInner(outputsRedirectAllow))
-    .replace("{run_dir_pattern}", jsonInner(runDirPattern))
-    .replace("{agt_work_pattern}", jsonInner(agtWorkPattern))
-    .replace("{run_dir_rel}", jsonInner(path.relative(plannerWs, plannerRun)))
-    .replace("{run_dir}", jsonInner(plannerRun))
-    .replace("{outputs_dir_rel}", jsonInner(path.relative(plannerWs, plannerOut)))
-    .replace("{outputs_dir}", jsonInner(plannerOut))
-    .replace("{agt_work}", jsonInner(plannerAgtWork))
-    .replace("{workspace_dir}", jsonInner(plannerWs)),
-);
+// 优先级同 docker/agt/planner/policy.json（policy.json 为单一真源，此处仅复刻）。
+const PLANNER_PRIORITY = {
+  "allow-write-to-outputs": 40,
+  "deny-bash-governance-paths": 38,
+  "deny-governance-files": 36,
+  "allow-bash-write-outputs": 34,
+  "deny-bash-write-family": 32,
+  "deny-write-to-workspace": 20,
+};
+const renderedPlannerPolicy = plannerPolicyRaw
+  .replace("{outputs_redirect_allow}", jsonInner(outputsRedirectAllow))
+  .replace("{run_dir_pattern}", jsonInner(runDirPattern))
+  .replace("{agt_work_pattern}", jsonInner(agtWorkPattern))
+  .replace("{run_dir_rel}", jsonInner(plannerRunRel))
+  .replace("{run_dir}", jsonInner(plannerRun))
+  .replace("{outputs_dir_rel}", jsonInner(plannerOutRel))
+  .replace("{outputs_dir}", jsonInner(plannerOut))
+  .replace("{agt_work}", jsonInner(plannerAgtWork))
+  .replace("{workspace_dir}", jsonInner(plannerWs));
+// 复刻体逐规则对齐 policy.json 优先级（防两处漂移的确定性断言）。
+const stageDoc = JSON.parse(renderedPlannerPolicy);
+for (const rule of stageDoc.rules) {
+  if (rule.name in PLANNER_PRIORITY) {
+    rule.priority = PLANNER_PRIORITY[rule.name];
+  }
+}
+const plannerPolicy = parsePolicy(JSON.stringify(stageDoc));
 
 // §2.4 两分支产出：instructions.json（Instructions 接管）与 reply.txt（Reply 对话继续）都
 // 写进产出目录（宿主收割）→ allow
@@ -225,6 +254,95 @@ const bashDenyCases = [
 for (const cmd of bashDenyCases) {
   const bd = evaluateToolCall(plannerPolicy, bash(cmd));
   assert(bd.decision === "deny" && bd.reason === "路径不在允许的工作范围", `planner bash ${cmd} → deny 中性（got ${bd.decision}/${bd.rule}/${bd.reason}）`);
+}
+
+// ============================================================================
+// 第四轮对抗探针（UnknowRecheck 复审 5 点——组合遮蔽 / 非字面形态 / fd 与无空格
+// 重定向 / block reason 真实反馈面）。全部负向：逐条 deny + 中性 reason。
+// ============================================================================
+console.log("== 第四轮对抗探针（组合遮蔽 / 非字面形态 / fd·无空格重定向） ==");
+// ① 优先级遮蔽回归：治理读 + 产出写组合命令曾被 allow-bash-write-outputs
+//    整体放行（含 > outputs/../plan-verdicts.json 覆写治理文件）——governance
+//    deny(38) 先于 bash allow(34) 后必须逐条 deny。
+const comboProbes = [
+  `cat ${plannerRun}/plan-verdicts.json > ${plannerOut}/leak.txt`, // 治理读+产出写
+  `cat ${plannerRun}/plan-verdicts.json > ${plannerOut}/../plan-verdicts.json`, // ../ 覆写治理文件（回归）
+  `cat ${plannerRun}/plan-verdicts.json > ${plannerOut}/../conversation.json`, // ../ 覆写同级治理文件
+];
+for (const cmd of comboProbes) {
+  const cd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(cd.decision === "deny" && cd.reason === "路径不在允许的工作范围",
+    `对抗探针① 组合遮蔽 ${cmd.slice(0, 44)}… → deny（got ${cd.decision}/${cd.rule}）`);
+}
+// ② 非字面形态：../ 穿越串 / ~ / $HOME / ${HOME} / .alfred/runs / 治理关键词，
+//    均不命中字面前缀（host.rs 与 policy.json 静态层双单源同形态）。
+const literalEscapeProbes = [
+  `cat ../../${path.basename(plannerState)}/runs/run-1/plan-verdicts.json`,
+  `cat ../../${path.basename(plannerState)}/runs/run-1/../../runs/run-1/plan-verdicts.json`,
+  "ls ~/.local/state/alfred/runs",
+  "cat $HOME/.local/state/alfred/runs/run-1/plan-verdicts.json",
+  "cat ${HOME}/.local/state/alfred/runs/run-1/conversation.json",
+  "ls .alfred/runs/run-1",
+  "cat .alfred/runs/run-1/plan-verdicts.json",
+  "ls run-dir-somewhere-else",
+  "cat plan-verdicts.json",
+  "cat exec-verdicts.json",
+  "tail -5 conversation.json",
+  "wc -l audit.jsonl",
+];
+for (const cmd of literalEscapeProbes) {
+  const ld = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(ld.decision === "deny" && ld.reason === "路径不在允许的工作范围",
+    `对抗探针② 非字面形态 ${cmd} → deny（got ${ld.decision}/${ld.rule}）`);
+}
+// ③ 合法写不被 governance 层误杀（carve 精确性——run 字面前缀 + outputs 段命中
+//    时 deny-governance-paths 让路，allow-bash-write-outputs(34) 接住放行）。
+const legitOutWrites = [
+  `echo '{}' > ${plannerOut}/instructions.json`,
+  `echo x > ${plannerOut}/sub/deep/reply.txt`,
+  `echo x >> ${plannerOut}/reply.txt`,
+  `echo x | tee -a ${plannerOut}/reply.txt`,
+];
+for (const cmd of legitOutWrites) {
+  const gd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(gd.decision === "allow" && gd.rule === "allow-bash-write-outputs",
+    `对抗探针③ 合法 outputs 写不误杀 ${cmd.slice(0, 40)}… → allow（got ${gd.decision}/${gd.rule}）`);
+}
+// ④ 写族漏形态：无空格 `>`（>file）与 fd 限定 `2>` / `1>>` / `&>>` → deny。
+const redirectFormProbes = [
+  "echo x >file.txt",
+  "echo x >>file.txt",
+  "echo x 2>err.txt",
+  "echo x 1>>out.txt",
+  "echo x &>>all.txt",
+  "cmd1 2> /dev/null; echo x > out.txt",
+];
+for (const cmd of redirectFormProbes) {
+  const rd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(rd.decision === "deny", `对抗探针④ 写族漏形态 ${cmd} → deny（got ${rd.decision}/${rd.rule}）`);
+}
+// ⑤ block reason 中性（复审③：真实反馈面 = 扩展层 agt-policy.ts 的 block 输出，
+//    非 engine reason）——模拟扩展层拼装，断言拼装产物不含规则名/治理语义词。
+const extensionBlock = (d) => `操作被策略拒绝：${d.reason}`;
+for (const d of [
+  evaluateToolCall(plannerPolicy, read(`${plannerRun}/plan-verdicts.json`)),
+  evaluateToolCall(plannerPolicy, bash(`cat ${plannerRun}/plan-verdicts.json > ${plannerOut}/leak.txt`)),
+  evaluateToolCall(plannerPolicy, bash("cat plan-verdicts.json")),
+]) {
+  const msg = extensionBlock(d);
+  assert(!msg.includes(d.rule ?? "") && !/\[(?:deny|allow)[-\]a-z]*/i.test(msg),
+    `对抗探针⑤ block reason 无规则名（got ${msg}）`);
+  assert(!/governance|verdict|conversation|audit/i.test(msg.replace("操作被策略拒绝：", "")),
+    `对抗探针⑤ block reason 无治理语义词（got ${msg}）`);
+}
+// ⑤b 扩展层真实源码级断言：agt-policy.ts 的 deny 分支模板串不得拼 rule 名。
+{
+  const extSource = readFileSync(path.join(here, "../../../docker/agt/agt-policy.ts"), "utf8");
+  const denyBranch = extSource.slice(extSource.indexOf('decision.decision === "deny"'));
+  assert(denyBranch.includes("`操作被策略拒绝：${decision.reason}`"),
+    "对抗探针⑤b agt-policy.ts deny 分支用中性模板（源码级）");
+  assert(!denyBranch.includes("${decision.rule}"),
+    "对抗探针⑤b agt-policy.ts deny 分支不含规则名插值（源码级）");
 }
 
 // 读项目文件 / 普通只读命令 → allow（隔离面只封治理产物与写通道，不误伤）
