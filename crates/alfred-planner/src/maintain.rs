@@ -204,6 +204,14 @@ pub fn run_maintain(
         serde_json::to_string_pretty(&projection).context("serialize SessionDoc projection")?;
     let payload = trigger_payload_section(trigger);
     let prompt = format!("当前会话文档：\n{session}\n\n{payload}");
+    // system prompt（MaintainerAudit P3 审计真值）：静态 schema + 产出路径规则，
+    // 提升到离线分支之前构造——离线 llm-calls 记录与真跑同值（converse 落全量
+    // messages 同范式），llm-calls 不再有"system 恒空串"的记录失真。
+    let system_prompt = format!(
+        "{}{}",
+        MAINTAIN_SYSTEM_PROMPT,
+        maintain_output_section(&outputs_dir)
+    );
 
     let (text, offline, transport) = if offline {
         match std::env::var("ALFRED_MAINTAIN_OFFLINE_FILE") {
@@ -227,11 +235,6 @@ pub fn run_maintain(
         let agt_ext = prepare_host_agt(&work, &opts.agt, &outputs_dir, &opts.project_root)?;
         let pi_config_dir = work.join(PI_CONFIG_DIR);
         write_pi_config(&pi_config_dir, model)?;
-        let system_prompt = format!(
-            "{}{}",
-            MAINTAIN_SYSTEM_PROMPT,
-            maintain_output_section(&outputs_dir)
-        );
         let pi_stdout = spawn_planner_pi(
             opts,
             model,
@@ -259,12 +262,12 @@ pub fn run_maintain(
     let record = LlmCallRecord {
         ts: alfred_core::util::now_rfc3339(),
         role: "maintain".into(),
-        model: model.inspect_model_id(),
         offline,
+        model: model.inspect_model_id(),
         transport: transport.to_string(),
-        // system prompt 不进审计（converse 同范式：记录 user 载荷即可——
-        // system 是静态 schema 文本，真跑路径已含产出规则）。
-        messages: vec![ChatMessage::system(String::new()), ChatMessage::user(prompt)],
+        // system prompt 审计真值（MaintainerAudit P3）：记录提升后的构造真值，
+        // 离线/真跑同值（与 converse 落全量 messages 同范式），不再恒空串失真。
+        messages: vec![ChatMessage::system(system_prompt), ChatMessage::user(prompt)],
         response: text.trim().to_string(),
         ok: true,
         error: None,
@@ -357,11 +360,29 @@ mod tests {
             let updated = run_maintain(&opts, &model, &doc, &trigger)
                 .unwrap_or_else(|e| panic!("{key}=1 应走离线直通，却报错：{e}"));
             assert_eq!(updated, doc, "{key}=1 无注入文件 → 恒等直通（文档不变）");
-            let recs: Vec<_> = std::fs::read_dir(base.join("llm-calls"))
+            // P3 审计真值：记录里的 system prompt = 真值（静态 schema + 产出
+            // 路径规则），离线与真跑同值，不再是恒空串。
+            let rec_path = base
+                .join("llm-calls")
+                .read_dir()
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .collect();
-            assert!(!recs.is_empty(), "{key}=1 应落 llm-calls role=maintain 记录");
+                .map(|e| e.path())
+                .next()
+                .expect("{key}=1 应落 llm-calls role=maintain 记录");
+            let rec: LlmCallRecord = serde_json::from_str(
+                &std::fs::read_to_string(&rec_path).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(rec.role, "maintain", "role=maintain");
+            assert!(rec.offline && rec.transport == "offline");
+            assert_eq!(rec.messages.len(), 2, "system + user 两条");
+            assert_eq!(rec.messages[0].role, "system");
+            assert!(
+                rec.messages[0].content.starts_with("你是治理系统的会话文档维护者")
+                    && rec.messages[0].content.contains("session.json"),
+                "system prompt 记录真值（含 schema 与产出路径规则）"
+            );
             match prev {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
