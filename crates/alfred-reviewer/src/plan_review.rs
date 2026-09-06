@@ -1,12 +1,8 @@
 //!
-//! 计划审查（R6c 容器化）：reviewer 容器（ws 全量 ro + 对话记录 + 契约全字段）
-//! 内 pi 读全量信息审忠实度，产出 verdict.json 到 /outputs；宿主读容器产出做
-//! Pydantic 等价校验。离线（ALFRED_OFFLINE=1）不跑容器（无 docker）——审查跳过
-//! → unscored → 调用方升级属主（§六继承项，不悄悄放行）。
-//!
-//! 三容器 Inspect 统一管（属主 08-27）：reviewer 容器经 Inspect 容器管理接口
-//! （DockerSandboxEnvironment + sandbox_agent_bridge + exec_remote）起容器/驱动
-//! pi，不再有 `inspect eval` 评测路径（旧 `execute_plan_review_eval` 已移除）。
+//! 计划审查（宿主 pi 化）：宿主 pi agent 全可见（ws 产物 + 对话记录 + verdict
+//! 历史 + 契约全字段经绝对路径自由读）审忠实度，产出 verdict.json 到
+//! `<review_dir>/outputs/`；宿主收割做 serde 等价校验。离线（ALFRED_OFFLINE=1）
+//! 不跑 pi——审查跳过 → unscored → 调用方升级属主（§六继承项，不悄悄放行）。
 
 use std::path::{Path, PathBuf};
 
@@ -19,18 +15,19 @@ use alfred_core::verdict::PlanVerdict;
 use alfred_executor::config::ExecutorModel;
 use serde::Serialize;
 
-use crate::container::{run_plan_review_in_container, ReviewerContainerOptions};
+use crate::host::{run_plan_review_on_host, ReviewerHostOptions};
 use crate::verdict::parse_plan_verdict_json;
 
 /// 计划审查选项。
 #[derive(Debug, Clone)]
 pub struct PlanReviewOptions {
-    /// run 目录（须位于 ~ 之下——E3）。
+    /// run 目录（reviewer 工作目录 = `<run>/plan-review`）。
     pub run_dir: PathBuf,
     /// 单样本时间上限（秒）。
     pub time_limit_secs: u32,
-    /// R6c：reviewer 容器驱动选项。计划审查一律走容器（无容器 = 无法审查）。
-    pub container: ReviewerContainerOptions,
+    /// 宿主 pi 驱动选项（cwd/AGT/时间上限）。计划审查一律跑宿主 pi（无配置 =
+    /// 无法审查）。
+    pub host: ReviewerHostOptions,
 }
 
 impl Default for PlanReviewOptions {
@@ -38,7 +35,7 @@ impl Default for PlanReviewOptions {
         Self {
             run_dir: PathBuf::new(),
             time_limit_secs: 300,
-            container: ReviewerContainerOptions::default(),
+            host: ReviewerHostOptions::default(),
         }
     }
 }
@@ -93,11 +90,10 @@ pub fn missing_workspace_subdirs(dagspec: &DagSpec) -> Option<(String, String)> 
     None
 }
 
-///
 /// 计划审查调度：
 /// - R6e(补A) 结构闸门命中（节点缺 workspace_subdirs）→ 直接判不合格打回。
-/// - 离线（`ALFRED_OFFLINE=1`）→ 不跑容器（无 docker）→ unscored（升级属主）。
-/// - 否则 → reviewer 容器（读全量信息）。
+/// - 离线（`ALFRED_OFFLINE=1`）→ 不跑 pi → unscored（升级属主）。
+/// - 否则 → 宿主 pi reviewer（全可见读全量信息）。
 pub fn execute_plan_review(
     opts: &PlanReviewOptions,
     model: &ExecutorModel,
@@ -117,14 +113,7 @@ pub fn execute_plan_review(
     if offline {
         return plan_review_skipped_offline(opts, model, request, dagspec);
     }
-    execute_plan_review_container(
-        opts,
-        &opts.container,
-        model,
-        request,
-        dagspec,
-        session_doc,
-    )
+    execute_plan_review_host(opts, model, request, dagspec, session_doc)
 }
 
 /// 离线跳过（`ALFRED_OFFLINE=1`）：不跑容器（无 docker）——计划审查跳过 →
@@ -250,23 +239,22 @@ fn reject_missing_workspace_subdirs(
     Ok(rec)
 }
 
-/// 容器路径：reviewer 容器（ws 全量 ro + 对话记录 + 契约全字段）内 pi 读
-/// 全量信息审忠实度 → 产出 verdict.json → 宿主 Pydantic 等价校验 → 落
-/// state.json / verdict.json / audit。
+/// 宿主路径：宿主 pi reviewer（全可见：ws 产物 + 对话记录 + verdict 历史 + 契约
+/// 全字段经绝对路径自由读）审忠实度 → 产出 `<review_dir>/outputs/verdict.json` →
+/// 宿主 serde 等价校验 → 落 state.json / verdict.json / audit / llm-calls。
 ///
-/// 失败路径显式 `bail!`（不悄悄放行）：容器驱动失败（driver 超时/crash/status
-/// error/未产出 verdict）→ `fail_review` 落盘后上报；verdict 解析失败 → unscored
-/// 兜底（`plan_verdict_parse_failure`），调用方据此升级属主。
-fn execute_plan_review_container(
+/// 失败路径显式 `bail!`（不悄悄放行）：pi 超时/退出码非零/未产出 verdict →
+/// `fail_review` 落盘后上报；verdict 解析失败 → unscored 兜底
+/// （`plan_verdict_parse_failure`），调用方据此升级属主。
+fn execute_plan_review_host(
     opts: &PlanReviewOptions,
-    container: &ReviewerContainerOptions,
     model: &ExecutorModel,
     request: &OwnerRequest,
     dagspec: &DagSpec,
     session_doc: Option<&SessionDoc>,
 ) -> Result<PlanReviewOutcome> {
     let started_at = now_rfc3339();
-    let run_id = match container.run_dir.file_name().and_then(|s| s.to_str()) {
+    let run_id = match opts.host.run_dir.file_name().and_then(|s| s.to_str()) {
         Some(name) => name.to_string(),
         None => short_id("planreview"),
     };
@@ -275,8 +263,8 @@ fn execute_plan_review_container(
     std::fs::create_dir_all(run_dir).with_context(|| format!("create run dir {}", run_dir.display()))?;
     append_audit(run_dir, "plan_review_started", &serde_json::json!({ "run_id": run_id, "request_id": request.id }))?;
 
-    // 输入落盘：request.json + dagspec.json（P9 证据 + R3 续跑输入；容器输入由
-    // container.rs 在 `<work>/inputs/` 落盘，这里落 run 目录供审计/续跑）。
+    // 输入落盘：request.json + dagspec.json（P9 证据 + R3 续跑输入；宿主 pi 的
+    // inputs/ 由 host.rs 在 `<work>/inputs/` 落盘，这里落 review 目录供审计/续跑）。
     std::fs::write(
         run_dir.join("request.json"),
         serde_json::to_string_pretty(request).context("serialize OwnerRequest")?,
@@ -286,8 +274,9 @@ fn execute_plan_review_container(
         serde_json::to_string_pretty(dagspec).context("serialize DagSpec")?,
     )?;
 
-    // 对话记录（reviewer 独有挂载，§二.8）：从治理 run 目录读；不存在 → 空。
-    let gov_dir = container
+    // 对话记录（reviewer 全可见，§二.8）：从治理 run 目录读；不存在 → 空。
+    let gov_dir = opts
+        .host
         .run_dir
         .parent()
         .context("reviewer work dir has no parent (治理 run 目录)")?;
@@ -297,8 +286,8 @@ fn execute_plan_review_container(
         .ok()
         .flatten();
 
-    let out = match run_plan_review_in_container(
-        container,
+    let out = match run_plan_review_on_host(
+        &opts.host,
         model,
         request,
         dagspec,
@@ -308,10 +297,10 @@ fn execute_plan_review_container(
     ) {
         Ok(out) => out,
         Err(e) => {
-            let msg = format!("plan review container failed: {e:#}");
+            let msg = format!("plan review host pi failed: {e:#}");
             fail_review(
                 run_dir, request, dagspec, model, &run_id, &started_at,
-                "error", None, "plan_review_container_failed", "container_failure", &msg,
+                "error", None, "plan_review_host_failed", "host_failure", &msg,
             )?;
             bail!(msg);
         }
@@ -322,7 +311,7 @@ fn execute_plan_review_container(
         &serde_json::json!({ "eval_location": out.eval_location }),
     )?;
 
-    // Pydantic 等价校验（verdict.rs）：容器产出 verdict.json → PlanVerdict。
+    // serde 等价校验（verdict.rs）：宿主 pi 产出 verdict.json → PlanVerdict。
     let verdict = match parse_plan_verdict_json(&out.output_text) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -337,7 +326,7 @@ fn execute_plan_review_container(
     };
     let eval_error = (out.eval_status != "success").then(|| {
         format!(
-            "plan review container driver finished with status '{}' (location={:?})",
+            "plan review host pi finished with status '{}' (location={:?})",
             out.eval_status, out.eval_location
         )
     });

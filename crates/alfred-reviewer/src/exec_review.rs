@@ -1,17 +1,15 @@
-//! 执行审查独立容器（R6c）：内嵌 grader → 独立 reviewer 容器。
 //!
-//! 流程：建 exec-review run 目录 → 写 request.json/contract.json（证据）→
-//! reviewer 容器（挂 ws 全量 ro + 契约全字段 + 对话记录）内 pi 读全量产物判
-//! 分 → 产出 verdict.json 到 /outputs → 宿主 Pydantic 等价校验 → 落
-//! verdict.json + state.json + audit.jsonl。
+//! 执行审查（宿主 pi 化）：宿主 pi agent 全可见（ws 全量产物 + 对话记录 + verdict
+//! 历史 + 契约全字段经绝对路径自由读）判产物 vs 验收标准，产出 verdict.json 到
+//! `<review_dir>/outputs/`；宿主收割做 serde 等价校验，落 verdict.json + state.json
+//! + audit.jsonl。
 //!
-//! 关键差异（vs 旧投影 grader）：旧 grader 只见 `Sample.target`（验收标准 + 产物
-//! 摘要，截断 80KB/200 文件）；本路径 reviewer 挂 **ws 全量 ro**，自己读 ws diff /
-//! git 历史 / 隐藏目录判产物——审查者看全量信息防合谋（R6c 验证核心：夹带私货
-//! 用例必须被全量 reviewer 抓到）。
+//! 关键差异（vs 旧投影 grader）：旧 grader 只见产物摘要（截断 80KB/200 文件）；
+//! 本路径 reviewer 自由读 ws 全量（git 历史 / 隐藏目录 / 超截断内容）——审查者看
+//! 全量信息防合谋（R6c 验证核心：夹带私货用例必须被全量 reviewer 抓到）。
 //!
 //! 治理环接入：R6d 移除 executor 内嵌 scorer（执行容器只出产物）；执行审查由
-//! 本驱动在独立 reviewer 容器内完成（governance exec_review_step）。
+//! 本驱动在宿主 pi 完成（governance exec_review_step）。
 
 use std::path::{Path, PathBuf};
 
@@ -24,23 +22,29 @@ use alfred_core::verdict::ExecVerdict;
 use alfred_executor::config::ExecutorModel;
 use serde::Serialize;
 
-use crate::container::{run_exec_review_in_container, ReviewerContainerOptions};
+use crate::host::{run_exec_review_on_host, ReviewerHostOptions};
 use crate::verdict::parse_exec_verdict_json;
 
-/// 执行审查选项（R6c）。
+/// 执行审查选项。
 #[derive(Debug, Clone)]
 pub struct ExecReviewOptions {
-    /// reviewer 容器驱动选项（`run_dir` = exec-review 工作目录，须位于 ~ 之下）。
-    pub container: ReviewerContainerOptions,
-    /// ws 全量 ro 挂载源（持久 ws 目录）。
+    /// 宿主 pi 驱动选项（`run_dir` = exec-review 工作目录）。
+    pub host: ReviewerHostOptions,
+    /// ws 全量读源（持久 ws 目录，reviewer 自由读）。
     pub ws_dir: PathBuf,
 }
 
 impl ExecReviewOptions {
-    /// 从治理环运行选项派生（`exec_review_dir` = `<run>/exec-review`，`ws_dir` = `<run>/ws`）。
-    pub fn from_governance(exec_review_dir: PathBuf, ws_dir: PathBuf, opts: &GovernanceOptions) -> Self {
+    /// 从治理环运行选项派生（`exec_review_dir` = `<run>/exec-review`，`ws_dir` = `<run>/ws`，
+    /// `project_root` = 治理对象项目根）。
+    pub fn from_governance(
+        exec_review_dir: PathBuf,
+        ws_dir: PathBuf,
+        project_root: PathBuf,
+        opts: &GovernanceOptions,
+    ) -> Self {
         Self {
-            container: ReviewerContainerOptions::from_governance(exec_review_dir, opts),
+            host: ReviewerHostOptions::from_governance(exec_review_dir, project_root, opts),
             ws_dir,
         }
     }
@@ -78,9 +82,9 @@ pub fn default_exec_review_dir() -> PathBuf {
     base.join(short_id("execreview"))
 }
 
-/// 执行审查容器驱动：request + 契约全字段 + 对话记录 + ws 全量 ro → ExecVerdict。
+/// 执行审查宿主驱动：request + 契约全字段 + 对话记录 + ws 全量 → ExecVerdict。
 ///
-/// 失败路径显式 `bail!`（不悄悄放行）：容器驱动失败 → `fail_exec_review` 落盘后
+/// 失败路径显式 `bail!`（不悄悄放行）：宿主 pi 失败 → `fail_exec_review` 落盘后
 /// 上报；verdict 解析失败 → unscored 兜底（调用方据此升级属主）。
 pub fn execute_exec_review(
     opts: &ExecReviewOptions,
@@ -91,11 +95,11 @@ pub fn execute_exec_review(
     conversation: Option<&alfred_core::conversation::ConversationLog>,
 ) -> Result<ExecReviewOutcome> {
     let started_at = now_rfc3339();
-    let run_id = match opts.container.run_dir.file_name().and_then(|s| s.to_str()) {
+    let run_id = match opts.host.run_dir.file_name().and_then(|s| s.to_str()) {
         Some(name) => name.to_string(),
         None => short_id("execreview"),
     };
-    let run_dir = &opts.container.run_dir;
+    let run_dir = &opts.host.run_dir;
 
     std::fs::create_dir_all(run_dir).with_context(|| format!("create exec review dir {}", run_dir.display()))?;
     append_audit(run_dir, "exec_review_started", &serde_json::json!({ "run_id": run_id, "request_id": request.id }))?;
@@ -110,8 +114,8 @@ pub fn execute_exec_review(
         serde_json::to_string_pretty(contract).context("serialize Contract")?,
     )?;
 
-    let out = match run_exec_review_in_container(
-        &opts.container,
+    let out = match run_exec_review_on_host(
+        &opts.host,
         model,
         request,
         contract,
@@ -121,8 +125,8 @@ pub fn execute_exec_review(
     ) {
         Ok(out) => out,
         Err(e) => {
-            let msg = format!("exec review container failed: {e:#}");
-            fail_exec_review(run_dir, request, model, &run_id, &started_at, "error", None, "exec_review_container_failed", "container_failure", &msg)?;
+            let msg = format!("exec review host pi failed: {e:#}");
+            fail_exec_review(run_dir, request, model, &run_id, &started_at, "error", None, "exec_review_host_failed", "host_failure", &msg)?;
             bail!(msg);
         }
     };
@@ -147,7 +151,7 @@ pub fn execute_exec_review(
     };
     let eval_error = (out.eval_status != "success").then(|| {
         format!(
-            "exec review container driver finished with status '{}' (location={:?})",
+            "exec review host pi finished with status '{}' (location={:?})",
             out.eval_status, out.eval_location
         )
     });
