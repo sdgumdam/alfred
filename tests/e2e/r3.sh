@@ -350,8 +350,8 @@ ALFRED_OFFLINE_PLAN_FILE="$CASE3_DIR/plan-faithful.json" \
 cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --run-dir "$CASE3_DIR" \
   --decision retry
-# （--message "" = Retry 消息可选：feed_owner_message 无消息跳过消息轮，不做
-#   maintain②/不落 owner.message；--image 沿用 run.options 持久配置，无需重复传）
+# （--message "" = Retry 消息可选：feed_owner_message 无消息跳过消息轮、不落
+#   owner.message；--image 沿用 run.options 持久配置，无需重复传）
 
 assert_state "$CASE3_DIR" "escalated"
 # 断言：伪装消息无结构化否决词；llm-calls/0001.json（重规划）引用伪装消息
@@ -394,7 +394,7 @@ PY
 echo "PASS(case3): 打回伪装 → feed retry → 伪装消息进 planner（无结构化否决词）→ 重规划 → 执行 → 执行审查离线回退升级"
 
 # ============================================================================
-# Case 4：多轮会话文档（打回 → 属主补充 → converse 引用会话文档关键结论）
+# Case 4：多轮会话（打回 → 属主补充 → 重规划；维护者已回退——会话文档保持空文档）
 # ============================================================================
 CASE4_DIR="$R3_RUNS/run-r3-case4"
 rm -rf "$CASE4_DIR"
@@ -477,25 +477,24 @@ cargo run --quiet -p alfred-cli --bin alfred -- feed \
   --message "$CASE4_DIR/supplement.txt"
 
 assert_state "$CASE4_DIR" "escalated"
-# 断言：第二次 converse 的 llm-calls 记录引用会话文档（review_summary + key_conclusions）
-python3 - "$CASE4_DIR/state.json" "$CASE4_DIR/llm-calls" <<'PY' || { echo "FAIL(case4): converse 未引用会话文档关键结论" >&2; exit 1; }
+# 断言：feed revise 设 owner_message；会话文档保持空文档语义（维护者已回退待重做）
+python3 - "$CASE4_DIR/state.json" "$CASE4_DIR/llm-calls" <<'PY' || { echo "FAIL(case4): 会话文档空文档语义断言" >&2; exit 1; }
 import json, sys, glob, os
 d = json.load(open(sys.argv[1]))
-# R6d：离线 feed revise 走到执行审查时离线回退 → 升级挂起（escalated）；
-# 会话文档多轮（打回→补充→重规划）本身已验证。
+# R6d：离线 feed revise 走到执行审查时离线回退 → 升级挂起（escalated）。
 assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
 doc = d["session_doc"]
-# maintain ②：属主补充进了 key_conclusions
-assert any("技术选型" in c for c in doc["key_conclusions"]), f"key_conclusions missing supplement: {doc['key_conclusions']}"
-# maintain ①：打回后 review_summary 非空
-assert len(doc["review_summary"]) >= 1, "review_summary empty"
+# 维护者已回退（待新架构重做）：会话文档保持空文档，属主补充只设 owner_message
+assert doc == {"key_file_paths": [], "key_conclusions": [], "review_summary": []}, \
+    f"session_doc not empty: {doc}"
+assert d["owner_message"] and "技术选型" in d["owner_message"], \
+    f"owner_message missing supplement: {d.get('owner_message')}"
 files = sorted(glob.glob(os.path.join(sys.argv[2], "*.json")))
 assert len(files) >= 2, f"expect >=2 llm-calls, got {len(files)}"
 rec = json.load(open(files[-1]))
 user = rec["messages"][-1]["content"]
-# 第二次 converse 的 prompt 包含维护者写入的关键结论（会话文档三段）
-assert "技术选型" in user, "converse 未引用属主补充（key_conclusions）"
-assert any(s[:20] in user for s in doc["review_summary"]), "converse 未引用审查摘要（review_summary）"
+# 第二次 converse 的 prompt 含属主补充（owner_message 语义）
+assert "技术选型" in user, "converse 未引用属主补充（owner_message）"
 # P1/方案B 防回归：converse 实际输入无 review_summary 字段名、无禁词（投影改名+中性化）
 forbidden = ["reject", "rejected", "verdict", "review", "reviewer", "scorer", "score",
              "grader", "eval", "unscored", "否决", "审查", "评审", "评分", "评估", "打分", "打回", "判定"]
@@ -512,7 +511,7 @@ for f in files:
     u = r["messages"][-1]["content"]
     assert "owner_feedback" in u, f"converse projection missing owner_feedback: {u}"
 PY
-echo "PASS(case4): 打回→属主补充→converse 引用会话文档关键结论 → 执行审查离线回退升级（从 llm 调用记录断言）"
+echo "PASS(case4): 打回→属主补充→重规划（会话文档保持空文档）→ 执行审查离线回退升级（从 llm 调用记录断言）"
 
 echo ""
 echo "============================================="

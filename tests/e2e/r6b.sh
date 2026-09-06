@@ -3,13 +3,12 @@
 # R6b e2e：planner 容器化回归（宿主直调 → 容器 Agent）
 #
 # 三层：
-#   Tier 0（默认，无外部依赖）：cargo test —— 离线 converse/maintain 单测 +
-#     新容器驱动（compose 渲染 / 模板注入 / 输入落盘）单测。这是"离线路径全绿"
+#   Tier 0（默认，无外部依赖）：cargo test —— 离线 converse 单测 +
+#     容器驱动（compose 渲染 / 模板注入 / 输入落盘）单测。这是"离线路径全绿"
 #     的核心。
 #   Tier 1（需 inspect CLI，无需 docker / 无需真 LLM）：ALFRED_OFFLINE 规划 +
 #     mockllm 计划审查（unscored → 升级）——断言 converse 离线产物
-#     （llm-calls/dagspec.json/conversation.json）+ maintain 离线（driver feed
-#     revise 更新 key_conclusions）。inspect 缺失时跳过（打印 SKIP）。
+#     （llm-calls/dagspec.json/conversation.json）。inspect 缺失时跳过（打印 SKIP）。
 #   Tier 2（需 inspect + docker + 真模型，验方跑）：R6B_REAL=1 时真容器 converse
 #     产合法 DagSpec（zhipu 真跑）+ ws 只读断言。默认关闭（留给验方）。
 #
@@ -23,18 +22,15 @@
 #
 # Tier 1 用例：
 #   caseA 离线 converse（driver run → 计划 → mockllm 审查 unscored → 升级挂起）
-#   caseB 离线 maintain②（driver feed revise 属主补充 → key_conclusions 更新）
+#   caseB feed revise 属主补充（维护者已回退——session_doc 保持空文档语义）
 #   caseC P1-2 Reply 多轮续入（规划器答复 → state=Planning → driver feed revise
 #         续入属主答复 → 重规划 → 升级挂起）
 #   caseD P2a/P2b Planning 态 Abandon（converse 答复停驻 → feed abandon 无消息、
-#         planner 不可用也能弃 → 终态 Abandoned；不跑 maintain②/不落 owner.message 轮）
+#         planner 不可用也能弃 → 终态 Abandoned；不落 owner.message 轮）
 #   caseE Retry 消息可选（feed retry 无 --message → 按来源重审 → 再升级挂起）
 #   caseG P2-1 append 透传（--append-system-prompt <memory> → planner converse
 #         system prompt：llm-calls 记录的 converse system prompt 含注入内存 + 基础
 #         建图 schema 仍在；run 与 feed 各验一轮）
-#   caseH maintain Err 回退（feed revise 坏 run：planner 容器不可达 → maintain
-#         回退旧 session_doc + audit maintain_warning(trigger=owner_message) +
-#         owner.message 轮照落 + converse 失败升级属主不悄悄放行）
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -64,7 +60,7 @@ fi
 
 if [[ -z "$INSPECT" ]]; then
   echo "SKIP(Tier1): 无 inspect CLI（ALFRED_INSPECT 或 PATH）。离线 CLI 回归跳过；"
-  echo "  Tier 0 已覆盖离线 converse/maintain 单测。"
+  echo "  Tier 0 已覆盖离线 converse 单测。"
 else
   echo ""
   echo "============================================="
@@ -168,8 +164,8 @@ assert state["state_machine"]["state"] == "escalated", f"state={state['state_mac
 PY
   echo "PASS(caseA): 离线 converse 产物（dagspec/llm-calls/conversation.json）+ 审查出错升级"
 
-  # ---- Case B：离线 maintain②（driver feed revise 属主补充 → key_conclusions 更新）----
-  echo "[r6b] caseB: driver feed revise（离线 maintain → key_conclusions 追加） ..."
+  # ---- Case B：feed revise 属主补充（维护者已回退——会话文档保持空文档语义）----
+  echo "[r6b] caseB: driver feed revise（属主补充 → owner_message 设入，session_doc 保持空） ..."
   MSG_FILE="$CASE_A/owner-msg.txt"
   cat > "$MSG_FILE" <<'TXT'
 技术选型用 Rust
@@ -180,21 +176,19 @@ TXT
     --decision revise \
     --message "$MSG_FILE"
 
-  python3 - "$CASE_A" <<'PY' || { echo "FAIL(caseB): maintain 离线更新断言" >&2; exit 1; }
+  python3 - "$CASE_A" <<'PY' || { echo "FAIL(caseB): feed revise 空文档语义断言" >&2; exit 1; }
 import json, os, sys
 run = sys.argv[1]
 state = json.load(open(os.path.join(run, "state.json")))
-assert "技术选型用 Rust" in state["session_doc"]["key_conclusions"], \
-    f"key_conclusions={state['session_doc']['key_conclusions']}"
+# 维护者已回退（待新架构重做）：会话文档保持空文档，owner_message 照常设入
+assert state["session_doc"] == {"key_file_paths": [], "key_conclusions": [], "review_summary": []}, \
+    f"session_doc={state['session_doc']}"
 assert state["owner_message"] == "技术选型用 Rust", "owner_message not updated"
-# maintain 记录（llm-calls 新 seq，role=maintain, transport=offline? —— maintain 离线不落盘）
-# 注：maintain 离线路径（ALFRED_OFFLINE）是确定性更新，不写 llm-calls（与 R3 一致）。
-# 只断言会话文档更新成功。
 PY
   # ---- Case C：P1-2 Reply 多轮续入（规划器答复 → state=Planning → decide revise 续入 → 重规划）----
   # 规划器第一轮先答复属主（不产计划，§2.4 Reply 分支）→ 状态停 Planning（对话继续）；
   # 属主经 `driver feed --decision revise --message <回答>` 从 Planning 态续入下一轮
-  # 消息（设 owner_message → maintain② → planning_step 复用 revise 机制）→ 重规划
+  # 消息（设 owner_message → planning_step 复用 revise 机制）→ 重规划
   # → 计划审查（mockllm unscored）→ 升级挂起。多轮对话端到端闭环。
   CASE_C="$R6B_RUNS/run-r6b-reply-continue"
   rm -rf "$CASE_C"
@@ -282,8 +276,8 @@ state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
 # owner_message = 属主答复（decide revise 设入）
 assert state["owner_message"] == "可以，技术选型用 Rust。", f"owner_message={state['owner_message']}"
-# maintain②：属主答复进了 key_conclusions
-assert any("技术选型用 Rust" in c for c in state["session_doc"]["key_conclusions"]), \
+# 维护者已回退：会话文档保持空文档（属主答复只设 owner_message，不进 key_conclusions）
+assert state["session_doc"]["key_conclusions"] == [], \
     f"key_conclusions={state['session_doc']['key_conclusions']}"
 # conversation.json：request.submit → converse.reply(规划器提问) → owner.message(属主答复) → converse.reply(重规划)
 conv = json.load(open(os.path.join(run, "conversation.json")))
@@ -298,9 +292,9 @@ PY
   # ---- Case D：Planning 态 Abandon（P2a/P2b：属主放弃恒可选 + Abandon 前置路由）----
   # P2a：Planning（converse 答复停驻）→ feed abandon → 终态 Abandoned（此前无
   #      (Planning, OwnerAbandon) 转移，属主从该态无法终止 run——违背"放弃恒可选"）。
-  # P2b：Abandon 前置路由——不要求消息、不跑 maintain②、不落 owner.message 轮。
-  #      坏 run 也能弃：下面 feed abandon 不带 ALFRED_OFFLINE（planner 容器路径不可用，
-  #      dummy provider 无 docker）——若代码仍跑 maintain②（planner）会失败，Abandon 生效不了。
+  # P2b：Abandon 前置路由——不要求消息、不落 owner.message 轮。坏 run 也能弃：
+  #      feed abandon 不带 ALFRED_OFFLINE（planner 容器路径不可用，dummy provider
+  #      无 docker）——Abandon 不触碰 planner 直接进终态。
   CASE_D="$R6B_RUNS/run-r6b-planning-abandon"
   rm -rf "$CASE_D"
   mkdir -p "$CASE_D"
@@ -356,8 +350,8 @@ assert state["state_machine"]["state"] == "planning", f"state={state['state_mach
 PY
   echo "PASS(caseD1): Reply 分支 → Planning（对话继续）"
 
-  # 坏 run：不带 ALFRED_OFFLINE——planner 容器路径不可用。若 Abandon 仍走 maintain②
-  # （planner）会失败；前置路由应让 Abandon 不触碰 planner 直接进终态。
+  # 坏 run：不带 ALFRED_OFFLINE——planner 容器路径不可用。前置路由让 Abandon
+  # 不触碰 planner 直接进终态。
   echo "[r6b] caseD: driver feed abandon（无 --message；planner 不可用也能弃） ..."
   env -u ALFRED_OFFLINE -u ALFRED_OFFLINE_PLAN_FILE -u ALFRED_OFFLINE_REPLY_FILE \
   cargo run --quiet -p alfred-cli --bin alfred -- feed \
@@ -370,7 +364,7 @@ run = sys.argv[1]
 state = json.load(open(os.path.join(run, "state.json")))
 # 终态 Abandoned（P2a：Planning → OwnerAbandon 合法转移）
 assert state["state_machine"]["state"] == "abandoned", f"state={state['state_machine']['state']}"
-# P2b：不落 owner.message 轮、不跑 maintain②——但 Retry/Abandon 决策补落
+# P2b：不落 owner.message 轮——但 Retry/Abandon 决策补落
 # panel.decision 轮（ConversationSource::PanelDecision，reviewer 可见升级拍板，
 # P3 契约）：conversation.json = request.submit → converse.reply → panel.decision
 conv = json.load(open(os.path.join(run, "conversation.json")))
@@ -378,7 +372,7 @@ sources = [t["source"] for t in conv["turns"]]
 assert sources == ["request.submit", "converse.reply", "panel.decision"], \
     f"sources={sources}"
 assert "owner.message" not in sources, f"sources={sources}"
-# P2b：不跑 maintain②（key_conclusions 无新增）
+# 会话文档保持空（key_conclusions 无新增）
 assert state["session_doc"]["key_conclusions"] == [], \
     f"key_conclusions={state['session_doc']['key_conclusions']}"
 # P2b：不设 owner_message（保持 None，无消息轮）
@@ -403,7 +397,7 @@ run = sys.argv[1]
 state = json.load(open(os.path.join(run, "state.json")))
 # retry 无消息不应 bail；从 Escalated(PlanReview) 重审同一计划 → 离线跳过 → 再升级挂起
 assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
-# 无消息 → 不新增 owner.message 轮、不跑 maintain②；Retry 决策补落
+# 无消息 → 不新增 owner.message 轮；Retry 决策补落
 # panel.decision 轮（ConversationSource::PanelDecision，P3 契约）
 conv = json.load(open(os.path.join(run, "conversation.json")))
 sources = [t["source"] for t in conv["turns"]]
@@ -643,92 +637,8 @@ for r in converse:
 PY
   echo "PASS(caseG2): feed --append-system-prompt → 新一轮 converse system prompt 含注入内存 + 基础 schema"
 
-  # ---- Case H：maintain Err 回退（feed/plan_review 维护者②的坏 run 行为覆盖）----
-  # caseD 坏 run 范式：先离线跑出非空 session_doc（feed revise 离线 maintain 成功 →
-  # key_conclusions 固化；REPLY_FILE 分支保持 Planning），再 env -u ALFRED_OFFLINE 跑
-  # feed revise——maintain 走容器路径（dummy provider，容器内 LLM 不可达 → 驱动超时
-  # Err）→ 回退旧 session_doc + audit 记 maintain_warning(trigger=owner_message)，
-  # owner.message 轮照落；随后 converse 容器同样失败 → planning_error_escalated 升级
-  # 挂起（不悄悄放行）。断言可观测副产物：maintain_warning、旧 session_doc 保留
-  # （key_conclusions 不丢）、owner.message 轮 + owner_message 设入、升级终态。
-  CASE_H="$R6B_RUNS/run-r6b-maintain-err-fallback"
-  rm -rf "$CASE_H"
-  mkdir -p "$CASE_H"
-  cat > "$CASE_H/request.json" <<'JSON'
-{
-  "id": "req-r6b-c7",
-  "title": "create hello.txt",
-  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
-  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
-  "created_at": "2026-09-01T00:00:00Z"
-}
-JSON
-  printf '收到需求。技术选型确认一下：内容用 Rust 实现，可以吗？\n' > "$CASE_H/reply.txt"
-  printf '好，定下来：技术选型用 Rust。\n' > "$CASE_H/reply2.txt"
-  printf '补充：技术选型用 Rust\n' > "$CASE_H/msg1.txt"
-  printf '补充：错误处理要完善\n' > "$CASE_H/msg2.txt"
-  echo "[r6b] caseH: driver run（离线 Reply → Planning）+ feed revise（离线 maintain 固化 key_conclusions） ..."
-  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_H/reply.txt" \
-  cargo run --quiet -p alfred-cli --bin alfred -- run \
-    --request "$CASE_H/request.json" \
-    --run-dir "$CASE_H" \
-    --time-limit 60 \
-    --review-time-limit 60 \
-    --planner-time-limit 60
-  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_H/reply2.txt" \
-  cargo run --quiet -p alfred-cli --bin alfred -- feed \
-    --run-dir "$CASE_H" \
-    --decision revise \
-    --message "$CASE_H/msg1.txt"
-
-  echo "[r6b] caseH: driver feed revise（坏 run：env -u ALFRED_OFFLINE → maintain 容器 Err → 回退） ..."
-  env -u ALFRED_OFFLINE -u ALFRED_OFFLINE_PLAN_FILE -u ALFRED_OFFLINE_REPLY_FILE \
-  cargo run --quiet -p alfred-cli --bin alfred -- feed \
-    --run-dir "$CASE_H" \
-    --decision revise \
-    --message "$CASE_H/msg2.txt"
-
-  python3 - "$CASE_H" <<'PY' || { echo "FAIL(caseH): maintain Err 回退断言" >&2; exit 1; }
-import json, os, sys
-run = sys.argv[1]
-# ① audit.jsonl 出现 maintain_warning（trigger=owner_message + 回退旧 doc）——该回退
-#    分支首次被 e2e 行为覆盖；错误文案随环境（docker 有无/超时）不同，不逐字断言。
-warnings = []
-for line in open(os.path.join(run, "audit.jsonl")):
-    rec = json.loads(line)
-    if rec["event"] == "maintain_warning":
-        warnings.append(rec["data"])
-assert len(warnings) == 1, f"maintain_warning events={warnings}"
-assert warnings[0]["trigger"] == "owner_message", f"trigger={warnings[0]['trigger']}"
-assert warnings[0]["fallback"] == "keep_previous_session_doc", f"fallback={warnings[0]['fallback']}"
-# ② 旧 session_doc 保留：feed#1 离线 maintain 固化的 key_conclusions 不因 maintain
-#    Err 丢失/清空（keep_previous_session_doc 回退语义的可观测面）。
-state = json.load(open(os.path.join(run, "state.json")))
-assert state["session_doc"]["key_conclusions"] == ["补充：技术选型用 Rust"], \
-    f"key_conclusions={state['session_doc']['key_conclusions']}"
-# ③ owner.message 轮照落 + owner_message 设入坏 feed 的属主消息（回退不吞消息轮）。
-assert state["owner_message"] == "补充：错误处理要完善", f"owner_message={state['owner_message']}"
-conv = json.load(open(os.path.join(run, "conversation.json")))
-sources = [t["source"] for t in conv["turns"]]
-assert sources == ["request.submit", "converse.reply", "owner.message", "converse.reply", "owner.message"], \
-    f"sources={sources}"
-assert conv["turns"][-1]["role"] == "owner" and conv["turns"][-1]["content"] == "补充：错误处理要完善", \
-    f"last turn={conv['turns'][-1]}"
-# ④ 治理环不悄悄放行：converse 容器失败 → planning_error_escalated 升级挂起。
-assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
-esc = [json.loads(l)["data"] for l in open(os.path.join(run, "audit.jsonl"))
-       if json.loads(l)["event"] == "planning_error_escalated"]
-assert esc, "planning_error_escalated missing（converse 失败未升级属主）"
-PY
-  echo "PASS(caseH): maintain Err 回退（maintain_warning + 旧 session_doc 保留 + owner.message 轮 + 升级不悄悄放行）"
-
   unset ALFRED_CONFIG
 
-  unset ALFRED_CONFIG
-
-  unset ALFRED_CONFIG
-
-  unset ALFRED_CONFIG
   echo ""
   echo "R6b Tier 1 全部通过：离线规划回归 PASS"
 fi
