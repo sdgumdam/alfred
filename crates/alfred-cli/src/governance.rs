@@ -315,7 +315,8 @@ fn maintainer_opts(run: &GovernanceRun, ctx: &GovernanceContext) -> PlannerHostO
 }
 
 /// 触发滚动维护（ConverseDone）：收割更新后的会话文档 + 落 audit + llm-calls
-/// （run_maintain 内部落 role=maintain 记录）。维护失败**显式报错**——记忆坏了
+/// （run_maintain 内部落 role=maintain 记录）+ **推进持久审计基线**（维护成功
+/// 后才推进——失败/崩溃行不丢，下轮补提取）。维护失败**显式报错**——记忆坏了
 /// 要可见，不悄悄放行（无静默出口）。
 fn maintain_after_converse(
     run: &mut GovernanceRun,
@@ -333,6 +334,9 @@ fn maintain_after_converse(
         &run.session_doc,
         &trigger,
     )?;
+    // 基线推进到当前审计末尾（维护成功 = 增量已被消费）。
+    let consumed = alfred_planner::host::snapshot_audit_lines(&ctx.run_dir);
+    alfred_planner::host::write_audit_baseline(&ctx.run_dir, consumed)?;
     audit(
         &ctx.run_dir,
         "maintain_done",
@@ -366,6 +370,9 @@ fn maintain_after_plan_review(
         &run.session_doc,
         &trigger,
     )?;
+    // 基线推进到当前审计末尾（审查期 planner 未跑，行数应不变；防御性推进）。
+    let consumed = alfred_planner::host::snapshot_audit_lines(&ctx.run_dir);
+    alfred_planner::host::write_audit_baseline(&ctx.run_dir, consumed)?;
     audit(
         &ctx.run_dir,
         "maintain_done",
@@ -383,9 +390,10 @@ fn maintain_after_plan_review(
 /// Planning，编排环返回调用方；答复文本 surface 给调用方（driver 打印，P2-2），
 /// 调用方经下一轮属主消息（revise 语义）续入对话（P1-2）。
 fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Option<String>> {
-    // key_file_paths 真实数据源（维护者重做）：converse 前快照 AGT 审计行数，
-    // converse 落定后增量提取本轮 allow read 宿主路径（确定性提取+去重）。
-    let audit_lines_before = alfred_planner::host::snapshot_audit_lines(&ctx.run_dir);
+    // key_file_paths 真实数据源（维护者重做）：从**持久审计基线**（上轮维护成功
+    // 后推进的行数）增量提取 allow read 宿主路径——崩溃/维护失败不丢行，跨进程
+    // 轮次间隙的审计行照常进下轮增量。
+    let audit_baseline = alfred_planner::host::read_audit_baseline(&ctx.run_dir);
     let owner_message = match &run.owner_message {
         Some(m) => m.clone(),
         None => alfred_planner::format_request_message(&run.request),
@@ -448,7 +456,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
             // AGT 审计 allow read 增量）+ key_conclusions（计划摘要）——下轮 converse
             // 即用上新记忆。
             let read_paths =
-                alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_lines_before);
+                alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
             maintain_after_converse(run, ctx, read_paths, &format_plan_reply(&dagspec))?;
             run.dagspec = Some(dagspec);
             run.apply(GovernanceEvent::PlanProduced)?;
@@ -473,7 +481,7 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
             )?;
             // ConverseDone 滚动维护：答复文本作为 reply_summary（key_conclusions 语义）。
             let read_paths =
-                alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_lines_before);
+                alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
             maintain_after_converse(run, ctx, read_paths, &reply)?;
             Ok(Some(reply))
         }

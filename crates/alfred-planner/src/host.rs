@@ -71,6 +71,32 @@ pub fn snapshot_audit_lines(run_dir: &Path) -> u64 {
     }
 }
 
+/// 审计提取基线文件（`<run>/planner/audit-baseline`：已提取到的行数）。
+///
+/// **持久基线**（不是内存里的"本轮开始时行数"）：基线只在维护成功后推进——
+/// converse 后进程崩溃/维护失败，行不丢（下轮补提取，维护者去重兜底）；跨
+/// driver 进程轮次间新落的审计行也照常进下一轮增量。首轮基线缺省 0。
+pub fn audit_baseline_path(run_dir: &Path) -> PathBuf {
+    run_dir.join(PLANNER_WORK_DIR).join("audit-baseline")
+}
+
+/// 读审计提取基线（缺文件 = 首轮 → 0）。
+pub fn read_audit_baseline(run_dir: &Path) -> u64 {
+    std::fs::read_to_string(audit_baseline_path(run_dir))
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// 推进审计提取基线（维护成功后调用）。
+pub fn write_audit_baseline(run_dir: &Path, consumed: u64) -> Result<()> {
+    let path = audit_baseline_path(run_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(&path, consumed.to_string()).with_context(|| format!("write {}", path.display()))
+}
+
 /// AGT 审计 JSONL 的单行记录（提取所需字段子集；宽进——多余字段忽略）。
 #[derive(serde::Deserialize)]
 struct AgtAuditLine {
