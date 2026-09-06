@@ -64,11 +64,12 @@ pub enum MaintainTrigger {
 /// review_summary（审计真源字段名不变）。alias 兼容维护者回写原字段名的形态。
 #[derive(serde::Deserialize)]
 struct MaintainedProjection {
-    #[serde(default)]
+    // 无 default（MaintainerAudit P2）：错形态 JSON（缺字段/误名）解析必须报错，
+    // 不许静默清空整份记忆——收割是唯一写入口，坏产出要可见。rename+alias 双名
+    // 兼容维护者回写原字段名 review_summary 的形态。
     key_file_paths: Vec<String>,
-    #[serde(default)]
     key_conclusions: Vec<String>,
-    #[serde(default, rename = "owner_feedback", alias = "review_summary")]
+    #[serde(rename = "owner_feedback", alias = "review_summary")]
     review_summary: Vec<String>,
 }
 
@@ -352,5 +353,33 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    /// 收割 schema 严格（MaintainerAudit P2）：错形态 JSON 缺任一字段 → 解析报错
+    /// 不静默清空；三字段齐（含 alias review_summary 双名）→ 正常解析。
+    #[test]
+    fn maintained_projection_rejects_missing_fields() {
+        // 缺 key_file_paths → 错（此前 default 静默清空整份记忆）
+        let missing = serde_json::from_str::<MaintainedProjection>(
+            r#"{"key_conclusions": [], "owner_feedback": []}"#,
+        );
+        assert!(missing.is_err(), "缺 key_file_paths 必须报错（不静默清空）");
+        // 缺 key_conclusions → 错
+        let missing2 = serde_json::from_str::<MaintainedProjection>(
+            r#"{"key_file_paths": [], "owner_feedback": []}"#,
+        );
+        assert!(missing2.is_err(), "缺 key_conclusions 必须报错");
+        // 三字段齐（owner_feedback 命名）→ 正常
+        let ok = serde_json::from_str::<MaintainedProjection>(
+            r#"{"key_file_paths": ["/a.rs"], "key_conclusions": ["用 Rust"], "owner_feedback": []}"#,
+        )
+        .expect("三字段齐应解析成功");
+        assert_eq!(ok.key_file_paths, vec!["/a.rs".to_string()]);
+        // alias：维护者回写磁盘真源字段名 review_summary 同样合法
+        let aliased = serde_json::from_str::<MaintainedProjection>(
+            r#"{"key_file_paths": [], "key_conclusions": [], "review_summary": ["属主反馈"]}"#,
+        )
+        .expect("alias review_summary 应解析成功");
+        assert_eq!(aliased.review_summary, vec!["属主反馈".to_string()]);
     }
 }
