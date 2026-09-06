@@ -332,16 +332,38 @@ ext = read(os.path.join(repo, "docker/agt/agt-policy.ts"))
 state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "completed", f"state={state['state_machine']['state']}"
 
-# 2) 四角色内置策略 byte 级落盘（无 ALFRED_AGT_DIR）
-roles = [
-    (os.path.join(run, "planner", "agt"), "docker/agt/planner/policy.json"),
-    (os.path.join(run, "plan-review", "agt"), "docker/agt/reviewer/policy.json"),
-    (os.path.join(run, "exec-1", "agt"), "docker/agt/executor/policy.json"),
-    (os.path.join(run, "exec-review", "agt"), "docker/agt/reviewer/policy.json"),
-]
-for agt_dir, asset in roles:
+# 2) 内置策略落盘断言分两层（宿主形态：planner/reviewer 策略占位符按 run
+#    渲染后不可 byte 比——照 Case A 注释；executor 无占位符仍 byte 级一致）：
+#    - executor：byte 级 == docker/agt 资产；
+#    - planner/reviewer：JSON 合法 + 占位符零残留 + 含渲染后真实路径。
+ext = read(os.path.join(repo, "docker/agt/agt-policy.ts"))
+byte_roles = [(os.path.join(run, "exec-1", "agt"), "docker/agt/executor/policy.json")]
+for agt_dir, asset in byte_roles:
     assert read(os.path.join(agt_dir, "policy.json")) == read(os.path.join(repo, asset)), \
         f"{agt_dir} 落盘策略 != docker/agt/{asset}"
+    assert read(os.path.join(agt_dir, "agt-policy.ts")) == ext, f"{agt_dir} 落盘扩展漂移"
+
+rendered_roles = [
+    (os.path.join(run, "planner", "agt"), "planner",
+     ["{run_dir}", "{run_dir_rel}", "{outputs_dir}", "{outputs_dir_rel}",
+      "{agt_work}", "{workspace_dir}", "{run_dir_pattern}",
+      "{agt_work_pattern}", "{outputs_redirect_allow}"],
+     [run]),
+    (os.path.join(run, "plan-review", "agt"), "reviewer",
+     ["{outputs_dir}", "{outputs_redirect_allow}"],
+     [os.path.join(run, "plan-review", "outputs")]),
+    (os.path.join(run, "exec-review", "agt"), "reviewer",
+     ["{outputs_dir}", "{outputs_redirect_allow}"],
+     [os.path.join(run, "exec-review", "outputs")]),
+]
+for agt_dir, role, placeholders, must_contain in rendered_roles:
+    p = os.path.join(agt_dir, "policy.json")
+    text = open(p, encoding="utf-8").read()
+    json.loads(text)
+    for token in placeholders:
+        assert token not in text, f"{role} 策略占位符未渲染: {token}"
+    for want in must_contain:
+        assert want in text, f"{role} 策略未含渲染后路径 {want}"
     assert read(os.path.join(agt_dir, "agt-policy.ts")) == ext, f"{agt_dir} 落盘扩展漂移"
 
 # 3) executor 容器审计含 allow（真实 write 工具调用被 AGT 求值并放行）
