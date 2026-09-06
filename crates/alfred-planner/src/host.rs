@@ -430,14 +430,13 @@ fn render_planner_policy(
         regex_escape(&out_abs),
         regex_escape(&out_rel),
     );
-    // - 真实 run 目录（绝对/相对双形态）在命令文本中出现即拦
+    // - 真实 run 目录（绝对/相对双形态）在命令文本中出现即拦（含 planner/agt
+    //   工作目录——run 目录子路径，无需单列）。
     let run_dir_pattern = format!(
         r#"(?:{}|{})"#,
         regex_escape(&run_abs),
         regex_escape(&run_rel),
     );
-    // - AGT 工作目录（策略/审计不可触碰；绝对形态 + 通用 .agt/ 兜底）
-    let agt_work_pattern = format!(r#"(?:{}|\.agt/)"#, regex_escape(&agt_work));
 
     let json = |s: &str| -> String {
         serde_json::to_string(s)
@@ -449,7 +448,6 @@ fn render_planner_policy(
     Ok(policy
         .replace("{outputs_redirect_allow}", &json(&outputs_redirect_allow))
         .replace("{run_dir_pattern}", &json(&run_dir_pattern))
-        .replace("{agt_work_pattern}", &json(&agt_work_pattern))
         .replace("{run_dir_rel}", &json(&run_rel))
         .replace("{run_dir}", &json(&run_abs))
         .replace("{outputs_dir_rel}", &json(&out_rel))
@@ -536,7 +534,7 @@ mod tests {
         for token in [
             "{run_dir}", "{run_dir_rel}", "{outputs_dir}", "{outputs_dir_rel}",
             "{agt_work}", "{workspace_dir}", "{run_dir_pattern}",
-            "{agt_work_pattern}", "{outputs_redirect_allow}",
+            "{outputs_redirect_allow}",
             "__RUNS_DIR__", "__OUTPUTS_DIR__", "__AGT_WORK__", "__WORKSPACE_DIR__",
         ] {
             assert!(!rendered.contains(token), "占位符未渲染: {token}");
