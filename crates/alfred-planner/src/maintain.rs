@@ -75,10 +75,25 @@ struct MaintainedProjection {
 
 impl MaintainedProjection {
     fn into_session_doc(self) -> SessionDoc {
+        // 禁词回流封堵（MaintainerAudit P2，真跑实证"否决"进 key_conclusions）：
+        // 收割是会话文档唯一写入口——维护者 LLM 产出可能夹带结构化审查词，逐段
+        // 复用 disguise 既有管线（neutralize → 残留禁词回退中性模板）后落盘，
+        // 保证磁盘真源三段零禁词（converse 投影层 sanitize 只是第二道，不是
+        // 唯一防线）。key_file_paths 同查：路径含禁词（如 …/review/x.md）同样
+        // 回退中性模板——回流封堵不设免检面。
+        let mut key_file_paths = self.key_file_paths;
+        crate::disguise::sanitize_review_summary(&mut key_file_paths);
+        let mut key_conclusions = self.key_conclusions;
+        for c in key_conclusions.iter_mut() {
+            *c = crate::disguise::neutralize_review_language(c);
+        }
+        crate::disguise::sanitize_review_summary(&mut key_conclusions);
+        let mut review_summary = self.review_summary;
+        crate::disguise::sanitize_review_summary(&mut review_summary);
         SessionDoc {
-            key_file_paths: self.key_file_paths,
-            key_conclusions: self.key_conclusions,
-            review_summary: self.review_summary,
+            key_file_paths,
+            key_conclusions,
+            review_summary,
         }
     }
 }
@@ -381,5 +396,41 @@ mod tests {
         )
         .expect("alias review_summary 应解析成功");
         assert_eq!(aliased.review_summary, vec!["属主反馈".to_string()]);
+    }
+
+    /// 禁词回流封堵（MaintainerAudit P2）：维护者产出夹带结构化审查词 → 收割
+    /// 时 neutralize，残留禁词回退中性模板——key_conclusions/key_file_paths/
+    /// review_summary 三段都查，落盘真源零禁词。
+    #[test]
+    fn harvest_scrubs_forbidden_language_all_sections() {
+        let p = MaintainedProjection {
+            key_file_paths: vec!["/ws/src/main.rs".into(), "/ws/评审记录/x.md".into()],
+            key_conclusions: vec![
+                "技术选型用 Rust".into(),
+                "方案被否决：规划器要重做".into(),
+            ],
+            review_summary: vec!["审查未通过".into()],
+        };
+        let doc = p.into_session_doc();
+        for (seg, entries) in [
+            ("key_file_paths", &doc.key_file_paths),
+            ("key_conclusions", &doc.key_conclusions),
+            ("review_summary", &doc.review_summary),
+        ] {
+            for e in entries {
+                assert!(
+                    crate::disguise::contains_forbidden_signal(e).is_none(),
+                    "{seg} 段禁词回流：{e}"
+                );
+            }
+        }
+        // neutralize 保语义（非全量替换）："否决"→"不行" 留在原句
+        assert!(
+            doc.key_conclusions.iter().any(|c| c.contains("不行")),
+            "中和后语义保留：{:?}",
+            doc.key_conclusions
+        );
+        // 干净条目原样透传（不误伤）
+        assert!(doc.key_file_paths.contains(&"/ws/src/main.rs".to_string()));
     }
 }
