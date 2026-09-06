@@ -66,7 +66,7 @@ Owner (human)
 | crate | responsibility |
 |---|---|
 | `alfred-core` | Shared cross-crate entities (single source of truth): OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc + the **governance state machine** (`governance.rs`, §3.3 routing table in code) |
-| `alfred-planner` | Planner (converse graph-building / disguise rejection; maintain session-doc **pending redo** — half-implementation rolled back); in-container pi conversation agent (bridge-relayed LLM) with `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
+| `alfred-planner` | Planner (converse graph-building / disguise rejection / **maintain session-doc maintainer** — host pi rolling maintenance, see below); host pi conversation agent (cwd=project root, run-level pi-config model, AGT unaware policy), `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
 | `alfred-executor` | Execution side: generates the Inspect container-management driver (`driver.py`, not an eval Task), the sandbox compose, spawn/poll the driver (done record), artifact collection, config loading |
 | `alfred-reviewer` | Review side: plan/exec review both run in a dedicated reviewer container (driver.py in-container pi, judging fidelity → PlanVerdict / acceptance → ExecVerdict) |
 | `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal) + real `alfred` bin (codux-schedulable CLI driver: run/feed/status, consumes leading `--append-system-prompt`; the injected project context is appended to the planner pi's system prompt) |
@@ -180,13 +180,25 @@ Tiered routing (§3.3, all six rows in code):
 - **Disguised rejection (P7)**: the plan-review reason is rewritten into an
   owner-voice message (a forbidden-signal check rejects review/verdict/否决/打回
   etc.) before it is fed back to the planner for replanning.
-- **Session document (P6, maintainer pending redo)**: the original `maintain`
-  updated the three-section SessionDoc (key_file_paths / key_conclusions /
-  review_summary) at ① plan-review conclusion and ② owner-supplement —
-  **that half-implementation has been rolled back** (to be redone under the new
-  architecture: host pi + periodic + real data sources); the SessionDoc schema is
-  kept, the projection fed to the planner is neutralized (`review_summary` →
-  `owner_feedback`, forbidden-signal scrubbed), and the doc is currently always empty.
+- **Session-document maintainer (P6, redone: host pi + rolling maintenance + real
+  data sources)**: the maintainer is a host pi agent (`maintain.rs`, following the
+  converse host.rs pattern: cwd=project root, run-level pi-config single model
+  source, AGT write/read interception over run governance artifacts — a planner-side
+  component under the same unawareness constraint); its output is harvested from
+  `<run>/planner/outputs/session.json`. **Rolling triggers**: ① after every converse
+  round settles (ConverseDone: key_file_paths + key_conclusions, available to the
+  next converse round); ② after a plan-review rejection settles (PlanReviewed: the
+  review reason is rewritten into owner-voice via `disguise_rejection` before it
+  enters review_summary). **Real source for key_file_paths**: the orchestrator
+  extracts this round's allowed reads (host paths) incrementally from the AGT audit
+  (persistent baseline `<run>/planner/audit-baseline`, advanced only after successful
+  maintenance; **deny records are never extracted** — deny paths leak the governance
+  surface); the maintainer LLM decides which are key. The maintainer works in the
+  projected space (owner_feedback naming + scrubbing); the on-disk field name
+  review_summary is unchanged; the projection fed to the planner stays neutralized
+  (`review_summary` → `owner_feedback`). Offline: identity passthrough or injection
+  via `ALFRED_MAINTAIN_OFFLINE_FILE` (e2e r6b caseH asserts rolling semantics, data
+  source, disguise projection, and unawareness).
 
 ---
 

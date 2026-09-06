@@ -142,8 +142,13 @@ fn trigger_payload_section(trigger: &MaintainTrigger) -> String {
 
 /// 运行维护者一轮：喂当前会话文档 + 触发载荷 → 收割更新后的 SessionDoc。
 ///
-/// 宿主 pi 短会话（AGT 拦写+拦读同 converse——维护者同受不可知约束）；收割
-/// `session.json` 必须存在且为合法 SessionDoc（无静默出口）；llm-calls 落盘
+/// **离线**（`ALFRED_OFFLINE=1` 或 `ALFRED_MAINTAIN_OFFLINE=1`）：确定性直通——
+/// 不跑 pi，收割注入文件 `ALFRED_MAINTAIN_OFFLINE_FILE`（更新后的完整会话文档
+/// JSON）作为维护产出（e2e 离线回归；llm-calls 照落 transport=offline 记录，
+/// prompt/触发载荷断言面与真跑同构）。不设注入文件 → 显式报错（不静默）。
+///
+/// 真 LLM：宿主 pi 短会话（AGT 拦写+拦读同 converse——维护者同受不可知约束）；
+/// 收割 `session.json` 必须存在且为合法会话文档（无静默出口）；llm-calls 落盘
 /// （role=maintain）。维护失败显式报错——记忆坏了要可见，不悄悄放行。
 pub fn run_maintain(
     opts: &PlannerHostOptions,
@@ -151,7 +156,9 @@ pub fn run_maintain(
     doc: &SessionDoc,
     trigger: &MaintainTrigger,
 ) -> Result<SessionDoc> {
-    if model.raw_id {
+    let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
+        || std::env::var("ALFRED_MAINTAIN_OFFLINE").as_deref() == Ok("1");
+    if !offline && model.raw_id {
         bail!(
             "maintainer host pi requires an openai-compatible provider model, got raw builtin model '{}'",
             model.model
@@ -171,11 +178,6 @@ pub fn run_maintain(
         Err(e) => return Err(e).with_context(|| format!("remove stale {}", MAINTAIN_OUTPUT_FILE)),
     }
 
-    // AGT 拦截层 + run 级 pi 配置（converse 同款单一真源）。
-    let agt_ext = prepare_host_agt(&work, &opts.agt, &outputs_dir, &opts.project_root)?;
-    let pi_config_dir = work.join(PI_CONFIG_DIR);
-    write_pi_config(&pi_config_dir, model)?;
-
     // prompt（stdin）= 当前会话文档（**投影空间**：owner_feedback 命名+净化——
     // 维护者字面零禁词，同 converse 投影）+ 本轮触发载荷。
     let projection = project_session_doc(doc);
@@ -184,26 +186,48 @@ pub fn run_maintain(
     let payload = trigger_payload_section(trigger);
     let prompt = format!("当前会话文档：\n{session}\n\n{payload}");
 
-    let system_prompt = format!(
-        "{}{}",
-        MAINTAIN_SYSTEM_PROMPT,
-        maintain_output_section(&outputs_dir)
-    );
-
-    let _pi_stdout = spawn_planner_pi(
-        opts,
-        model,
-        &work,
-        &pi_config_dir,
-        agt_ext.as_deref(),
-        &system_prompt,
-        &prompt,
-    )?;
-
-    // 收割：session.json 必须存在且解析为合法会话文档（无静默出口）。
-    let text = std::fs::read_to_string(&out_path).with_context(|| {
-        format!("maintainer produced no {MAINTAIN_OUTPUT_FILE} (pi stdout: {_pi_stdout})")
-    })?;
+    let (text, offline, transport) = if offline {
+        match std::env::var("ALFRED_MAINTAIN_OFFLINE_FILE") {
+            // 离线注入：收割注入文件（e2e 从记录断言滚动/disguise 语义）。
+            Ok(path) => (
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("read offline maintain output {path}"))?,
+                true,
+                "offline",
+            ),
+            // 离线无注入：恒等直通（文档不变；与 converse 离线直通同构——
+            // llm-calls 记录喂=产，审计链完整，无静默失败）。
+            Err(_) => (
+                serde_json::to_string_pretty(&projection).context("serialize identity maintain")?,
+                true,
+                "offline",
+            ),
+        }
+    } else {
+        // AGT 拦截层 + run 级 pi 配置（converse 同款单一真源）。
+        let agt_ext = prepare_host_agt(&work, &opts.agt, &outputs_dir, &opts.project_root)?;
+        let pi_config_dir = work.join(PI_CONFIG_DIR);
+        write_pi_config(&pi_config_dir, model)?;
+        let system_prompt = format!(
+            "{}{}",
+            MAINTAIN_SYSTEM_PROMPT,
+            maintain_output_section(&outputs_dir)
+        );
+        let pi_stdout = spawn_planner_pi(
+            opts,
+            model,
+            &work,
+            &pi_config_dir,
+            agt_ext.as_deref(),
+            &system_prompt,
+            &prompt,
+        )?;
+        // 收割：session.json 必须存在且解析为合法会话文档（无静默出口）。
+        let text = std::fs::read_to_string(&out_path).with_context(|| {
+            format!("maintainer produced no {MAINTAIN_OUTPUT_FILE} (pi stdout: {pi_stdout})")
+        })?;
+        (text, false, "host_pi")
+    };
     if text.trim().is_empty() {
         bail!("maintainer produced empty {MAINTAIN_OUTPUT_FILE}");
     }
@@ -217,12 +241,11 @@ pub fn run_maintain(
         ts: alfred_core::util::now_rfc3339(),
         role: "maintain".into(),
         model: model.inspect_model_id(),
-        offline: false,
-        transport: "host_pi".into(),
-        messages: vec![
-            ChatMessage::system(system_prompt),
-            ChatMessage::user(prompt),
-        ],
+        offline,
+        transport: transport.to_string(),
+        // system prompt 不进审计（converse 同范式：记录 user 载荷即可——
+        // system 是静态 schema 文本，真跑路径已含产出规则）。
+        messages: vec![ChatMessage::system(String::new()), ChatMessage::user(prompt)],
         response: text.trim().to_string(),
         ok: true,
         error: None,

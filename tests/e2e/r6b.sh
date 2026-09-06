@@ -164,27 +164,50 @@ assert state["state_machine"]["state"] == "escalated", f"state={state['state_mac
 PY
   echo "PASS(caseA): 离线 converse 产物（dagspec/llm-calls/conversation.json）+ 审查出错升级"
 
-  # ---- Case B：feed revise 属主补充（维护者已回退——会话文档保持空文档语义）----
-  echo "[r6b] caseB: driver feed revise（属主补充 → owner_message 设入，session_doc 保持空） ..."
+  # ---- Case B：feed revise 属主补充（维护者已重做：ConverseDone 滚动维护——
+  # 重规划轮 converse 落定后维护者更新 session_doc；离线经
+  # ALFRED_MAINTAIN_OFFLINE_FILE 注入更新后文档）----
+  echo "[r6b] caseB: driver feed revise（属主补充 → 重规划 → ConverseDone 滚动维护） ..."
   MSG_FILE="$CASE_A/owner-msg.txt"
   cat > "$MSG_FILE" <<'TXT'
 技术选型用 Rust
 TXT
+  # 维护者离线注入：重规划轮维护者产出（滚动累积：key_conclusions 吸收属主补充）
+  cat > "$CASE_A/maintained.json" <<'JSON'
+{
+  "key_file_paths": [],
+  "key_conclusions": ["技术选型用 Rust"],
+  "owner_feedback": []
+}
+JSON
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_A/plan-faithful.json" \
+  ALFRED_MAINTAIN_OFFLINE_FILE="$CASE_A/maintained.json" \
   cargo run --quiet -p alfred-cli --bin alfred -- feed \
     --run-dir "$CASE_A" \
     --decision revise \
     --message "$MSG_FILE"
 
-  python3 - "$CASE_A" <<'PY' || { echo "FAIL(caseB): feed revise 空文档语义断言" >&2; exit 1; }
+  python3 - "$CASE_A" <<'PY' || { echo "FAIL(caseB): feed revise 滚动维护断言" >&2; exit 1; }
 import json, os, sys
 run = sys.argv[1]
 state = json.load(open(os.path.join(run, "state.json")))
-# 维护者已回退（待新架构重做）：会话文档保持空文档，owner_message 照常设入
-assert state["session_doc"] == {"key_file_paths": [], "key_conclusions": [], "review_summary": []}, \
-    f"session_doc={state['session_doc']}"
+# 维护者已重做：重规划轮 ConverseDone 维护把属主补充固化进 key_conclusions
+assert state["session_doc"]["key_conclusions"] == ["技术选型用 Rust"], \
+    f"key_conclusions={state['session_doc']['key_conclusions']}"
 assert state["owner_message"] == "技术选型用 Rust", "owner_message not updated"
+# maintain llm-calls 记录：role=maintain + offline 直通 + 触发载荷含探查/产出摘要段
+recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
+maintain = [r for r in recs
+            if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "maintain"]
+assert maintain, f"no maintain llm-call record: {recs}"
+rec = json.load(open(os.path.join(run, "llm-calls", maintain[-1])))
+assert rec["offline"] is True and rec["transport"] == "offline", \
+    f"offline={rec['offline']} transport={rec['transport']}"
+user = rec["messages"][-1]["content"]
+assert "本轮探查读过" in user, "maintain prompt missing read-paths section"
+assert "本轮对话产出摘要" in user, "maintain prompt missing reply-summary section"
 PY
+  echo "PASS(caseB): feed revise → ConverseDone 滚动维护（key_conclusions 固化属主补充 + maintain llm-calls 记录）"
   # ---- Case C：P1-2 Reply 多轮续入（规划器答复 → state=Planning → decide revise 续入 → 重规划）----
   # 规划器第一轮先答复属主（不产计划，§2.4 Reply 分支）→ 状态停 Planning（对话继续）；
   # 属主经 `driver feed --decision revise --message <回答>` 从 Planning 态续入下一轮
@@ -261,8 +284,17 @@ assert "技术选型确认" in conv["turns"][1]["content"], f"reply content={con
 PY
   echo "PASS(caseC1): Reply 分支 → Planning（对话继续）"
 
-  echo "[r6b] caseC: driver feed revise（Planning 态续入属主答复 → 重规划） ..."
+  echo "[r6b] caseC: driver feed revise（Planning 态续入属主答复 → 重规划 + 滚动维护） ..."
+  # 维护者离线注入：续入轮维护者产出（key_conclusions 吸收属主答复）
+  cat > "$CASE_C/maintained.json" <<'JSON'
+{
+  "key_file_paths": [],
+  "key_conclusions": ["技术选型确认：用 Rust"],
+  "owner_feedback": []
+}
+JSON
   ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_C/plan-faithful.json" \
+  ALFRED_MAINTAIN_OFFLINE_FILE="$CASE_C/maintained.json" \
   cargo run --quiet -p alfred-cli --bin alfred -- feed \
     --run-dir "$CASE_C" \
     --decision revise \
@@ -276,8 +308,8 @@ state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
 # owner_message = 属主答复（decide revise 设入）
 assert state["owner_message"] == "可以，技术选型用 Rust。", f"owner_message={state['owner_message']}"
-# 维护者已回退：会话文档保持空文档（属主答复只设 owner_message，不进 key_conclusions）
-assert state["session_doc"]["key_conclusions"] == [], \
+# 维护者已重做：续入轮 ConverseDone 维护把属主答复固化进 key_conclusions
+assert state["session_doc"]["key_conclusions"] == ["技术选型确认：用 Rust"], \
     f"key_conclusions={state['session_doc']['key_conclusions']}"
 # conversation.json：request.submit → converse.reply(规划器提问) → owner.message(属主答复) → converse.reply(重规划)
 conv = json.load(open(os.path.join(run, "conversation.json")))
@@ -636,6 +668,216 @@ for r in converse:
     assert memory in system, f"{r}: 注入内存标记未透传: {system!r}"
 PY
   echo "PASS(caseG2): feed --append-system-prompt → 新一轮 converse system prompt 含注入内存 + 基础 schema"
+
+  # ---- Case H：维护者重做全链路（滚动维护 + key_file_paths 审计数据源 +
+  #      PlanReviewed disguise 投影 + 不可知断言）----
+  # H1 轮1：run（Reply 分支）→ ConverseDone 维护（审计注入 2 条 allow read →
+  #    key_file_paths 吸收；key_conclusions 吸收答复摘要）；含 1 条 deny read +
+  #    1 条 allow write（deny 路径不进 key_file_paths——不可知：deny 路径泄露治理面）。
+  # H2 轮2：feed revise（重规划）→ ConverseDone 维护（滚动累积，不清空轮1条目）。
+  # H3 审查后：计划审查拒绝（空 workspace_subdirs）→ PlanReviewed 维护——审查
+  #    理由经 disguise 投影进 review_summary（属主口吻，无禁词）；维护者 prompt
+  #    零 reviewer 痕迹。
+  CASE_H="$R6B_RUNS/run-r6b-maintainer-rolling"
+  rm -rf "$CASE_H"
+  mkdir -p "$CASE_H"
+  cat > "$CASE_H/request.json" <<'JSON'
+{
+  "id": "req-r6b-h1",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+  "created_at": "2026-09-01T00:00:00Z"
+}
+JSON
+  # 审计增量（维护者 key_file_paths 真实数据源——离线下由测试预写模拟 planner
+  # 宿主 pi 真实读过的宿主路径；deny 记录的路径必须被过滤）：
+  AGT_DIR="$CASE_H/planner/agt/audit"
+  mkdir -p "$AGT_DIR"
+  cat > "$AGT_DIR/audit.jsonl" <<'JSONL'
+{"ts":"2026-09-01T00:00:01Z","tool_name":"read","path":"/tmp/r6b-h-src/main.rs","decision":"allow","rule":null,"reason":"default_action=allow"}
+{"ts":"2026-09-01T00:00:02Z","tool_name":"read","path":"/tmp/r6b-h-src/README.md","decision":"allow","rule":null,"reason":"default_action=allow"}
+{"ts":"2026-09-01T00:00:03Z","tool_name":"read","path":"/tmp/r6b-h-run/state.json","decision":"deny","rule":"deny-governance-files","reason":"路径不在允许的工作范围"}
+{"ts":"2026-09-01T00:00:04Z","tool_name":"write","path":"/tmp/r6b-h-run/planner/outputs/reply.txt","decision":"allow","rule":null,"reason":"default_action=allow"}
+JSONL
+  cat > "$CASE_H/reply.txt" <<'TXT'
+收到需求。技术选型确认一下：内容用 Rust 实现，可以吗？
+TXT
+  # H1 维护者离线注入（模拟维护者 LLM 产出：轮1 key_file_paths 收 allow read
+  # 的宿主路径，不含 deny 的 state.json；reply 写路径不算 read——正确被排除）
+  cat > "$CASE_H/maintained-1.json" <<'JSON'
+{
+  "key_file_paths": ["/tmp/r6b-h-src/main.rs", "/tmp/r6b-h-src/README.md"],
+  "key_conclusions": [],
+  "owner_feedback": []
+}
+JSON
+  # H2 重规划用忠实计划（workspace_subdirs=["src"]；H3 复用 run1 落的 dagspec 语义）
+  cat > "$CASE_H/plan-faithful.json" <<'JSON'
+{
+  "request_id": "req-r6b-h1",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": ["src"]
+      }
+    }
+  ]
+}
+JSON
+  echo "[r6b] caseH1: driver run（Reply 分支 → ConverseDone 维护，key_file_paths 吸收 allow read 宿主路径） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_H/reply.txt" \
+  ALFRED_MAINTAIN_OFFLINE_FILE="$CASE_H/maintained-1.json" \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
+    --request "$CASE_H/request.json" \
+    --run-dir "$CASE_H" \
+    --time-limit 60 \
+    --review-time-limit 60 \
+    --planner-time-limit 60
+
+  python3 - "$CASE_H" <<'PY' || { echo "FAIL(caseH1): 滚动维护轮1断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+doc = state["session_doc"]
+# key_file_paths = AGT 审计 allow read 的宿主路径（deny 的 state.json 与 write 的
+# reply.txt 都不进——不可知：deny 路径泄露治理面）
+assert sorted(doc["key_file_paths"]) == ["/tmp/r6b-h-src/README.md", "/tmp/r6b-h-src/main.rs"], \
+    f"key_file_paths={doc['key_file_paths']}"
+assert doc["review_summary"] == [], f"review_summary={doc['review_summary']}"
+# 持久审计基线已推进到 4 行（维护成功后推进）
+baseline = open(os.path.join(run, "planner", "audit-baseline")).read().strip()
+assert baseline == "4", f"audit-baseline={baseline}"
+# maintain llm-calls 记录：user 载荷含"本轮探查读过"清单 = 2 条 allow read 路径，
+# 无 deny 路径 state.json、无 deny 语义（不可知）
+recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
+maintain = [r for r in recs
+            if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "maintain"]
+assert len(maintain) == 1, f"expect 1 maintain record, got {maintain}"
+rec = json.load(open(os.path.join(run, "llm-calls", maintain[0])))
+user = rec["messages"][-1]["content"]
+assert "/tmp/r6b-h-src/main.rs" in user and "/tmp/r6b-h-src/README.md" in user, \
+    f"maintain prompt missing allow-read paths: {user}"
+assert "state.json" not in user, f"maintain prompt leaked deny path: {user}"
+assert "reply.txt" not in user, f"maintain prompt leaked write path: {user}"
+PY
+  echo "PASS(caseH1): ConverseDone 维护轮1（allow read 宿主路径进 key_file_paths，deny/write 过滤，基线推进）"
+
+  # H2 轮2：feed revise 续入（重规划）→ ConverseDone 维护（滚动累积：轮1的
+  # key_file_paths 保留 + key_conclusions 新增；审计基线后新增 1 条 allow read）
+  cat >> "$AGT_DIR/audit.jsonl" <<'JSONL'
+{"ts":"2026-09-01T00:01:00Z","tool_name":"read","path":"/tmp/r6b-h-src/Cargo.toml","decision":"allow","rule":null,"reason":"default_action=allow"}
+JSONL
+  # H2 维护者离线注入（维护者 LLM 一轮产出：滚动累积 + review_summary 吸收伪装反馈）
+  cat > "$CASE_H/maintained-2.json" <<'JSON'
+{
+  "key_file_paths": ["/tmp/r6b-h-src/main.rs", "/tmp/r6b-h-src/README.md", "/tmp/r6b-h-src/Cargo.toml"],
+  "key_conclusions": ["技术选型确认：用 Rust"],
+  "owner_feedback": ["我重新看了下需求，你给的方案跟我要的不太对。你再按我原来的需求重新弄一版，别想当然。"]
+}
+JSON
+  cat > "$CASE_H/answer.txt" <<'TXT'
+可以，技术选型用 Rust。
+TXT
+  # 不忠实计划（空 workspace_subdirs → 计划审查结构闸门拒绝 → PlanReviewed 维护）
+  cat > "$CASE_H/plan-unfaithful.json" <<'JSON'
+{
+  "request_id": "req-r6b-h1",
+  "nodes": [
+    {
+      "id": "task-1",
+      "summary": "create hello.txt with content Hello",
+      "contract": {
+        "prompt": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+        "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+        "reviewer_models": []
+      },
+      "sandbox": {
+        "volumes": [],
+        "runtime": null,
+        "packages": [],
+        "network": false,
+        "workspace_subdirs": []
+      }
+    }
+  ]
+}
+JSON
+  # H2 注入**不忠实计划**（空 workspace_subdirs）：converse 落定 → ConverseDone
+  # 维护（滚动累积）→ 计划审查结构闸门 pass=false → PlanReviewed 维护（审查理由
+  # disguise 投影进 review_summary）→ PlanRejected 挂起。一步覆盖两个触发点。
+  echo "[r6b] caseH2: driver feed revise（重规划 → ConverseDone 维护 + 审查拒绝 → PlanReviewed 维护 → PlanRejected） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_H/plan-unfaithful.json" \
+  ALFRED_MAINTAIN_OFFLINE_FILE="$CASE_H/maintained-2.json" \
+  cargo run --quiet -p alfred-cli --bin alfred -- feed \
+    --run-dir "$CASE_H" \
+    --decision revise \
+    --message "$CASE_H/answer.txt"
+
+  python3 - "$CASE_H" <<'PY' || { echo "FAIL(caseH2): 滚动维护+PlanReviewed 断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+doc = state["session_doc"]
+# 审查拒绝（空 workspace_subdirs 结构闸门）→ PlanRejected 挂起
+assert state["state_machine"]["state"] == "plan_rejected", \
+    f"state={state['state_machine']['state']}"
+# ConverseDone 滚动累积：轮1 路径保留 + 轮2 新增 Cargo.toml；key_conclusions 固化属主答复
+assert sorted(doc["key_file_paths"]) == [
+    "/tmp/r6b-h-src/Cargo.toml", "/tmp/r6b-h-src/README.md", "/tmp/r6b-h-src/main.rs"], \
+    f"key_file_paths={doc['key_file_paths']}"
+assert doc["key_conclusions"] == ["技术选型确认：用 Rust"], \
+    f"key_conclusions={doc['key_conclusions']}"
+# PlanReviewed 维护：review_summary 落伪装转写（属主口吻，无禁词）
+assert doc["review_summary"], f"review_summary empty: {doc}"
+for entry in doc["review_summary"]:
+    forbidden = ["reject", "verdict", "review", "reviewer", "scorer", "score",
+                 "grader", "eval", "unscored", "审查", "评审", "评分", "评估",
+                 "打分", "否决", "打回", "判定"]
+    hits = [w for w in forbidden if w in entry.lower()]
+    assert not hits, f"review_summary 含禁词 {hits}: {entry}"
+# 基线推进到 5 行
+baseline = open(os.path.join(run, "planner", "audit-baseline")).read().strip()
+assert baseline == "5", f"audit-baseline={baseline}"
+# 轮内顺序 = converse 先、维护后：本轮 converse prompt 应含**上一轮**维护的
+# key_file_paths（滚动语义——轮1的 main.rs/README.md 在轮2 converse 可见）；
+# 本轮维护新增的 Cargo.toml 落在 converse 之后（上方 state.json 断言已覆盖）。
+recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
+converse = [r for r in recs
+            if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "converse"]
+last = json.load(open(os.path.join(run, "llm-calls", converse[-1])))
+user = last["messages"][-1]["content"]
+assert "/tmp/r6b-h-src/main.rs" in user and "/tmp/r6b-h-src/README.md" in user, \
+    "下轮 converse 未看到上一轮维护的 key_file_paths（滚动语义破坏）"
+assert "owner_feedback" in user, "投影缺 owner_feedback 字段名"
+assert "review_summary" not in user, "converse 输入泄露磁盘字段名 review_summary"
+# PlanReviewed 轮的维护者 user 载荷 = 伪装后的属主口吻反馈。禁词标准与 r3
+# caseF 伪装断言一致（结构化否决信号——disguise_rejection 的中和面）；
+# workspace_subdirs 属计划 schema 字段名（计划技术语义），非审查者痕迹，
+# 不在 disguise 禁词表（与 feed_owner_message 伪装消息同一产物、同一标准）。
+maintain = [r for r in recs
+            if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "maintain"
+            and "属主对本轮方案的反馈" in json.load(open(os.path.join(run, "llm-calls", r)))["messages"][-1]["content"]]
+assert maintain, "无 PlanReviewed 载荷的 maintain 记录"
+rec = json.load(open(os.path.join(run, "llm-calls", maintain[-1])))
+user = rec["messages"][-1]["content"]
+assert "属主对本轮方案的反馈" in user, f"PlanReviewed 载荷缺失: {user}"
+forbidden = ["verdict", "review", "reviewer", "审查", "评审", "否决", "打回", "评分"]
+hits = [w for w in forbidden if w in user.lower()]
+assert not hits, f"维护者 prompt 泄露审查语义 {hits}: {user}"
+PY
+  echo "PASS(caseH2): 重规划轮 ConverseDone 滚动累积 + PlanReviewed disguise 维护（零审查语义泄露）+ PlanRejected"
 
   unset ALFRED_CONFIG
 

@@ -51,7 +51,7 @@ alfred 是一个最小可运行（working skeleton）的 AI 代理治理系统�
 | crate | 职责 |
 |---|---|
 | `alfred-core` | 跨组件共享实体（唯一真源）：OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc + **治理环状态机**（`governance.rs`，§3.3 路由表落码） |
-| `alfred-planner` | 规划器（converse 建图 / 打回伪装 disguise；maintain 会话文档维护**待重做**——半实现已回退）；容器内 pi 对话 agent（桥代发 LLM），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
+| `alfred-planner` | 规划器（converse 建图 / 打回伪装 disguise / **maintain 会话文档维护者**——宿主 pi 滚动维护，见下）；宿主 pi 对话 agent（cwd=项目根，run 级 pi-config 模型，AGT 不可知策略），llm-calls/ 落盘；`ALFRED_OFFLINE=1` 离线确定性直通 |
 | `alfred-reviewer` | 审查侧：计划/执行审查都在独立 reviewer 容器内完成（driver.py 容器 pi，判忠实度 PlanVerdict / 验收 ExecVerdict） |
 | `alfred-cli` | 治理环库驱动（`governance::run_governance_loop` / `feed_owner_message` / `init_governance_run` / `build_governance_context`）+ 真实 `alfred` bin（**owner 持续会话入口 `chat`**：需求收集/对话路由/拍板/断点恢复的确定性 REPL，codux 调度的常驻会话进程）+ codux 可调度 CLI driver：run/feed/status（脚本/e2e 技术接口，消费前置 `--append-system-prompt`，注入的项目上下文追加到 planner pi 系统提示） |
 
@@ -180,11 +180,19 @@ Planning → PlanReviewing → Executing → ExecReviewing
 - **审查本身出错**（unscored / driver error）→ 升级属主，不悄悄放行。
 - **打回伪装（P7）**：计划审查打回的 reason 被转写为属主口吻消息（禁词检查：
   reject/verdict/审查/打回 等结构化信号不得出现），再喂给规划器重规划。
-- **会话文档（P6，维护者待重做）**：原 maintain 在 ① 计划审查结论落定、
-  ② 属主补充新需求 两时机更新 SessionDoc 三段（key_file_paths / key_conclusions /
-  review_summary）——**该半实现已回退**（新架构下重做：宿主 pi + 定期 + 真实数据源）；
-  SessionDoc schema 保留，喂给规划器时投影中性化（review_summary → owner_feedback，
-  禁词净化），当前恒为空文档。
+- **会话文档维护者（P6，已重做：宿主 pi + 滚动维护 + 真实数据源）**：维护者 =
+  宿主 pi agent（`maintain.rs`，照 converse host.rs 范式：cwd=项目根、run 级
+  pi-config 模型单源、AGT 拦写+拦读 run 治理产物——planner 侧组件同受不可知），
+  产出收割 `<run>/planner/outputs/session.json`。**滚动触发**：① 每轮 converse
+  落定后（ConverseDone：key_file_paths + key_conclusions，下轮 converse 即用上）；
+  ② 计划审查拒绝落定后（PlanReviewed：审查理由经 `disguise_rejection` 转写为
+  属主口吻后进 review_summary）。**key_file_paths 真实数据源**：编排器从 AGT
+  审计增量提取本轮 allow read 的宿主路径（持久基线 `<run>/planner/audit-baseline`
+  只在维护成功后推进；**deny 记录不提取**——deny 路径泄露治理面），维护者 LLM
+  判关键性落盘。维护者在投影空间工作（owner_feedback 命名+净化），磁盘真源
+  字段名 review_summary 不变；喂规划器时投影中性化（review_summary →
+  owner_feedback）。离线：恒等直通或 `ALFRED_MAINTAIN_OFFLINE_FILE` 注入
+  （e2e r6b caseH 断言滚动语义/数据源/disguise 投影/不可知）。
 
 ---
 
