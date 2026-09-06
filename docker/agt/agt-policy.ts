@@ -55,6 +55,10 @@ export interface PolicyRule {
   condition?: string;
   /** AGT Claude Code 式命令正则黑名单（仅对 bash 类工具的 command 生效）。 */
   command_patterns?: Array<{ source: string; flags?: string }>;
+  /** 路径白名单（绝对路径前缀；宿主落盘时占位符已替换）。与 command_patterns
+   *  同语义：两者都有时需同时命中（AND）；规则含 path_prefixes 时要求工具调用
+   *  提取出目标路径且以任一前缀开头。 */
+  path_prefixes?: string[];
   action: "allow" | "deny";
   priority?: number;
   enabled?: boolean;
@@ -80,14 +84,24 @@ export interface AuditEntry {
   reason: string;
 }
 
-export const WORKSPACE_DIR = "/workspace";
+/** 默认工作区根（容器 executor 语义；未设 AGT_WORKSPACE_DIR 时的回退值）。 */
+export const DEFAULT_WORKSPACE_DIR = "/workspace";
+
+/** 工作区根（沙箱边界语义）。
+ *  宿主 pi 化后由 env `AGT_WORKSPACE_DIR` 注入（planner/reviewer = 治理对象项目根；
+ *  executor 容器仍为 /workspace）；env 未设时回退 /workspace（容器 executor 用法不变）。
+ *  运行时读取（每次调用）：同一扩展文件可被不同 env 的进程加载。 */
+export function workspaceDir(): string {
+  const dir = process.env.AGT_WORKSPACE_DIR;
+  return dir && dir.trim() !== "" ? dir.trim().replace(/\/+$/, "") : DEFAULT_WORKSPACE_DIR;
+}
 
 // ---------------------------------------------------------------------------
 // 路径/命令逃逸判定（沙箱边界语义）
 // ---------------------------------------------------------------------------
 
-/** 规范化路径：剥引号、解析 .、..，返回绝对路径（相对路径按 /workspace 解析）。 */
-export function normalizePath(p: string, cwd = WORKSPACE_DIR): string {
+/** 规范化路径：剥引号、解析 .、..，返回绝对路径（相对路径按工作区根解析）。 */
+export function normalizePath(p: string, cwd = workspaceDir()): string {
   let s = String(p).trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     s = s.slice(1, -1);
@@ -103,10 +117,11 @@ export function normalizePath(p: string, cwd = WORKSPACE_DIR): string {
   return "/" + parts.join("/");
 }
 
-/** 路径是否逃逸工作区（绝对路径不在 /workspace 下，或 .. 上跳出）。 */
-export function pathEscapesWorkspace(p: string, cwd = WORKSPACE_DIR): boolean {
+/** 路径是否逃逸工作区（绝对路径不在工作区根下，或 .. 上跳出）。 */
+export function pathEscapesWorkspace(p: string, cwd = workspaceDir()): boolean {
+  const ws = workspaceDir();
   const abs = normalizePath(p, cwd);
-  return abs !== WORKSPACE_DIR && !abs.startsWith(WORKSPACE_DIR + "/");
+  return abs !== ws && !abs.startsWith(ws + "/");
 }
 
 /** 从命令文本提取的绝对路径 token 中，是否有任何逃逸工作区。 */
@@ -245,18 +260,15 @@ function ruleMatches(rule: PolicyRule, ctx: Record<string, unknown>): boolean {
       cond = true; // fail-closed
     }
   }
-  if (!cond) return false;
-  if (rule.command_patterns && rule.command_patterns.length > 0) {
-    const cmd = String(ctx["command"] ?? "");
-    if (!cmd) return false;
-    const anyMatch = rule.command_patterns.some((pat) => {
-      try {
-        return new RegExp(pat.source, pat.flags ?? "i").test(cmd);
-      } catch {
-        return true; // fail-closed：非法正则按命中（保守拒绝）
-      }
+  if (rule.path_prefixes && rule.path_prefixes.length > 0) {
+    const target = String(ctx["target_path"] ?? ctx["path"] ?? "");
+    if (!target) return false;
+    const normalized = normalizePath(target);
+    const anyPrefix = rule.path_prefixes.some((prefix) => {
+      const p = normalizePath(prefix);
+      return normalized === p || normalized.startsWith(p + "/");
     });
-    if (!anyMatch) return false;
+    if (!anyPrefix) return false;
   }
   return true;
 }

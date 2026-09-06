@@ -1,33 +1,50 @@
 {
   "apiVersion": "governance.toolkit/v1",
-  "name": "alfred-planner-deny-write",
+  "name": "alfred-planner-unaware",
   "default_action": "allow",
   "deny_on_policy_error": true,
   "rules": [
     {
-      "name": "deny-write-to-workspace",
-      "description": "结构性拒绝写工作区（planner 无 workspace edit 权限；产出经 /outputs 挂载写入，不写 ws）",
-      "condition": "(tool_name == 'write' or tool_name == 'edit') and target_path.startswith('/workspace')",
-      "action": "deny"
-    },
-    {
       "name": "allow-write-to-outputs",
-      "description": "允许写 /outputs（DagSpec 产出路径，planner 的合法产出挂载）",
-      "condition": "(tool_name == 'write') and target_path.startswith('/outputs')",
-      "action": "allow"
+      "description": "产出目录放行（占位符由宿主驱动按 run 渲染注入）",
+      "condition": "(tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('__OUTPUTS_DIR__') or target_path.startswith('__OUTPUTS_DIR_REL__'))",
+      "action": "allow",
+      "priority": 30
     },
     {
-      "name": "no-sudo",
-      "description": "沙箱内禁用 sudo",
-      "condition": "tool_name == 'bash'",
-      "command_patterns": [{ "source": "\\bsudo\\b", "flags": "i" }],
-      "action": "deny"
+      "name": "deny-write-to-workspace",
+      "description": "路径不在工作范围",
+      "condition": "(tool_name == 'write' or tool_name == 'edit') and target_path.startswith('__WORKSPACE_DIR__')",
+      "action": "deny",
+      "priority": 20
     },
     {
-      "name": "no-recursive-delete",
-      "description": "阻断递归删除（rm -rf 等）",
+      "name": "deny-governance-files",
+      "description": "路径不在工作范围",
+      "condition": "(tool_name == 'read' or tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('__RUNS_DIR__') or target_path.startswith('__RUNS_DIR_REL__') or target_path.startswith('__AGT_WORK__'))",
+      "action": "deny",
+      "priority": 25
+    },
+    {
+      "name": "deny-bash-governance-paths",
+      "description": "路径不在工作范围",
       "condition": "tool_name == 'bash'",
-      "command_patterns": [{ "source": "\\brm\\b[\\s\\S]*-(?:r[fF]|[fF]r)\\b", "flags": "i" }],
+      "command_patterns": [
+        { "source": "\\.alfred/runs", "flags": "" },
+        { "source": "\\.agt/", "flags": "" }
+      ],
+      "action": "deny",
+      "priority": 25
+    },
+    {
+      "name": "deny-bash-write-redirection",
+      "description": "路径不在工作范围",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [
+        { "source": "^(?:[^\\n\"']|\"[^\"]*\"|'[^']*')*?(?:>>?|<<<?)[\\s\\S]*", "flags": "" },
+        { "source": "\\bsudo\\b", "flags": "i" },
+        { "source": "\\brm\\b[\\s\\S]*-(?:r[fF]|[fF]r)\\b", "flags": "i" }
+      ],
       "action": "deny"
     }
   ]
