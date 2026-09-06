@@ -400,10 +400,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event) => {
     const auditPath = process.env.AGT_AUDIT_PATH || DEFAULT_AUDIT_PATH;
     const ts = new Date().toISOString();
-    const ctx = {
-      tool_name: event.toolName,
-      args: (event.input ?? {}) as Record<string, unknown>,
-    };
+    const args = (event.input ?? {}) as Record<string, unknown>;
+    const command = args["command"];
+    const path = extractPath(event.toolName, args);
+    const ctx = { tool_name: event.toolName, args };
 
     const pol = ensurePolicy();
     if (!pol) {
@@ -413,6 +413,10 @@ export default function (pi: ExtensionAPI) {
         ts,
         tool_name: event.toolName,
         tool_call_id: event.toolCallId,
+        // 审计带 path（P0 契约修复）：key_file_paths 真实数据源依赖
+        // allow read 行的 path 提取（host.rs extract_allow_read_paths）；
+        // deny 行同样带 path，但提取侧按 decision==allow 过滤，无泄露。
+        path,
         decision: "deny",
         rule: "__policy_load_error__",
         reason,
@@ -421,12 +425,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     const decision = evaluateToolCall(pol, ctx);
-    const command = ctx.args["command"];
     appendAudit(auditPath, {
       ts,
       tool_name: event.toolName,
       tool_call_id: event.toolCallId,
       command: typeof command === "string" ? command : undefined,
+      path,
       decision: decision.decision,
       rule: decision.rule,
       reason: decision.reason,

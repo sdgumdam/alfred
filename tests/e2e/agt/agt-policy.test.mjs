@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  appendAudit,
   commandEscapesWorkspace,
   evaluateToolCall,
   parsePolicy,
@@ -410,6 +411,80 @@ const p4 = evaluateToolCall(plannerPolicy, { tool_name: "write", args: { content
 assert(p4.decision === "allow", `planner write 无 path → allow（got ${p4.decision}）`);
 delete process.env.AGT_WORKSPACE_DIR;
 for (const d of [plannerWs, plannerState]) rmSync(d, { recursive: true, force: true });
+
+// ============================================================================
+// 审计 path 契约（MaintainerAudit P0）：appendAudit 条目形状 = host.rs
+// AgtAuditLine 消费契约钉死——每次决策行必须携带 path（key_file_paths 真实
+// 数据源 = allow read 行的 path 提取；deny 行也带 path，提取侧按
+// decision==allow 过滤，无泄露）。此前 appendAudit 从不写 path，生产审计
+// 恒缺 path——README 宣称的"真实数据源"不存在。
+// ============================================================================
+console.log("== 审计 path 契约（key_file_paths 数据源 = allow read 行 path） ==");
+{
+  const auditDir = makeTempDir("alfred-audit-contract-");
+  const auditFile = path.join(auditDir, "audit.jsonl");
+  process.env.AGT_AUDIT_PATH = auditFile;
+  // read 工具 allow → path 必须落盘（extractPath 的 file_path 形态也覆盖）。
+  for (const ev of [
+    { toolName: "read", input: { path: "/workspace/src/main.rs" } },
+    { toolName: "edit", input: { file_path: "/workspace/src/lib.rs" } },
+    { toolName: "bash", input: { command: "cat /etc/passwd" } }, // deny；bash 无 path
+    { toolName: "write", input: { content: "x" } }, // 无路径参数 → path 缺省
+  ]) {
+    const d = evaluateToolCall(policy, { tool_name: ev.toolName, args: ev.input });
+    appendAudit(auditFile, {
+      ts: "2026-09-07T00:00:00.000Z",
+      tool_name: ev.toolName,
+      command: typeof ev.input.command === "string" ? ev.input.command : undefined,
+      path: ev.input.path ?? ev.input.file_path,
+      decision: d.decision,
+      rule: d.rule,
+      reason: d.reason,
+    });
+  }
+  const lines = readFileSync(auditFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert(lines.length === 4, `审计 4 行 JSONL（got ${lines.length}）`);
+  for (const l of lines) {
+    assert(
+      typeof l.ts === "string" && typeof l.tool_name === "string"
+        && (l.decision === "allow" || l.decision === "deny")
+        && "rule" in l && typeof l.reason === "string",
+      `审计行含 host.rs 消费必需字段 ts/tool_name/decision/rule/reason：${JSON.stringify(l)}`,
+    );
+  }
+  const readAllow = lines[0];
+  assert(readAllow.decision === "allow" && readAllow.tool_name === "read"
+    && readAllow.path === "/workspace/src/main.rs",
+    `allow read 行携带 path（key_file_paths 数据源）：${JSON.stringify(readAllow)}`);
+  const editAllow = lines[1];
+  assert(editAllow.decision === "allow" && editAllow.path === "/workspace/src/lib.rs",
+    `allow edit 行携带 file_path 形态 path：${JSON.stringify(editAllow)}`);
+  const bashDeny = lines[2];
+  assert(bashDeny.decision === "deny" && bashDeny.path === undefined,
+    `bash 无 path（extractPath 对 bash 返 undefined，不可伪造）：${JSON.stringify(bashDeny)}`);
+  // 消费侧契约演练：host.rs extract_allow_read_paths 同款过滤（decision==allow
+  // 且 tool_name==read 且 path 非空）在真实审计行上提取出且仅提取出 allow read 路径
+  // ——deny 行的 path 不会被提取（无治理面泄露）。
+  const extracted = [...new Set(lines
+    .filter((l) => l.decision === "allow" && l.tool_name === "read" && l.path)
+    .map((l) => l.path))].sort();
+  assert(extracted.length === 1 && extracted[0] === "/workspace/src/main.rs",
+    `提取器契约：allow read 过滤 → ${JSON.stringify(extracted)}`);
+  delete process.env.AGT_AUDIT_PATH;
+  rmSync(auditDir, { recursive: true, force: true });
+}
+// 扩展工厂源码级断言（⑤b 同款）：pi.on("tool_call") 两处 appendAudit 都必须
+// 携带 path 字段（生产者侧真源——改掉即红，防止回退成"生产恒空"契约断裂）。
+{
+  const extSource = readFileSync(path.join(here, "../../../docker/agt/agt-policy.ts"), "utf8");
+  const handler = extSource.slice(extSource.indexOf('pi.on("tool_call"'));
+  const auditCalls = handler.split("appendAudit(auditPath").length - 1;
+  assert(auditCalls === 2, `工厂恰好两处 appendAudit（got ${auditCalls}）`);
+  for (const seg of handler.split("appendAudit(auditPath").slice(1)) {
+    const entry = seg.slice(0, seg.indexOf("});"));
+    assert(/\bpath\b/.test(entry), `appendAudit 条目携带 path：${entry.replace(/\s+/g, " ").trim()}`);
+  }
+}
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
