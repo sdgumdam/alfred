@@ -791,4 +791,44 @@ mod tests {
             assert_eq!(desc, "路径不在允许的工作范围", "deny 描述非中性: {desc}");
         }
     }
+
+    /// 审计 path 契约端到端（MaintainerAudit P0）：生产侧（agt-policy.ts 真宿主
+    /// pi 实测捕获行，见 d6b86b5 验证记录）→ 消费侧 extract_allow_read_paths
+    /// 提取出真实宿主路径；deny 行 / write 行 / bash 行均不提取（不可知）。
+    /// 行即 2026-09-07 真跑 `pi -e agt-policy.ts` 读宿主文件落的审计原文。
+    #[test]
+    fn extract_allow_read_paths_consumes_real_pi_audit_line() {
+        let base =
+            std::env::temp_dir().join(format!("alfred-audit-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let run_dir = base.join("run");
+        let audit_dir = run_dir.join(PLANNER_WORK_DIR).join("agt/audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        // 真 pi 落的 allow read 行（字段全：ts/tool_name/tool_call_id/path/decision/rule/reason）
+        // + 同 run 形态的 deny read / allow write 行（path 必须被过滤）。
+        std::fs::write(
+            audit_dir.join("audit.jsonl"),
+            concat!(
+                r#"{"ts":"2026-09-06T20:18:32.690Z","tool_name":"read","tool_call_id":"call_d43ee88cb0944ef2bf4fa2c3","path":"/tmp/agtp0-e2e/ws/marker.txt","decision":"allow","rule":null,"reason":"default_action=allow"}"#,
+                "\n",
+                r#"{"ts":"2026-09-06T20:18:33.000Z","tool_name":"read","tool_call_id":"call_x","path":"/tmp/agtp0-e2e/run/state.json","decision":"deny","rule":"deny-governance-files","reason":"路径不在允许的工作范围"}"#,
+                "\n",
+                r#"{"ts":"2026-09-06T20:18:33.500Z","tool_name":"write","tool_call_id":"call_y","path":"/tmp/agtp0-e2e/run/planner/outputs/reply.txt","decision":"allow","rule":null,"reason":"default_action=allow"}"#,
+                "\n",
+                r#"{"ts":"2026-09-06T20:18:34.000Z","tool_name":"bash","tool_call_id":"call_z","command":"cat src/x.rs","decision":"allow","rule":null,"reason":"default_action=allow"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let paths = extract_allow_read_paths(&run_dir, 0);
+        assert_eq!(
+            paths,
+            vec!["/tmp/agtp0-e2e/ws/marker.txt".to_string()],
+            "只提取 allow read 的宿主 path，deny/write/bash 全过滤: {paths:?}"
+        );
+        // 增量：since_lines 越过已提取行 → 不重复提取。
+        let incremental = extract_allow_read_paths(&run_dir, 1);
+        assert!(incremental.is_empty(), "基线后无新 allow read → 空: {incremental:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
