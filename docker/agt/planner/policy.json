@@ -6,46 +6,60 @@
   "rules": [
     {
       "name": "allow-write-to-outputs",
-      "description": "产出目录放行（占位符由宿主驱动按 run 渲染注入）",
-      "condition": "(tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('__OUTPUTS_DIR__') or target_path.startswith('__OUTPUTS_DIR_REL__'))",
+      "description": "产出目录放行（占位符由宿主落盘后按 run 渲染注入）",
+      "condition": "(tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('{outputs_dir}') or target_path.startswith('{outputs_dir_rel}'))",
       "action": "allow",
       "priority": 30
     },
     {
-      "name": "deny-write-to-workspace",
-      "description": "路径不在工作范围",
-      "condition": "(tool_name == 'write' or tool_name == 'edit') and target_path.startswith('__WORKSPACE_DIR__')",
-      "action": "deny",
-      "priority": 20
+      "name": "allow-bash-write-outputs",
+      "description": "bash 写重定向放行产出目录（重定向/tee 指向产出目录；占位正则由宿主落盘时替换）",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [{ "source": "{outputs_redirect_allow}", "flags": "i" }],
+      "action": "allow",
+      "priority": 30
     },
     {
       "name": "deny-governance-files",
-      "description": "路径不在工作范围",
-      "condition": "(tool_name == 'read' or tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('__RUNS_DIR__') or target_path.startswith('__RUNS_DIR_REL__') or target_path.startswith('__AGT_WORK__'))",
+      "description": "路径不在允许的工作范围",
+      "condition": "(tool_name == 'read' or tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('{run_dir}') or target_path.startswith('{run_dir_rel}') or target_path.startswith('{agt_work}'))",
       "action": "deny",
       "priority": 25
     },
     {
       "name": "deny-bash-governance-paths",
-      "description": "路径不在工作范围",
+      "description": "路径不在允许的工作范围",
       "condition": "tool_name == 'bash'",
       "command_patterns": [
         { "source": "\\.alfred/runs", "flags": "" },
-        { "source": "\\.agt/", "flags": "" }
+        { "source": "\\.agt/", "flags": "" },
+        { "source": "{run_dir_pattern}", "flags": "" }
       ],
       "action": "deny",
       "priority": 25
     },
     {
-      "name": "deny-bash-write-redirection",
-      "description": "路径不在工作范围",
+      "name": "deny-bash-write-family",
+      "description": "路径不在允许的工作范围",
       "condition": "tool_name == 'bash'",
       "command_patterns": [
-        { "source": "^(?:[^\\n\"']|\"[^\"]*\"|'[^']*')*?(?:>>?|<<<?)[\\s\\S]*", "flags": "" },
-        { "source": "\\bsudo\\b", "flags": "i" },
-        { "source": "\\brm\\b[\\s\\S]*-(?:r[fF]|[fF]r)\\b", "flags": "i" }
+        { "source": "(?:^|[;|&\\s])>>?\\s*[^\\s|;&<>]+", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])tee\\s", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])dd\\b[^|;&<>]*\\bof=", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])(?:cp|mv|ln|mkdir|rmdir|touch|truncate|chmod|chown)\\b", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])rm\\b", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])sed\\b[^|;&<>]*-i\\b", "flags": "i" },
+        { "source": "\\bsudo\\b", "flags": "i" }
       ],
-      "action": "deny"
+      "action": "deny",
+      "priority": 25
+    },
+    {
+      "name": "deny-write-to-workspace",
+      "description": "路径不在允许的工作范围",
+      "condition": "(tool_name == 'write' or tool_name == 'edit') and target_path.startswith('{workspace_dir}')",
+      "action": "deny",
+      "priority": 20
     }
   ]
 }

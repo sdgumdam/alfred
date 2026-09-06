@@ -325,7 +325,8 @@ pub fn run_converse_on_host(
 }
 
 /// 宿主侧 AGT 层准备：策略 + 扩展落 `<work>/agt/`，并把 planner 不可知策略的
-/// 占位符按本 run 渲染（`__WORKSPACE_DIR__`/`__OUTPUTS_DIR__`/… → 绝对/相对路径）。
+/// 占位符按本 run 渲染（`{run_dir}`/`{outputs_dir}`/… → 真实 run 目录派生的
+/// 绝对/相对前缀；渲染语义见 [`render_planner_policy`]）。
 ///
 /// 容器时代 `prepare_agt_work` 只搬文件（占位符由挂载语义隐含）；宿主形态 cwd=
 /// 项目根，策略需要 run 产物的绝对前缀 + 相对前缀双形态（模型可能给相对路径）。
@@ -389,11 +390,23 @@ fn stage_agt_dir(work: &Path) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// 把 planner 不可知策略占位符按本 run 渲染。
+/// 把 planner 不可知策略占位符按本 run 渲染（照 reviewer `render_reviewer_policy`
+/// 范式：占位符在策略文件里无法自引用宿主才知道的真实路径，落盘前渲染）。
+///
+/// **前缀全部从真实 run 目录派生**（`--run-dir` / `$ALFRED_STATE_DIR`/默认布局
+/// 任意路径）：写死虚构前缀（旧 `__RUNS_DIR__` = `<项目根>/.alfred/runs`）在 run
+/// 目录为任意路径时从不命中——HostPiAudit P0：planner 可自由读 verdicts /
+/// conversation / audit。
 ///
 /// 双形态前缀：绝对（pi 工具参数常见绝对路径）+ 相对（cwd=项目根时模型可能给
-/// `.alfred/runs/...` 形态）。相对形态 = 绝对路径剥项目根前缀（无前导 ./，与
-/// 策略 startswith 条件一致）。
+/// `.alfred/runs/...` 形态）。相对形态 = 绝对路径剥项目根前缀；剥不动（run 目录
+/// 在项目根外，如 state-dir 布局）→ 相对条件退化为绝对串（恒不命中，安全侧：
+/// 绝对前缀规则仍覆盖）。
+///
+/// JSON 转义：占位符替换值进的是 JSON 字符串值内部（condition 与 regex source
+/// 同理），按 serde_json::to_string 去外层引号；`*_pattern` 正则 source 另做
+/// 最小正则转义。`*_rel` 占位符必须先于 `*_dir` 替换（`{run_dir}` 是
+/// `{run_dir_rel}` 的前缀串，顺序颠倒会截断后者）。
 fn render_planner_policy(
     policy: &str,
     run_dir: &Path,
@@ -401,21 +414,59 @@ fn render_planner_policy(
     project_root: &Path,
 ) -> Result<String> {
     let ws = absolut(project_root)?;
-    let runs_abs = absolut(&project_root.join(".alfred/runs"))?;
+    let run_abs = absolut(run_dir)?;
     let out_abs = absolut(outputs_dir)?;
-    // 相对形态 = 绝对剥 `<项目根>/`（产出目录恒在项目根之下：run 目录由编排器
-    // 建在治理对象项目根内）。剥不动（run 目录在项目根外）→ 相对条件退化为
-    // 绝对串（恒不命中，安全侧：拦写仍由绝对前缀规则覆盖）。
-    let ws_prefix = format!("{ws}/");
-    let out_rel = out_abs.strip_prefix(&ws_prefix).unwrap_or(&out_abs).to_string();
     let agt_work = absolut(&run_dir.join(PLANNER_WORK_DIR).join("agt"))?;
+    let ws_prefix = format!("{ws}/");
+    let rel = |abs: &str| -> String {
+        abs.strip_prefix(&ws_prefix).unwrap_or(abs).to_string()
+    };
+    let (run_rel, out_rel) = (rel(&run_abs), rel(&out_abs));
+
+    // bash 侧边界正则（条件字符串与 command_patterns 前后参照 reviewer 范式）：
+    // - 产出目录写重定向放行（> / >> / tee 指向产出目录绝对/相对形态，含子路径）
+    let outputs_redirect_allow = format!(
+        r#"(?:^|[;|&\s])(?:>>?|tee\s+(?:-a\s+)?)\s*(?:{}|{})(?:/[^\s|;&<>]*)?(?=[\s]|$)"#,
+        regex_escape(&out_abs),
+        regex_escape(&out_rel),
+    );
+    // - 真实 run 目录（绝对/相对双形态）在命令文本中出现即拦
+    let run_dir_pattern = format!(
+        r#"(?:{}|{})"#,
+        regex_escape(&run_abs),
+        regex_escape(&run_rel),
+    );
+    // - AGT 工作目录（策略/审计不可触碰；绝对形态 + 通用 .agt/ 兜底）
+    let agt_work_pattern = format!(r#"(?:{}|\.agt/)"#, regex_escape(&agt_work));
+
+    let json = |s: &str| -> String {
+        serde_json::to_string(s)
+            .expect("json-escape policy placeholder value")
+            .trim_matches('"')
+            .to_string()
+    };
+    // 替换顺序：*_rel 在 *_dir 前（占位符文本前缀冲突，见函数头注释）。
     Ok(policy
-        .replace("__WORKSPACE_DIR__", &ws)
-        .replace("__OUTPUTS_DIR__", &out_abs)
-        .replace("__OUTPUTS_DIR_REL__", &out_rel)
-        .replace("__RUNS_DIR__", &runs_abs)
-        .replace("__RUNS_DIR_REL__", ".alfred/runs")
-        .replace("__AGT_WORK__", &agt_work))
+        .replace("{outputs_redirect_allow}", &json(&outputs_redirect_allow))
+        .replace("{run_dir_pattern}", &json(&run_dir_pattern))
+        .replace("{agt_work_pattern}", &json(&agt_work_pattern))
+        .replace("{run_dir_rel}", &json(&run_rel))
+        .replace("{run_dir}", &json(&run_abs))
+        .replace("{outputs_dir_rel}", &json(&out_rel))
+        .replace("{outputs_dir}", &json(&out_abs))
+        .replace("{agt_work}", &json(&agt_work))
+        .replace("{workspace_dir}", &json(&ws)))
+}
+
+/// 最小正则转义（同 reviewer host.rs：只转义路径常见元字符）。
+fn regex_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^'
+            | '$' => format!("\\{c}"),
+            _ => c.to_string(),
+        })
+        .collect()
 }
 
 /// 路径绝对化（不要求存在；不解析 symlink，与 pi 工具参数字面语义一致）。
