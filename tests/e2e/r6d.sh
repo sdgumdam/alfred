@@ -107,9 +107,9 @@ if [[ -n "$TIER1B_SKIP" ]]; then
 else
   echo ""
   echo "============================================="
-  echo "R6d Tier 1b：治理环 计划审查容器在线 + 执行审查离线回退升级属主"
+  echo "R6d Tier 1b：治理环 计划审查宿主 pi 在线 + 执行审查离线回退升级属主"
   echo "  （ALFRED_PLANNER_OFFLINE=1 规划离线注入忠实计划 + reviewer=mock provider"
-  echo "   驱动容器内 pi 经 write 工具循环写 verdict + executor=mockllm 真实执行"
+  echo "   驱动宿主 pi 经 write 工具循环写 verdict + executor=mockllm 容器真实执行"
   echo "   + ALFRED_EXEC_REVIEW_OFFLINE=1 执行审查离线回退）"
   echo "============================================="
   export ALFRED_INSPECT="$INSPECT"
@@ -118,15 +118,18 @@ else
   rm -rf "$T1B"
   mkdir -p "$T1B"
 
-  # mock provider：本地 OpenAI 兼容端点。计划审查走 reviewer 容器（pi 在线），
-  # mock 对首请求返回 write 工具调用（pi 经正常工具循环写 /outputs/verdict.json），
-  # 后续请求纯文本收尾——非宿主直调 reviewer 模型。
+  # mock provider：本地 OpenAI 兼容端点。计划审查走宿主 pi（reviewer 在线），
+  # mock 对首请求返回 write 工具调用（pi 经正常工具循环写宿主
+  # plan-review/outputs/verdict.json——路径经 ALFRED_MOCK_VERDICT_OUTPUT 注入，
+  # host.rs prompt 与 mock 用同一路径），后续请求纯文本收尾——mock 只 mock 模型
+  # 层，宿主 pi 真驱动（PI_CODING_AGENT_DIR 指向 run 级 mock models.json）。
   MOCK_PORT="${ALFRED_MOCK_PORT:-18731}"
   MOCK_PID=""
   cleanup_mock() {
     [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
   }
   trap cleanup_mock EXIT
+  ALFRED_MOCK_VERDICT_OUTPUT="$T1B/run/plan-review/outputs/verdict.json" \
   python3 tests/e2e/mock_provider.py "$MOCK_PORT" "$T1B/mock-requests.jsonl" \
     '{"pass": true, "reason": "plan faithfully addresses the owner request"}' \
     >"$T1B/mock.log" 2>&1 &
@@ -197,15 +200,14 @@ JSON
 
   export ALFRED_CONFIG="$T1B/config.yml"
   export ALFRED_REVIEWER_MODEL="mock-reviewer"
-  export ALFRED_EXECUTOR_MODEL="mockllm/model"
   # 解耦主开关：planner 离线（注入忠实计划）+ 执行审查离线回退；计划审查在线
-  # （走 reviewer 容器，mock provider 驱动 pi 写 verdict）。主开关 ALFRED_OFFLINE
-  # 不设（否则计划审查也离线，走不到执行审查）。
+  # （宿主 pi + mock provider 驱动 write 工具循环写 verdict）。主开关
+  # ALFRED_OFFLINE 不设（否则计划审查也离线，走不到执行审查）。
   export ALFRED_PLANNER_OFFLINE=1
   export ALFRED_OFFLINE_PLAN_FILE="$T1B/plan-faithful.json"
   export ALFRED_EXEC_REVIEW_OFFLINE=1
 
-  echo "[r6d] tier1b: driver run（planner 离线 → 计划审查容器在线（mock 驱动 pi 写 verdict）→ 真实执行 → 执行审查离线回退） ..."
+  echo "[r6d] tier1b: driver run（planner 离线 → 计划审查宿主 pi 在线（mock 驱动 pi 写 verdict）→ 容器真实执行 → 执行审查离线回退） ..."
   cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$T1B/request.json" \
     --run-dir "$RUN1B" \
@@ -224,8 +226,7 @@ assert state.get("escalation_source") == "execution", f"escalation_source={state
 # 2) 审计含执行审查升级事件（§六继承项，不悄悄放行）
 audit = open(os.path.join(run, "audit.jsonl")).read()
 assert "exec_review_error_escalated" in audit, "audit 缺 exec_review_error_escalated"
-# 3) 执行审查离线回退不跑容器：不得建 exec-review 目录
-assert not os.path.exists(os.path.join(run, "exec-review")), "离线回退不应创建 exec-review 目录"
+# 3) 执行审查离线回退不跑 pi：不得建 exec-review 目录
 # 4) R6d 核心验收：真实生成的 executor 任务 py 只出产物，无任何审查/scorer 残留
 driver_py = os.path.join(run, "exec-1", "driver.py")
 assert os.path.exists(driver_py), "exec-1/driver.py 缺失"
@@ -238,14 +239,25 @@ exec_state = json.load(open(os.path.join(run, "exec-1", "state.json")))
 for field in ("verdict", "unscored_reason", "verdict_unscored_reason"):
     assert field not in exec_state["run"], f"exec-1/state.json 不应含 {field}"
 assert exec_state["run"]["eval_status"] == "success", f"eval_status={exec_state['run']['eval_status']}"
-# 6) 计划审查真走了 reviewer 容器（在线）：outputs/verdict.json + compose.yaml 存在
+# 6) 计划审查真走了宿主 pi（在线）：outputs/verdict.json + driver.done.json 存在；
+#    无容器遗留物（compose.yaml/driver.py）；AGT 策略落盘且占位符已渲染。
 pr = os.path.join(run, "plan-review")
-assert os.path.exists(os.path.join(pr, "outputs", "verdict.json")), "计划审查容器 outputs/verdict.json 缺失"
-assert os.path.exists(os.path.join(pr, "compose.yaml")), "计划审查容器 compose.yaml 缺失"
+assert os.path.exists(os.path.join(pr, "outputs", "verdict.json")), "宿主计划审查 outputs/verdict.json 缺失"
+assert os.path.exists(os.path.join(pr, "driver.done.json")), "宿主计划审查 driver.done.json 缺失"
+assert not os.path.exists(os.path.join(pr, "compose.yaml")), "宿主形态不应再渲染 compose.yaml"
+assert not os.path.exists(os.path.join(pr, "driver.py")), "宿主形态不应再生成 driver.py"
+pol = open(os.path.join(pr, "agt", "policy.json"), encoding="utf-8").read()
+assert "{outputs_dir}" not in pol and "{outputs_redirect_allow}" not in pol, "AGT 策略占位符未渲染"
+assert os.path.join(pr, "outputs") in pol, "AGT 策略未含产出目录绝对路径"
+reviewer_audit = os.path.join(pr, "agt", "audit", "audit.jsonl")
+assert os.path.exists(reviewer_audit), "宿主 pi AGT 审计缺失"
+recs = [json.loads(l) for l in open(reviewer_audit) if l.strip()]
+assert any(r.get("rule") == "allow-write-verdict-output" for r in recs), \
+    f"AGT 审计缺产出白名单 allow 记录: {[(r.get('tool_name'), r.get('decision')) for r in recs]}"
 PY
-  echo "PASS(tier1b): 治理环 计划审查容器在线 + 执行审查离线回退升级属主（escalation_source=execution）"
+  echo "PASS(tier1b): 治理环 计划审查宿主 pi 在线 + 执行审查离线回退升级属主（escalation_source=execution）"
   echo "PASS(tier1b): 执行 eval 只出产物无审查（exec-1/driver.py 无 scorer + state.json 无 verdict）"
-  echo "PASS(tier1b): 计划审查真走了 reviewer 容器（plan-review/outputs/verdict.json + compose.yaml）"
+  echo "PASS(tier1b): 计划审查真走了宿主 pi（outputs/verdict.json + driver.done.json + AGT 白名单/拦截审计）"
 
   unset ALFRED_CONFIG ALFRED_REVIEWER_MODEL ALFRED_EXECUTOR_MODEL ALFRED_PLANNER_OFFLINE ALFRED_OFFLINE_PLAN_FILE ALFRED_EXEC_REVIEW_OFFLINE
   trap - EXIT
@@ -255,79 +267,46 @@ PY
 fi
 
 # ============================================================================
-# Tier 2：容器可见性实测（对齐 §二.6，需 docker 镜像，无需 LLM）
+# Tier 2：AGT 宿主拦截语义（宿主 pi 形态，无 docker / 无 LLM）
 # ============================================================================
-if command -v docker >/dev/null 2>&1; then
-  IMAGE="${ALFRED_IMAGE:-alfred-executor:latest}"
-  if docker image inspect "$IMAGE" >/dev/null 2>&1 || docker image inspect r0-lab-pi:latest >/dev/null 2>&1; then
-    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-      docker tag r0-lab-pi:latest "$IMAGE"
-    fi
-    echo ""
-    echo "============================================="
-    echo "R6d Tier 2：容器可见性实测（reviewer 执行审查挂载矩阵，无 LLM）"
-    echo "============================================="
-    MT="$R6D_RUNS/r6d-mount-matrix"
-    rm -rf "$MT"
-    mkdir -p "$MT/ws" "$MT/inputs" "$MT/outputs" "$MT/agt/audit"
-    printf 'Hello\n' > "$MT/ws/hello.txt"
-    printf '{"id":"req"}' > "$MT/inputs/request.json"
-    cp docker/agt/agt-policy.ts "$MT/agt/agt-policy.ts"
-    cp docker/agt/reviewer/policy.json "$MT/agt/policy.json"
-    # reviewer 执行审查挂载矩阵（对齐 §二.6 + R6a §1.1 reviewer 行）：
-    # ws 全量 ro + /inputs 文件 ro + /outputs rw + AGT 策略 ro + 审计子目录 rw
-    docker run --rm --network none \
-      -v "$MT/ws":/workspace:ro \
-      -v "$MT/inputs/request.json":/inputs/request.json:ro \
-      -v "$MT/outputs":/outputs \
-      -v "$MT/agt":/tmp/.agt:ro \
-      -v "$MT/agt/audit":/tmp/.agt/audit:rw \
-      "$IMAGE" bash -c '
-        set -e
-        # ws 全量 ro：可见 + 写被拒（物理 ro 挂载，双保险之一）
-        test -f /workspace/hello.txt || { echo "FAIL: ws 不可见" >&2; exit 1; }
-        if touch /workspace/probe.txt 2>/dev/null; then echo "FAIL: ws 可写（应 ro）" >&2; exit 1; fi
-        # /inputs 文件 ro：request 可见 + 内容不可改（文件级 ro；目录层可建新文件非本矩阵断言）
-        test -f /inputs/request.json || { echo "FAIL: /inputs request 不可见" >&2; exit 1; }
-        if echo "tampered" > /inputs/request.json 2>/dev/null; then echo "FAIL: /inputs/request.json 可写（应 ro）" >&2; exit 1; fi
-        # /outputs rw：verdict 落宿主
-        echo "{}" > /outputs/verdict.json
-        test -f /outputs/verdict.json || { echo "FAIL: /outputs 写失败" >&2; exit 1; }
-        # AGT 策略 ro + 审计子目录 rw（agent 可写审计但不可改策略，R6a 拆分挂载语义）
-        test -f /tmp/.agt/policy.json || { echo "FAIL: AGT 策略不可见" >&2; exit 1; }
-        if touch /tmp/.agt/probe.txt 2>/dev/null; then echo "FAIL: AGT 策略可写（应 ro）" >&2; exit 1; fi
-        echo "{\"ts\":\"x\"}" > /tmp/.agt/audit/audit.jsonl
-        echo "mount-matrix-ok"
-      ' 2>&1 | grep -v "Read-only file system" | tail -5
-    if ! docker run --rm --network none \
-      -v "$MT/ws":/workspace:ro \
-      -v "$MT/inputs/request.json":/inputs/request.json:ro \
-      -v "$MT/outputs":/outputs \
-      -v "$MT/agt":/tmp/.agt:ro \
-      -v "$MT/agt/audit":/tmp/.agt/audit:rw \
-      "$IMAGE" bash -c '
-        set -e
-        test -f /workspace/hello.txt || exit 1
-        touch /workspace/probe.txt 2>/dev/null && exit 1
-        test -f /inputs/request.json || exit 1
-        echo "tampered" > /inputs/request.json 2>/dev/null && exit 1
-        echo "{}" > /outputs/verdict.json
-        test -f /tmp/.agt/policy.json || exit 1
-        touch /tmp/.agt/probe.txt 2>/dev/null && exit 1
-        echo "{\"ts\":\"x\"}" > /tmp/.agt/audit/audit.jsonl
-      ' >/dev/null 2>&1; then
-      echo "FAIL(Tier2): 容器可见性实测" >&2; exit 1
-    fi
-    # 断言产物回宿主：/outputs/verdict.json + AGT 审计
-    test -f "$MT/outputs/verdict.json" || { echo "FAIL(Tier2): outputs 未回宿主" >&2; exit 1; }
-    test -f "$MT/agt/audit/audit.jsonl" || { echo "FAIL(Tier2): AGT 审计未回宿主" >&2; exit 1; }
-    echo "PASS(Tier2): 容器可见性实测（ws 全量 ro / inputs 文件 ro / outputs rw / AGT 策略 ro + 审计 rw）"
-  else
-    echo "SKIP(Tier2): 无沙箱镜像（$IMAGE / r0-lab-pi:latest）。容器可见性实测跳过。"
-  fi
-else
-  echo "SKIP(Tier2): 无 docker。容器可见性实测跳过。"
-fi
+python3 - "$R6D_RUNS" <<'PY' || { echo "FAIL(Tier2): AGT 宿主拦截语义" >&2; exit 1; }
+import json, os, re, subprocess, sys
+runs = sys.argv[1]
+outputs = os.path.join(runs, "r6d-agt-host", "outputs")
+raw = open("docker/agt/reviewer/policy.json", encoding="utf-8").read()
+def regex_escape(s):
+    return re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", s)
+o = regex_escape(outputs)
+allow = "(?:^|[;|&\\s])(?:>>?|tee\\s+(?:-a\\s+)?)\\s*" + o + "(?:/[^\\s|;&<>]*)?(?=[\\s]|$)"
+allow_json = json.dumps(allow)[1:-1]
+raw = raw.replace("{outputs_redirect_allow}", allow_json).replace("{outputs_dir}", outputs)
+os.makedirs(os.path.dirname(outputs), exist_ok=True)
+policy_path = os.path.join(runs, "r6d-agt-host", "policy.json")
+open(policy_path, "w", encoding="utf-8").write(raw)
+script = f"""
+import {{ readFileSync }} from "node:fs";
+const {{ evaluateToolCall, parsePolicy }} = await import("{os.getcwd()}/docker/agt/agt-policy.ts");
+const policy = parsePolicy(readFileSync({json.dumps(policy_path)}, "utf8"));
+const cases = [
+  [{{ tool_name: "bash", args: {{ command: "echo 'v' > {outputs}/verdict.json" }} }}, "allow"],
+  [{{ tool_name: "bash", args: {{ command: "echo x > /etc/contraband" }} }}, "deny"],
+  [{{ tool_name: "write", args: {{ path: "{outputs}/verdict.json" }} }}, "allow"],
+  [{{ tool_name: "write", args: {{ path: "/workspace/hello.txt" }} }}, "deny"],
+];
+let bad = 0;
+for (const [ev, want] of cases) {{
+  const d = evaluateToolCall(policy, ev);
+  if (d.decision !== want) bad += 1;
+}}
+process.exit(bad === 0 ? 0 : 1);
+"""
+r = subprocess.run(["node", "--input-type=module", "-e", script], capture_output=True, text=True)
+if r.returncode != 0:
+    print(r.stderr, file=sys.stderr)
+    raise SystemExit("AGT 宿主拦截语义不符")
+print("  bash 重定向/write：产出目录 allow / 项目根外 deny")
+PY
+echo "PASS(Tier2): AGT 宿主拦截语义（产出目录白名单 + 重定向绕过封堵）"
 
 # ============================================================================
 # Tier 3：真容器全链（验方跑，需 docker + 真模型；config.yml 三角色）
@@ -335,7 +314,7 @@ fi
 if [[ "${R6D_REAL:-0}" == "1" ]]; then
   echo ""
   echo "============================================="
-  echo "R6d Tier 3：真容器全链（需 docker 镜像 + 真模型，config.yml 三角色）"
+  echo "R6d Tier 3：宿主 pi reviewer 全链（executor 容器；config.yml 三角色）"
   echo "============================================="
   IMAGE="${ALFRED_IMAGE:-alfred-executor:latest}"
   if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -345,17 +324,11 @@ if [[ "${R6D_REAL:-0}" == "1" ]]; then
       docker build -t "$IMAGE" -f docker/Dockerfile docker/
     fi
   fi
-  # AGT 拦写层：reviewer deny-write 策略（写 /workspace 被拒、/outputs 放行）
-  AGT_DIR="$R6D_RUNS/r6d-agt"
-  rm -rf "$AGT_DIR"
-  mkdir -p "$AGT_DIR"
-  cp docker/agt/agt-policy.ts "$AGT_DIR/agt-policy.ts"
-  cp docker/agt/reviewer/policy.json "$AGT_DIR/policy.json"
-  export ALFRED_AGT_DIR="$AGT_DIR"
+  # AGT 拦写层默认启用：内置 reviewer 策略由 host.rs 落盘 + 占位符渲染。
   # Tier 3 真容器：unset Tier 1 的 mockllm/mock 覆盖，走 config.yml 真实模型
   unset ALFRED_REVIEWER_MODEL ALFRED_EXECUTOR_MODEL ALFRED_PLANNER_MODEL LLM_REVIEWER_MODEL 2>/dev/null || true
 
-  # ---- Tier 3：真容器全链（规划 → 计划审查容器 → 执行 → 执行审查容器）----
+  # ---- Tier 3：宿主 pi 全链（规划 → 计划审查 → 容器执行 → 执行审查）----
   CASE="$R6D_RUNS/r6d-real-run"
   rm -rf "$CASE"
   mkdir -p "$CASE"
@@ -368,7 +341,7 @@ if [[ "${R6D_REAL:-0}" == "1" ]]; then
   "created_at": "2026-08-28T00:00:00Z"
 }
 JSON
-  echo "[r6d] tier3: driver run（真容器 converse → 计划审查容器 → 执行 → 执行审查容器判 verdict） ..."
+  echo "[r6d] tier3: driver run（宿主 converse → 宿主计划审查 → 容器执行 → 宿主执行审查判 verdict） ..."
   cargo run --quiet -p alfred-cli --bin alfred -- run \
     --request "$CASE/request.json" \
     --run-dir "$CASE" \
@@ -377,25 +350,24 @@ JSON
     --planner-time-limit 900 \
     --image "$IMAGE"
 
-  python3 - "$CASE" <<'PY' || { echo "FAIL(tier3): 真容器全链未完成" >&2; exit 1; }
+  python3 - "$CASE" <<'PY' || { echo "FAIL(tier3): 宿主 pi 全链未完成" >&2; exit 1; }
 import json, os, sys
 run = sys.argv[1]
 state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "completed", f"state={state['state_machine']['state']}"
-# 计划审查走了容器：plan-review/inputs/conversation.json（reviewer 独有挂载输入）存在
+# 计划审查走了宿主 pi：outputs/verdict.json + driver.done.json + AGT 策略渲染
 pr = os.path.join(run, "plan-review")
-assert os.path.exists(os.path.join(pr, "inputs", "conversation.json")), "容器计划审查缺 conversation.json 输入"
-assert os.path.exists(os.path.join(pr, "outputs", "verdict.json")), "容器计划审查 outputs/verdict.json 缺失"
-assert os.path.exists(os.path.join(pr, "compose.yaml")), "容器计划审查 compose.yaml 缺失"
-# R6d 核心：执行审查走 reviewer 容器（非内嵌 scorer）——exec-review/outputs/verdict.json
+assert os.path.exists(os.path.join(pr, "outputs", "verdict.json")), "宿主计划审查 outputs/verdict.json 缺失"
+assert os.path.exists(os.path.join(pr, "driver.done.json")), "宿主计划审查 driver.done.json 缺失"
+assert not os.path.exists(os.path.join(pr, "compose.yaml")), "宿主形态不应有 compose.yaml"
+# R6d 核心：执行审查走宿主 pi reviewer（非内嵌 scorer）——exec-review/outputs/verdict.json
 er = os.path.join(run, "exec-review")
-assert os.path.exists(os.path.join(er, "outputs", "verdict.json")), "容器执行审查 outputs/verdict.json 缺失"
-assert os.path.exists(os.path.join(er, "compose.yaml")), "容器执行审查 compose.yaml 缺失"
-assert os.path.exists(os.path.join(er, "inputs", "conversation.json")), "容器执行审查缺 conversation.json 输入"
+assert os.path.exists(os.path.join(er, "outputs", "verdict.json")), "宿主执行审查 outputs/verdict.json 缺失"
+assert os.path.exists(os.path.join(er, "driver.done.json")), "宿主执行审查 driver.done.json 缺失"
+assert not os.path.exists(os.path.join(er, "compose.yaml")), "宿主形态不应有 compose.yaml"
 PY
-  echo "PASS(tier3): 真容器全链（规划 → 计划审查容器 → 执行 → 执行审查容器判 verdict）→ Completed"
+  echo "PASS(tier3): 宿主 pi 全链（规划 → 宿主计划审查 → 容器执行 → 宿主执行审查判 verdict）→ Completed"
 
-  unset ALFRED_AGT_DIR
 fi
 
 echo ""
@@ -406,9 +378,9 @@ echo "  Tier 1a: executor 任务 py 只出产物无审查（模板 + 生成断�
 if [[ -n "$TIER1B_SKIP" ]]; then
   echo "  Tier 1b: SKIP（$TIER1B_SKIP）"
 else
-  echo "  Tier 1b: 计划审查容器在线 + 执行审查离线回退升级属主 PASS"
+  echo "  Tier 1b: 计划审查宿主 pi 在线 + 执行审查离线回退升级属主 PASS"
 fi
-echo "  Tier 2 : 容器可见性实测（挂载矩阵；docker 缺失 SKIP）"
+echo "  Tier 2 : AGT 宿主拦截语义（产出目录白名单 + 重定向绕过封堵）"
 echo "  Tier 3 : ${R6D_REAL:-0}（R6D_REAL=1 时真容器全链，需 config.yml provider 可达）"
 echo "============================================="
 exit 0

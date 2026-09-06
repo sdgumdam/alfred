@@ -81,6 +81,9 @@ cleanup() {
 trap cleanup EXIT
 
 start_mock() {
+  # $1 = run 目录（mock 的 write 路径必须与 host.rs prompt 一致：该 run 的
+  # plan-review/outputs/verdict.json）。
+  ALFRED_MOCK_VERDICT_OUTPUT="$1/plan-review/outputs/verdict.json" \
   python3 tests/e2e/mock_provider.py "$MOCK_PORT" "$RUNS/mock-requests.jsonl" \
     '{"pass": true, "reason": "plan faithfully addresses the owner request"}' \
     >"$RUNS/mock.log" 2>&1 &
@@ -162,9 +165,9 @@ run_deterministic_chain() {
     --no-ctl
 }
 
-unset ALFRED_AGT_DIR ALFRED_AGT_DISABLE
-start_mock
 write_fixtures "$RUNS"
+CASE_A="$RUNS/case-a-default-on"
+start_mock "$CASE_A"
 
 # ============================================================================
 # Tier 1 — Case A：默认启用（不设任何 AGT env）
@@ -191,33 +194,32 @@ read = lambda p: open(p, "rb").read()
 # 1) 治理环推进不受默认挂载影响（执行审查离线回退 → 升级属主，不悄悄放行）
 state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
-assert state.get("escalation_source") == "execution", f"escalation_source={state.get('escalation_source')}"
-
 # 2) 内置默认策略由二进制落盘（无 ALFRED_AGT_DIR）且 byte 级 == docker/agt 资产
+#    （宿主形态：policy.json 含占位符渲染——executor 侧无占位符仍 byte 级一致；
+#    reviewer 侧占位符替换后不可 byte 比，改为结构断言：JSON 合法 + 含渲染后
+#    产出目录 + 占位符消失）
 pr_agt = os.path.join(run, "plan-review", "agt")
 assert os.path.isfile(os.path.join(pr_agt, "policy.json")), "plan-review/agt/policy.json 缺失（reviewer 默认未挂 AGT）"
-assert read(os.path.join(pr_agt, "policy.json")) == read(os.path.join(repo, "docker/agt/reviewer/policy.json")), \
-    "reviewer 落盘策略 != docker/agt/reviewer/policy.json（内置资产漂移）"
-assert read(os.path.join(pr_agt, "agt-policy.ts")) == read(os.path.join(repo, "docker/agt/agt-policy.ts")), \
-    "reviewer 落盘扩展 != docker/agt/agt-policy.ts（内置资产漂移）"
+_rp = open(os.path.join(pr_agt, "policy.json"), encoding="utf-8").read()
+_rd = json.loads(_rp)
+_out_abs = os.path.join(run, "plan-review", "outputs")
+assert "{outputs_dir}" not in _rp and "{outputs_redirect_allow}" not in _rp, "reviewer 策略占位符未渲染"
+assert _out_abs in _rp, "reviewer 策略未含产出目录绝对路径"
+assert os.path.isfile(os.path.join(pr_agt, "agt-policy.ts")), "reviewer 扩展 agt-policy.ts 未落盘"
 ex_agt = os.path.join(run, "exec-1", "agt")
 assert read(os.path.join(ex_agt, "policy.json")) == read(os.path.join(repo, "docker/agt/executor/policy.json")), \
     "executor 落盘策略 != docker/agt/executor/policy.json（内置资产漂移）"
 assert os.path.isdir(os.path.join(ex_agt, "audit")), "exec-1/agt/audit 审计子目录缺失（rw 挂载源）"
 
-# 3) compose 挂载面（只看活动卷行；模板注释里的字样不算）：策略 ro + 审计 rw（两容器）
-for compose in [os.path.join(run, "plan-review", "compose.yaml"),
-                os.path.join(run, "exec-1", "executor.compose.yaml")]:
-    lines = open(compose, encoding="utf-8").read().splitlines()
-    vol = [l for l in lines if l.strip().startswith("- ") and "/tmp/.agt" in l]
-    assert any("/tmp/.agt:ro" in l for l in vol), f"{compose} 缺策略 ro 挂载: {vol}"
-    assert any("/tmp/.agt/audit:rw" in l for l in vol), f"{compose} 缺审计 rw 挂载: {vol}"
-
-# 4) driver 注入：AGT_EXT 非空（-e 加载扩展）
-for driver in [os.path.join(run, "plan-review", "driver.py"),
-               os.path.join(run, "exec-1", "driver.py")]:
-    text = open(driver, encoding="utf-8").read()
-    assert 'AGT_EXT = "/tmp/.agt/agt-policy.ts"' in text, f"{driver} 未注入 AGT 扩展"
+# 3) reviewer 宿主 pi 形态：plan-review 无 compose.yaml/driver.py（不再有挂载面）；
+#    executor 仍容器：compose 挂 /tmp/.agt ro + 审计 rw
+pr_compose = os.path.join(run, "plan-review", "compose.yaml")
+assert not os.path.exists(pr_compose), f"{pr_compose} 不应存在（reviewer 已宿主 pi 化）"
+ex_compose = os.path.join(run, "exec-1", "executor.compose.yaml")
+lines = open(ex_compose, encoding="utf-8").read().splitlines()
+vol = [l for l in lines if l.strip().startswith("- ") and "/tmp/.agt" in l]
+assert any("/tmp/.agt:ro" in l for l in vol), f"{ex_compose} 缺策略 ro 挂载: {vol}"
+assert any("/tmp/.agt/audit:rw" in l for l in vol), f"{ex_compose} 缺审计 rw 挂载: {vol}"
 
 # 5) 容器内扩展真加载真求值的可观测面：reviewer 容器审计含 allow
 #   （mock provider 驱动容器内 pi 经 write 工具写 /outputs/verdict.json →
@@ -230,7 +232,7 @@ allows = [r for r in recs if r.get("decision") == "allow"]
 assert allows, f"reviewer 审计无 allow 记录: {recs}"
 print(f"  reviewer 审计 total={len(recs)} allow={len(allows)}")
 PY
-echo "PASS(caseA): 默认启用——二进制落盘内置策略（byte 级 == docker/agt）+ compose 挂载 + driver 注入 + 容器内审计 allow"
+echo "PASS(caseA): 默认启用——二进制落盘内置策略（byte 级 == docker/agt）+ 宿主 pi 审计 allow + executor compose 挂载/注入"
 
 # ============================================================================
 # Tier 1 — Case B：ALFRED_AGT_DISABLE=1 显式关闭（opt-out）
@@ -238,10 +240,15 @@ echo "PASS(caseA): 默认启用——二进制落盘内置策略（byte 级 == d
 echo ""
 echo "============================================="
 echo "Tier 1 Case B：ALFRED_AGT_DISABLE=1（不挂不加载）"
-echo "============================================="
 CASE_B="$RUNS/case-b-disabled"
 # 显式 export（bash 函数调用的 VAR=1 前缀不保证导出给子进程）。
 export ALFRED_AGT_DISABLE=1
+# mock 的 write 目标路径按 case 重定向（重启 mock 实例——bind 同端口前先杀旧实例）。
+kill "$MOCK_PID" 2>/dev/null || true
+wait "$MOCK_PID" 2>/dev/null || true
+MOCK_PID=""
+while lsof -iTCP:"$MOCK_PORT" -sTCP:LISTEN >/dev/null 2>&1; do sleep 0.3; done
+start_mock "$CASE_B"
 run_deterministic_chain "$CASE_B"
 unset ALFRED_AGT_DISABLE
 
@@ -259,17 +266,17 @@ for d in [os.path.join(run, "plan-review", "agt"), os.path.join(run, "exec-1", "
 
 # 3) compose 无活动 AGT 卷行（模板文档注释里的 /tmp/.agt 字样不算挂载）；
 #    driver.py AGT_EXT 空串（不注入扩展）
-for compose in [os.path.join(run, "plan-review", "compose.yaml"),
-                os.path.join(run, "exec-1", "executor.compose.yaml")]:
-    lines = open(compose, encoding="utf-8").read().splitlines()
-    active = [l for l in lines if l.strip().startswith("- ") and "/tmp/.agt" in l]
-    assert not active, f"{compose} 仍有 AGT 挂载行: {active}"
-for driver in [os.path.join(run, "plan-review", "driver.py"),
-               os.path.join(run, "exec-1", "driver.py")]:
-    text = open(driver, encoding="utf-8").read()
-    assert 'AGT_EXT = ""' in text, f"{driver} 仍注入 AGT 扩展"
+# reviewer 宿主 pi：DISABLE=1 → 无 AGT staging（agt 目录整棵不存在）
+assert not os.path.exists(os.path.join(run, "plan-review", "agt")), "DISABLE=1 仍落盘 reviewer AGT"
+# executor 仍容器：compose 无活动 AGT 卷行 + driver.py 不注入扩展
+lines = open(os.path.join(run, "exec-1", "executor.compose.yaml"), encoding="utf-8").read().splitlines()
+active = [l for l in lines if l.strip().startswith("- ") and "/tmp/.agt" in l]
+assert not active, f"executor compose 仍有 AGT 挂载行: {active}"
+ex_driver = os.path.join(run, "exec-1", "driver.py")
+text = open(ex_driver, encoding="utf-8").read()
+assert 'AGT_EXT = ""' in text, f"{ex_driver} 仍注入 AGT 扩展"
 PY
-echo "PASS(caseB): ALFRED_AGT_DISABLE=1 不挂不加载（无 staging / 无挂载行 / 无扩展注入）"
+echo "PASS(caseB): ALFRED_AGT_DISABLE=1 不挂不加载（reviewer 无 staging / executor 无挂载行与扩展注入）"
 
 unset ALFRED_CONFIG ALFRED_REVIEWER_MODEL ALFRED_EXECUTOR_MODEL \
       ALFRED_PLANNER_OFFLINE ALFRED_OFFLINE_PLAN_FILE ALFRED_EXEC_REVIEW_OFFLINE

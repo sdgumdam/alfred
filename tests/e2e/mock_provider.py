@@ -30,6 +30,7 @@ and logs every request body to the run dir for evidence.
 """
 import http.server
 import json
+import os
 import socketserver
 import sys
 import time
@@ -39,12 +40,14 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8899
 LOG = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("mock-requests.jsonl")
 VERDICT = sys.argv[3] if len(sys.argv) > 3 else '{"pass": true, "reason": "plan faithfully addresses the owner request"}'
 
-# pi write 工具名 + 产出路径（reviewer 容器 driver 约定 /outputs/verdict.json）。
+# pi write 工具名 + 产出路径（宿主形态：host.rs prompt 指定
+# <run>/plan-review/outputs/verdict.json 绝对路径，env 注入；缺省保持容器时代
+# 旧值供历史复现）。
 WRITE_TOOL = "write"
-VERDICT_OUTPUT = "/outputs/verdict.json"
+VERDICT_OUTPUT = os.environ.get("ALFRED_MOCK_VERDICT_OUTPUT", "/outputs/verdict.json")
 TOOL_CALL_ID = "call_r6d_plan_write"
 # 工具循环收尾纯文本（pi 拿到无 tool_calls 的回复即 settle）。
-CLOSE_TEXT = "Verdict written to /outputs/verdict.json. Task complete."
+CLOSE_TEXT = f"Verdict written to {VERDICT_OUTPUT}. Task complete."
 
 
 def has_pi_write_tool(req: dict) -> bool:
@@ -82,13 +85,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with LOG.open("a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    def _respond(self, payload: dict):
-        data = json.dumps(payload).encode()
+    def _respond(self, payload: dict, stream: bool = False):
+        if not stream:
+            data = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        # SSE（pi 宿主形态恒 stream:true；把完整响应包成单个 chunk + [DONE]）
+        chunk = {
+            "id": payload.get("id", "chatcmpl-mock"),
+            "object": "chat.completion.chunk",
+            "created": payload.get("created", 0),
+            "model": payload.get("model", "mock"),
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": payload["choices"][0]["message"],
+                    "finish_reason": payload["choices"][0].get("finish_reason"),
+                }
+            ],
+        }
+        body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -165,7 +190,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ],
                 "usage": usage,
             }
-        self._respond(resp)
+        self._respond(resp, stream=bool(req.get("stream")))
 
     def do_GET(self):
         data = json.dumps({"service": "r6d-mock", "ok": True}).encode()
@@ -178,6 +203,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     LOG.parent.mkdir(parents=True, exist_ok=True)
-    with socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
+    class ReusableServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+
+    with ReusableServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"r6d mock provider on 127.0.0.1:{PORT}", flush=True)
         httpd.serve_forever()
