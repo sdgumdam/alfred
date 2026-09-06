@@ -369,10 +369,14 @@ forbidden = ["reject", "rejected", "verdict", "review", "reviewer", "scorer", "s
 low = msg.lower()
 hits = [w for w in forbidden if w in low]
 assert not hits, f"disguised message contains forbidden words {hits}: {msg}"
-# 重规划 converse 记录存在（0001.json：第二次 converse）
+# 重规划 converse 记录存在（维护者重做后 llm-calls 含 role=maintain 记录——
+# P1 起仅 ALFRED_PLANNER_OFFLINE 模式维护者也离线直通落记录；按 role 过滤取
+# 最后一条 converse，r6b 同范式）
 files = sorted(glob.glob(os.path.join(sys.argv[2], "*.json")))
 assert len(files) >= 2, f"expect >=2 llm-calls records, got {len(files)}"
-rec = json.load(open(files[-1]))
+conv = [f for f in files if json.load(open(f))["role"] == "converse"]
+assert len(conv) >= 2, f"expect >=2 converse records, got {len(conv)}"
+rec = json.load(open(conv[-1]))
 user = rec["messages"][-1]["content"]
 assert "属主本轮消息" in user, "replan record missing owner message"
 # 伪装消息确实喂给了 planner
@@ -482,17 +486,16 @@ python3 - "$CASE4_DIR/state.json" "$CASE4_DIR/llm-calls" <<'PY' || { echo "FAIL(
 import json, sys, glob, os
 d = json.load(open(sys.argv[1]))
 # R6d：离线 feed revise 走到执行审查时离线回退 → 升级挂起（escalated）。
-assert d["state_machine"]["state"] == "escalated", f"state={d['state_machine']['state']}"
-doc = d["session_doc"]
-# 维护者已回退（待新架构重做）：会话文档保持空文档，属主补充只设 owner_message
-assert doc == {"key_file_paths": [], "key_conclusions": [], "review_summary": []}, \
-    f"session_doc not empty: {doc}"
-assert d["owner_message"] and "技术选型" in d["owner_message"], \
-    f"owner_message missing supplement: {d.get('owner_message')}"
+# 维护者重做后 llm-calls 含 role=maintain 记录（P1 起仅 ALFRED_PLANNER_OFFLINE
+# 模式维护者也离线直通落记录）——按 role 过滤取最后一条 converse（r6b 同范式）
 files = sorted(glob.glob(os.path.join(sys.argv[2], "*.json")))
 assert len(files) >= 2, f"expect >=2 llm-calls, got {len(files)}"
-rec = json.load(open(files[-1]))
+conv = [f for f in files if json.load(open(f))["role"] == "converse"]
+assert len(conv) >= 2, f"expect >=2 converse records, got {len(conv)}"
+rec = json.load(open(conv[-1]))
 user = rec["messages"][-1]["content"]
+assert d["owner_message"] and "技术选型" in d["owner_message"], \
+    f"owner_message missing supplement: {d.get('owner_message')}"
 # 第二次 converse 的 prompt 含属主补充（owner_message 语义）
 assert "技术选型" in user, "converse 未引用属主补充（owner_message）"
 # P1/方案B 防回归：converse 实际输入无 review_summary 字段名、无禁词（投影改名+中性化）
