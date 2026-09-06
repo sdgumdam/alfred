@@ -260,6 +260,19 @@ function ruleMatches(rule: PolicyRule, ctx: Record<string, unknown>): boolean {
       cond = true; // fail-closed
     }
   }
+  if (!cond) return false;
+  if (rule.command_patterns && rule.command_patterns.length > 0) {
+    const cmd = String(ctx["command"] ?? "");
+    if (!cmd) return false;
+    const anyMatch = rule.command_patterns.some((pat) => {
+      try {
+        return new RegExp(pat.source, pat.flags ?? "i").test(cmd);
+      } catch {
+        return true; // fail-closed：非法正则按命中（保守拒绝）
+      }
+    });
+    if (!anyMatch) return false;
+  }
   if (rule.path_prefixes && rule.path_prefixes.length > 0) {
     const target = String(ctx["target_path"] ?? ctx["path"] ?? "");
     if (!target) return false;

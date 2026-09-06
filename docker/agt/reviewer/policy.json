@@ -5,21 +5,39 @@
   "deny_on_policy_error": true,
   "rules": [
     {
-      "name": "deny-write-in-workspace",
-      "description": "结构性拒绝写工作区（reviewer 无 workspace 写入权限；ws ro 双保险）",
-      "condition": "tool_name in ['write', 'edit', 'rename', 'delete', 'mkdir', 'move', 'copy', 'create'] and path_escapes_workspace in ['false']",
+      "name": "allow-write-verdict-output",
+      "description": "放行写审查产出目录（verdict 收割路径；{outputs_dir} 宿主落盘时替换）",
+      "condition": "tool_name in ['write', 'edit', 'rename', 'move', 'copy', 'create']",
+      "path_prefixes": ["{outputs_dir}"],
+      "action": "allow"
+    },
+    {
+      "name": "deny-all-writes",
+      "description": "结构性拒绝一切写（reviewer 只读审查 + 唯一产出 verdict；项目根/run/ws 均无写权限）",
+      "condition": "tool_name in ['write', 'edit', 'rename', 'delete', 'mkdir', 'move', 'copy', 'create']",
       "action": "deny"
     },
     {
-      "name": "deny-bash-write-redirect-to-workspace",
-      "description": "阻断 bash 写重定向到 /workspace（> 覆盖 ws 文件，ro 之外的兜底）",
+      "name": "allow-write-redirect-verdict-output",
+      "description": "放行 bash 写重定向到审查产出目录（占位正则由宿主落盘时替换）",
       "condition": "tool_name == 'bash'",
-      "command_patterns": [{ "source": ">\\s*/workspace", "flags": "i" }],
+      "command_patterns": [{ "source": "{outputs_redirect_allow}", "flags": "i" }],
+      "action": "allow"
+    },
+    {
+      "name": "deny-bash-write-redirect",
+      "description": "阻断 bash 写重定向到产出目录之外（防 write 被拒后经重定向绕过）",
+      "condition": "tool_name == 'bash'",
+      "command_patterns": [
+        { "source": "(?:^|[;|&\\s])>>?\\s*[^\\s|;&<>]+", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])tee\\s+(?:-a\\s+)?[^\\s|;&<>]+", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])dd\\b[^|;&<>]*\\bof=[^\\s|;&<>]+", "flags": "i" }
+      ],
       "action": "deny"
     },
     {
       "name": "no-sudo",
-      "description": "沙箱内禁用 sudo",
+      "description": "禁用 sudo（最小权限）",
       "condition": "tool_name == 'bash'",
       "command_patterns": [{ "source": "\\bsudo\\b", "flags": "i" }],
       "action": "deny"
