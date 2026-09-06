@@ -8,7 +8,8 @@
 //
 // 运行：node tests/e2e/agt/agt-policy.test.mjs
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -29,6 +30,11 @@ function assert(cond, label) {
     failures += 1;
     console.error(`  FAIL: ${label}`);
   }
+}
+
+/** 临时目录（确定性测试：真实 run 目录模拟不落仓库）。 */
+function makeTempDir(label) {
+  return mkdtempSync(path.join(os.tmpdir(), label));
 }
 
 function bash(cmd) {
@@ -118,20 +124,36 @@ const rePolicy = parsePolicy(JSON.stringify({
 const d13 = evaluateToolCall(rePolicy, bash("echo hi"));
 assert(d13.decision === "deny" && d13.rule === "bad-re", "非法正则 → 按命中 → deny（fail-closed）");
 
-console.log("== planner-policy.json 语义（宿主 pi：不可知拦写/拦读，占位符按 run 渲染） ==");
+// ============================================================================
+// planner-policy.json 语义（宿主 pi：不可知隔离——占位符由 host.rs
+// render_planner_policy 按**真实 run 目录**渲染；本节复刻同一替换，
+// run 目录用临时目录模拟 `$ALFRED_STATE_DIR` 布局——run 根在项目根之外，
+// 旧写死 `<ws>/.alfred/runs` 前缀从不命中，HostPiAudit P0 修复的负向断言）。
+// ============================================================================
 const plannerPolicyRaw = readFileSync(path.join(here, "../../../docker/agt/planner/policy.json"), "utf8");
-const plannerWs = "/home/demo/project";
-const plannerRun = `${plannerWs}/.alfred/runs/run-1`;
-const plannerOut = `${plannerRun}/planner/outputs`;
+const plannerWs = makeTempDir("alfred-planner-ws-");
+const plannerState = makeTempDir("alfred-state-"); // 模拟 $ALFRED_STATE_DIR（~/.local/state/alfred 布局：run 根在项目根外）
+const plannerRun = path.join(plannerState, "runs", "run-1");
+const plannerOut = path.join(plannerRun, "planner", "outputs");
+const plannerAgtWork = path.join(plannerRun, "planner", "agt");
 process.env.AGT_WORKSPACE_DIR = plannerWs;
+const regexEscape = (s) => s.replace(/[\\.+*?()|[\]{}^$]/g, "\\$&");
+const jsonInner = (s) => JSON.stringify(s).slice(1, -1);
+const outputsRedirectAllow =
+  `(?:^|[;|&\\s])(?:>>?|tee\\s+(?:-a\\s+)?)\\s*(?:${regexEscape(plannerOut)}|${regexEscape(path.relative(plannerWs, plannerOut))})(?:/[^\\s|;&<>]*)?(?=[\\s]|$)`;
+const runDirPattern = `(?:${regexEscape(plannerRun)}|${regexEscape(path.relative(plannerWs, plannerRun))})`;
+const agtWorkPattern = `(?:${regexEscape(plannerAgtWork)}|\\.agt/)`;
 const plannerPolicy = parsePolicy(
   plannerPolicyRaw
-    .replaceAll("__WORKSPACE_DIR__", plannerWs)
-    .replaceAll("__OUTPUTS_DIR__", plannerOut)
-    .replaceAll("__OUTPUTS_DIR_REL__", ".alfred/runs/run-1/planner/outputs")
-    .replaceAll("__RUNS_DIR__", `${plannerWs}/.alfred/runs`)
-    .replaceAll("__RUNS_DIR_REL__", ".alfred/runs")
-    .replaceAll("__AGT_WORK__", `${plannerRun}/planner/agt`),
+    .replace("{outputs_redirect_allow}", jsonInner(outputsRedirectAllow))
+    .replace("{run_dir_pattern}", jsonInner(runDirPattern))
+    .replace("{agt_work_pattern}", jsonInner(agtWorkPattern))
+    .replace("{run_dir_rel}", jsonInner(path.relative(plannerWs, plannerRun)))
+    .replace("{run_dir}", jsonInner(plannerRun))
+    .replace("{outputs_dir_rel}", jsonInner(path.relative(plannerWs, plannerOut)))
+    .replace("{outputs_dir}", jsonInner(plannerOut))
+    .replace("{agt_work}", jsonInner(plannerAgtWork))
+    .replace("{workspace_dir}", jsonInner(plannerWs)),
 );
 
 // §2.4 两分支产出：instructions.json（Instructions 接管）与 reply.txt（Reply 对话继续）都
@@ -141,6 +163,12 @@ assert(p1.decision === "allow" && p1.rule === "allow-write-to-outputs", `planner
 const p1b = evaluateToolCall(plannerPolicy, write(`${plannerOut}/reply.txt`));
 assert(p1b.decision === "allow" && p1b.rule === "allow-write-to-outputs", `planner write outputs/reply.txt → allow(${p1b.rule})`);
 
+// bash 写重定向 / tee 指向产出目录 → allow（写族放行的唯一出口）
+const p1c = evaluateToolCall(plannerPolicy, bash(`echo '{}' > ${plannerOut}/instructions.json`));
+assert(p1c.decision === "allow" && p1c.rule === "allow-bash-write-outputs", `planner bash > outputs → allow(${p1c.rule}/${p1c.decision})`);
+const p1d = evaluateToolCall(plannerPolicy, bash(`echo x | tee -a ${plannerOut}/reply.txt`));
+assert(p1d.decision === "allow" && p1d.rule === "allow-bash-write-outputs", `planner bash tee -a outputs → allow(${p1d.rule}/${p1d.decision})`);
+
 // 写项目根（cwd=工作区）→ deny（deny-write-to-workspace：target_path.startswith(ws) 命中）
 const p2 = evaluateToolCall(plannerPolicy, write(`${plannerWs}/foo.txt`));
 assert(p2.decision === "deny" && p2.rule === "deny-write-to-workspace", `planner write workspace/foo.txt → deny(${p2.rule})`);
@@ -149,8 +177,9 @@ assert(p2.decision === "deny" && p2.rule === "deny-write-to-workspace", `planner
 const p2b = evaluateToolCall(plannerPolicy, edit(`${plannerWs}/src/lib.rs`));
 assert(p2b.decision === "deny" && p2b.rule === "deny-write-to-workspace", `planner edit workspace/src/lib.rs → deny(${p2b.rule})`);
 
-// 拦读 run 治理产物（不可知核心）：verdicts/conversation/audit/审查目录 → deny，
-// 拒绝反馈中性（"路径不在工作范围"，不泄露内容存在性）
+// P0 负向断言：**真实 run 目录**（项目根外，$ALFRED_STATE_DIR 布局）下拦读 run
+// 治理产物：verdicts/conversation/audit/审查目录 → deny + 中性反馈
+// （"路径不在允许的工作范围"，不泄露规则名/内容存在性——HostPiAudit P1）
 for (const gp of [
   `${plannerRun}/plan-verdicts.json`,
   `${plannerRun}/exec-verdicts.json`,
@@ -160,34 +189,63 @@ for (const gp of [
   `${plannerRun}/exec-review/verdict.json`,
 ]) {
   const gd = evaluateToolCall(plannerPolicy, read(gp));
-  assert(gd.decision === "deny" && gd.reason === "路径不在工作范围", `planner read ${path.basename(gp)} → deny 中性(${gd.decision}/${gd.reason})`);
+  assert(gd.decision === "deny" && gd.reason === "路径不在允许的工作范围", `planner read ${path.basename(gp)} → deny 中性(${gd.decision}/${gd.reason})`);
 }
 
-// bash 触碰 run 目录 / .agt → deny；写重定向 / sudo / rm -rf → deny
-assert(evaluateToolCall(plannerPolicy, bash(`cat ${plannerRun}/plan-verdicts.json`)).decision === "deny", "planner bash cat run governance → deny");
-assert(evaluateToolCall(plannerPolicy, bash("ls .alfred/runs")).decision === "deny", "planner bash ls .alfred/runs → deny");
-assert(evaluateToolCall(plannerPolicy, bash("echo x > out.txt")).decision === "deny", "planner bash 写重定向 → deny");
-assert(evaluateToolCall(plannerPolicy, bash("sudo ls")).decision === "deny", "planner bash sudo → deny");
+// P1 负向断言：outputs 白名单无穿越——相对路径与 ../ 穿越必须落回真实 run 前缀
+// （normalizePath 归一化 + 绝对前缀双形态），逃逸不成立 → deny
+const relOut = path.relative(plannerWs, plannerOut);
+for (const tp of [
+  `${relOut}/../../plan-verdicts.json`, // ../ 穿越出产出目录 → run 治理产物
+  `${plannerOut}/../conversation.json`, // 同上（直接上跳一级）
+]) {
+  const td = evaluateToolCall(plannerPolicy, write(tp));
+  assert(td.decision === "deny", `planner write 穿越形态 ${tp} → deny（got ${td.decision}/${td.rule}）`);
+}
 
-// 读项目文件 / 普通命令 → allow
+// bash 触碰 run 目录 / .agt → deny；写族（重定向到白名单外 / tee / dd / cp / mv /
+// ln / mkdir / rm / sed -i / sudo）→ deny（HostPiAudit P1：bash 写通道封堵）
+const bashDenyCases = [
+  `cat ${plannerRun}/plan-verdicts.json`,
+  `cat ../${path.basename(plannerState)}/runs/run-1/plan-verdicts.json`,
+  "ls .alfred/runs",
+  "cat planner/../.agt/policy.json",
+  "echo x > out.txt",
+  "echo x | tee out.txt",
+  "dd if=/dev/zero of=out.txt bs=1 count=1",
+  `cp /etc/passwd ${plannerRun}/stolen.json`,
+  `mv src/lib.rs ${plannerRun}/lib.rs`,
+  "ln -s /etc/passwd pwn",
+  "mkdir rogue-dir",
+  "rm -rf ws",
+  "rm stale.tmp",
+  "sed -i 's/a/b/' src/lib.rs",
+  "sudo ls",
+];
+for (const cmd of bashDenyCases) {
+  const bd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(bd.decision === "deny" && bd.reason === "路径不在允许的工作范围", `planner bash ${cmd} → deny 中性（got ${bd.decision}/${bd.rule}/${bd.reason}）`);
+}
+
+// 读项目文件 / 普通只读命令 → allow（隔离面只封治理产物与写通道，不误伤）
 const p3 = evaluateToolCall(plannerPolicy, bash("cat src/main.rs"));
 assert(p3.decision === "allow", `planner read（bash cat 项目文件）→ allow（got ${p3.decision}）`);
 const p3b = evaluateToolCall(plannerPolicy, read(`${plannerWs}/README.md`));
 assert(p3b.decision === "allow", `planner read（read 项目文件）→ allow（got ${p3b.decision}）`);
-
+const p3c = evaluateToolCall(plannerPolicy, bash("git status --porcelain"));
+assert(p3c.decision === "allow", `planner bash git status → allow（got ${p3c.decision}/${p3c.rule}）`);
+const p3d = evaluateToolCall(plannerPolicy, bash("ls src"));
+assert(p3d.decision === "allow", `planner bash ls src → allow（got ${p3d.decision}）`);
+const p3e = evaluateToolCall(plannerPolicy, bash("grep -rn todo src | wc -l"));
+assert(p3e.decision === "allow", `planner bash grep|wc → allow（got ${p3e.decision}）`);
 // 无 path 的 write：target_path 缺失 → .startswith 返回 false 非抛错 → 规则不命中 → default allow
 const p4 = evaluateToolCall(plannerPolicy, { tool_name: "write", args: { content: "x" } });
 assert(p4.decision === "allow", `planner write 无 path → allow（got ${p4.decision}）`);
 delete process.env.AGT_WORKSPACE_DIR;
-
+for (const d of [plannerWs, plannerState]) rmSync(d, { recursive: true, force: true });
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
 }
 console.log("\nALL PASS: AGT 策略求值原型（确定性）");
 
-if (failures > 0) {
-  console.error(`\n${failures} assertion(s) failed`);
-  process.exit(1);
-}
-console.log("\nALL PASS: AGT 策略求值原型（确定性）");

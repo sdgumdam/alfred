@@ -7,7 +7,8 @@
     {
       "name": "allow-write-to-outputs",
       "description": "产出目录放行（占位符由宿主落盘后按 run 渲染注入）",
-      "condition": "(tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('{outputs_dir}') or target_path.startswith('{outputs_dir_rel}'))",
+      "condition": "tool_name == 'write' or tool_name == 'edit'",
+      "path_prefixes": ["{outputs_dir}", "{outputs_dir_rel}"],
       "action": "allow",
       "priority": 30
     },
@@ -22,7 +23,8 @@
     {
       "name": "deny-governance-files",
       "description": "路径不在允许的工作范围",
-      "condition": "(tool_name == 'read' or tool_name == 'write' or tool_name == 'edit') and (target_path.startswith('{run_dir}') or target_path.startswith('{run_dir_rel}') or target_path.startswith('{agt_work}'))",
+      "condition": "tool_name == 'read' or tool_name == 'write' or tool_name == 'edit'",
+      "path_prefixes": ["{run_dir}", "{run_dir_rel}", "{agt_work}"],
       "action": "deny",
       "priority": 25
     },
@@ -57,7 +59,8 @@
     {
       "name": "deny-write-to-workspace",
       "description": "路径不在允许的工作范围",
-      "condition": "(tool_name == 'write' or tool_name == 'edit') and target_path.startswith('{workspace_dir}')",
+      "condition": "tool_name == 'write' or tool_name == 'edit'",
+      "path_prefixes": ["{workspace_dir}"],
       "action": "deny",
       "priority": 20
     }
