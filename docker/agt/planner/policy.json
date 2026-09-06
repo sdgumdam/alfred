@@ -18,7 +18,7 @@
       "condition": "tool_name == 'bash'",
       "command_patterns": [{ "source": "{outputs_redirect_allow}", "flags": "i" }],
       "action": "allow",
-      "priority": 40
+      "priority": 34
     },
     {
       "name": "deny-governance-files",
@@ -26,7 +26,7 @@
       "condition": "tool_name == 'read' or tool_name == 'write' or tool_name == 'edit'",
       "path_prefixes": ["{run_dir}", "{run_dir_rel}", "{agt_work}"],
       "action": "deny",
-      "priority": 35
+      "priority": 36
     },
     {
       "name": "deny-bash-governance-paths",
@@ -41,7 +41,7 @@
         { "source": "(?i)(?:verdict|conversation|audit|run[ _-]?dir)", "flags": "" }
       ],
       "action": "deny",
-      "priority": 35
+      "priority": 38
     },
     {
       "name": "deny-bash-write-family",
@@ -59,7 +59,7 @@
         { "source": "\\bsudo\\b", "flags": "i" }
       ],
       "action": "deny",
-      "priority": 35
+      "priority": 32
     },
     {
       "name": "deny-write-to-workspace",
