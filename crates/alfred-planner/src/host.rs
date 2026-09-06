@@ -510,4 +510,128 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("auth.json")).unwrap(), "{}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 渲染语义（HostPiAudit P0 负向断言）：占位符按**真实 run 目录**渲染——
+    /// run 目录放 `$ALFRED_STATE_DIR` 布局（项目根之外任意路径），渲染后：
+    /// 无占位符残留、JSON 合法、condition/path_prefixes 含真实 run 绝对路径、
+    /// 正则 source 含转义后的 run/outputs 绝对形态。
+    #[test]
+    fn render_planner_policy_derives_prefixes_from_real_run_dir() {
+        let base = std::env::temp_dir().join(format!("alfred-render-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project_root = base.join("ws");
+        // run 根在项目根之外（$ALFRED_STATE_DIR/~/.local/state/alfred 布局）。
+        let run_dir = base.join("state/runs/run-1");
+        let outputs_dir = run_dir.join(PLANNER_WORK_DIR).join(OUTPUTS_DIR);
+        let rendered = render_planner_policy(
+            alfred_executor::agt::assets::PLANNER_POLICY,
+            &run_dir,
+            &outputs_dir,
+            &project_root,
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&rendered).expect("rendered policy is valid JSON");
+
+        // 无占位符残留（新 {…} 形态 + 旧 __…__ 形态都不得出现）。
+        for token in [
+            "{run_dir}", "{run_dir_rel}", "{outputs_dir}", "{outputs_dir_rel}",
+            "{agt_work}", "{workspace_dir}", "{run_dir_pattern}",
+            "{agt_work_pattern}", "{outputs_redirect_allow}",
+            "__RUNS_DIR__", "__OUTPUTS_DIR__", "__AGT_WORK__", "__WORKSPACE_DIR__",
+        ] {
+            assert!(!rendered.contains(token), "占位符未渲染: {token}");
+        }
+
+        let run_abs = absolut(&run_dir).unwrap();
+        let out_abs = absolut(&outputs_dir).unwrap();
+        let ws_abs = absolut(&project_root).unwrap();
+        let agt_work_abs = absolut(&run_dir.join(PLANNER_WORK_DIR).join("agt")).unwrap();
+
+        // deny-governance-files：path_prefixes 含真实 run 目录绝对前缀（P0 核心——
+        // 旧策略写死 <ws>/.alfred/runs，此 run 从不命中）。
+        let gov = doc["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "deny-governance-files")
+            .expect("deny-governance-files rule");
+        let prefixes = gov["path_prefixes"].as_array().unwrap();
+        assert!(
+            prefixes.iter().any(|p| p.as_str() == Some(run_abs.as_str())),
+            "path_prefixes 缺真实 run 绝对前缀 {run_abs}: {prefixes:?}"
+        );
+        assert!(
+            prefixes.iter().any(|p| p.as_str() == Some(agt_work_abs.as_str())),
+            "path_prefixes 缺 agt 工作目录前缀"
+        );
+
+        // allow 白名单与 workspace deny 同样含真实绝对前缀。
+        let allow = doc["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "allow-write-to-outputs")
+            .expect("allow-write-to-outputs rule");
+        assert!(
+            allow["path_prefixes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.as_str() == Some(out_abs.as_str())),
+            "allow path_prefixes 缺产出目录绝对前缀 {out_abs}"
+        );
+        let ws_deny = doc["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "deny-write-to-workspace")
+            .expect("deny-write-to-workspace rule");
+        assert!(
+            ws_deny["path_prefixes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.as_str() == Some(ws_abs.as_str())),
+            "deny-write-to-workspace 缺项目根绝对前缀"
+        );
+
+        // bash 侧正则 source：run 目录 / 产出目录转义形态（pattern 串内 `\.` 为
+        // 转义点号）。
+        let raw = doc["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "deny-bash-governance-paths")
+            .expect("deny-bash-governance-paths rule")["command_patterns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["source"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let escaped_run = regex_escape(&run_abs);
+        assert!(raw.contains(&escaped_run), "run 正则缺转义形态: {raw}");
+        let allow_re = doc["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "allow-bash-write-outputs")
+            .expect("allow-bash-write-outputs rule")["command_patterns"][0]["source"]
+            .as_str()
+            .unwrap();
+        assert!(
+            allow_re.contains(&regex_escape(&out_abs)),
+            "redirect allow 正则缺产出目录转义形态: {allow_re}"
+        );
+
+        // 反馈中性（HostPiAudit P1）：deny 规则的 description 统一中性语——
+        // 不泄露治理语义/规则名（allow 描述是放行说明，不在拒答反馈面上，不约束）。
+        for r in doc["rules"].as_array().unwrap() {
+            if r["action"].as_str() != Some("deny") {
+                continue;
+            }
+            let desc = r["description"].as_str().unwrap_or("");
+            assert_eq!(desc, "路径不在允许的工作范围", "deny 描述非中性: {desc}");
+        }
+    }
 }
