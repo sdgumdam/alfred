@@ -10,7 +10,7 @@
       "condition": "tool_name == 'write' or tool_name == 'edit'",
       "path_prefixes": ["{outputs_dir}", "{outputs_dir_rel}"],
       "action": "allow",
-      "priority": 30
+      "priority": 40
     },
     {
       "name": "allow-bash-write-outputs",
@@ -18,7 +18,7 @@
       "condition": "tool_name == 'bash'",
       "command_patterns": [{ "source": "{outputs_redirect_allow}", "flags": "i" }],
       "action": "allow",
-      "priority": 30
+      "priority": 40
     },
     {
       "name": "deny-governance-files",
@@ -26,7 +26,7 @@
       "condition": "tool_name == 'read' or tool_name == 'write' or tool_name == 'edit'",
       "path_prefixes": ["{run_dir}", "{run_dir_rel}", "{agt_work}"],
       "action": "deny",
-      "priority": 25
+      "priority": 35
     },
     {
       "name": "deny-bash-governance-paths",
@@ -35,10 +35,13 @@
       "command_patterns": [
         { "source": "\\.alfred/runs", "flags": "" },
         { "source": "\\.agt/", "flags": "" },
-        { "source": "{run_dir_pattern}", "flags": "" }
+        { "source": "{run_dir_pattern}(?!(/|\\\\)[^/\\\\]*(?:/|\\\\)(?:outputs|out)(?:/|\\\\|$))", "flags": "" },
+        { "source": "\\.alfred/runs|\\.alfred\\\\runs", "flags": "" },
+        { "source": "\\.\\.\\\\?/|\\.\\./|(?<=[\\s=])~(?:/|\\\\|$)|(?<=[\\s=])\\$HOME\\b|(?<=[\\s=])\\$\\{?HOME\\}?", "flags": "" },
+        { "source": "(?i)(?:verdict|conversation|audit|run[ _-]?dir)", "flags": "" }
       ],
       "action": "deny",
-      "priority": 25
+      "priority": 35
     },
     {
       "name": "deny-bash-write-family",
@@ -46,6 +49,8 @@
       "condition": "tool_name == 'bash'",
       "command_patterns": [
         { "source": "(?:^|[;|&\\s])>>?\\s*[^\\s|;&<>]+", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])>>?[^\\s|;&<>]", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])(?:[012]>>?|&>>?)\\s*[^\\s|;&<>]+", "flags": "i" },
         { "source": "(?:^|[;|&\\s])tee\\s", "flags": "i" },
         { "source": "(?:^|[;|&\\s])dd\\b[^|;&<>]*\\bof=", "flags": "i" },
         { "source": "(?:^|[;|&\\s])(?:cp|mv|ln|mkdir|rmdir|touch|truncate|chmod|chown)\\b", "flags": "i" },
@@ -54,7 +59,7 @@
         { "source": "\\bsudo\\b", "flags": "i" }
       ],
       "action": "deny",
-      "priority": 25
+      "priority": 35
     },
     {
       "name": "deny-write-to-workspace",
