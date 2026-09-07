@@ -358,7 +358,9 @@ for (const cmd of reviewRedirectProbes) {
   assert(rd.decision === "deny" && rd.rule === "deny-bash-governance-paths",
     `对抗探针③-2 review-outputs 重定向写 ${cmd.slice(0, 48)}… → deny（got ${rd.decision}/${rd.rule}）`);
 }
-// ④ 写族漏形态：无空格 `>`（>file）与 fd 限定 `2>` / `1>>` / `&>>` → deny。
+// ④ 写族漏形态：无空格 `>`（>file）与 fd 限定 `2>` / `1>>` / `&>>` → deny；
+//    fd 丢弃（`2>/dev/null` / `1>/dev/null`）→ allow（stderr/stdout 丢弃无害只读习惯，
+//    非写文件——DevnullFix 修复误杀：planner 标准探查 `ls ... 2>/dev/null | head` 整条被拦复发）。
 const redirectFormProbes = [
   "echo x >file.txt",
   "echo x >>file.txt",
@@ -370,6 +372,18 @@ const redirectFormProbes = [
 for (const cmd of redirectFormProbes) {
   const rd = evaluateToolCall(plannerPolicy, bash(cmd));
   assert(rd.decision === "deny", `对抗探针④ 写族漏形态 ${cmd} → deny（got ${rd.decision}/${rd.rule}）`);
+}
+// ④-2 fd 丢弃豁免（devnull-fix 回归面）：`2>/dev/null` / `1>/dev/null` 整条 allow；
+//    fd 指向真实文件（`2>file` / `2>>file`）仍 deny——负向先行只豁免 /dev/null 目标。
+const devnullAllowProbes = [
+  "ls src 2>/dev/null | head -30",
+  "find src 2>/dev/null | head -5",
+  "grep -rn todo src 2>/dev/null",
+  "cmd 1>/dev/null",
+];
+for (const cmd of devnullAllowProbes) {
+  const rd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(rd.decision === "allow", `fd 丢弃豁免④-2 ${cmd} → allow（got ${rd.decision}/${rd.rule}）`);
 }
 // ⑤ block reason 中性（复审③：真实反馈面 = 扩展层 agt-policy.ts 的 block 输出，
 //    非 engine reason）——模拟扩展层拼装，断言拼装产物不含规则名/治理语义词。

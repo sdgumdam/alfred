@@ -49,7 +49,7 @@
       "command_patterns": [
         { "source": "(?:^|[;|&\\s])>>?\\s*[^\\s|;&<>]+", "flags": "i" },
         { "source": "(?:^|[;|&\\s])>>?[^\\s|;&<>]", "flags": "i" },
-        { "source": "(?:^|[;|&\\s])(?:[012]>>?|&>>?)\\s*[^\\s|;&<>]+", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])(?:[012]>>?|&>>?)\\s*(?!/dev/null\\b)[^\\s|;&<>]+", "flags": "i" },
         { "source": "(?:^|[;|&\\s])tee\\s", "flags": "i" },
         { "source": "(?:^|[;|&\\s])dd\\b[^|;&<>]*\\bof=", "flags": "i" },
         { "source": "(?:^|[;|&\\s])(?:cp|mv|ln|mkdir|rmdir|touch|truncate|chmod|chown)\\b", "flags": "i" },
