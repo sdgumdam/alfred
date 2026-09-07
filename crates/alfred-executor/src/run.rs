@@ -21,16 +21,14 @@ use anyhow::{bail, Context, Result};
 use crate::agt::{assets, prepare_agt_work, AgtSource};
 use alfred_core::artifact::Artifact;
 use alfred_core::assignment::TaskAssignment;
-use alfred_core::contract::SandboxProfile;
+use alfred_core::contract::{SandboxProfile, VolumeMount};
 use alfred_core::request::OwnerRequest;
 use alfred_core::util::{now_rfc3339, short_id};
 use serde::Serialize;
 
 use crate::artifact::{collect_artifact, snapshot_workspace};
-use crate::compose_gen::{
-    canonicalize_workspace, generate_executor_compose, validate_workspace_subdir, ExecutorMounts,
-    CONTAINER_WORKSPACE_DIR,
-};
+use crate::compose_gen::{self, canonicalize_workspace, generate_executor_compose,
+    validate_workspace_subdir, ExecutorMounts, CONTAINER_WORKSPACE_DIR};
 use crate::config::ExecutorModel;
 use crate::driver::{absolutize_cwd, poll_container_driver, spawn_container_driver, DriverOutcome};
 use crate::task_gen::{generate_task_py, TaskGenParams};
@@ -169,20 +167,25 @@ pub fn init_workspace_git(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 校验 executor 沙箱档案（R6e）：仅允许契约声明的 `workspace_subdirs` 子集挂载。
-/// **空声明 = 防御性报错**（R6e 块B：executor ws 挂载非空保证——空声明是计划
-/// 缺陷，计划审查应打回重规划；不静默跳过挂载、不静默回退挂全量）。
-/// volumes/runtime/packages/network 执行驱动尚不支持——按审计约束显式拒绝而非
-/// 静默忽略，防止"申请的约束没生效"。
+/// 校验 executor 沙箱档案（R6e + 9/3 方案②：宿主材料进路 ref_volumes 打通）。
+///
+/// - `workspace_subdirs`：非空强制（R6e 块B：executor ws 挂载非空保证——空声明
+///   是计划缺陷，计划审查应打回重规划；不静默跳过挂载、不静默回退挂全量）。
+/// - `volumes`：**只读参考卷放行**（宿主材料进路：planner 声明
+///   `{"host_path","container_path","mode"}`，把任务要读的宿主材料以 ro 挂进
+///   执行容器）。逐卷校验放行条件：mode == "ro" + host 路径存在于宿主 +
+///   container 路径合法（绝对、不与工作区冲突）——校验真源
+///   [`validate_ref_volume`]（与 compose_gen 共用，单一真源）。
+/// - `runtime/packages/network`：执行驱动仍不支持——按审计约束显式拒绝而非
+///   静默忽略，防止"申请的约束没生效"。
 fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
-    if !sandbox.volumes.is_empty()
-        || sandbox.runtime.is_some()
-        || !sandbox.packages.is_empty()
-        || sandbox.network
-    {
+    if sandbox.runtime.is_some() || !sandbox.packages.is_empty() || sandbox.network {
         bail!(
-            "executor 沙箱档案不支持 volumes/runtime/packages/network（当前 sandbox={sandbox:?}）；仅支持 workspace_subdirs 子集挂载"
+            "executor 沙箱档案不支持 runtime/packages/network（当前 sandbox={sandbox:?}）；仅支持 workspace_subdirs + 只读 volumes（参考卷）"
         );
+    }
+    for vol in &sandbox.volumes {
+        validate_ref_volume(vol)?;
     }
     if sandbox.workspace_subdirs.is_empty() {
         // R6e 块B：executor ws 挂载非空保证——空声明 = 计划缺陷（计划审查应打回
@@ -192,6 +195,12 @@ fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// 只读参考卷单卷校验（9/3 方案②；`validate_executor_sandbox` 与 compose 生成
+/// 层共用真源，此处为 wrapper）。
+fn validate_ref_volume(vol: &VolumeMount) -> Result<()> {
+    compose_gen::validate_ref_volume(vol)
 }
 
 
@@ -204,9 +213,10 @@ pub fn execute_run(
     model: &ExecutorModel,
     request: &OwnerRequest,
 ) -> Result<RunOutcome> {
-    // 沙箱档案校验（R6e）：executor 支持契约声明的 workspace_subdirs 子集挂载
-    // （R6e 块B：非空挂载保证，空声明防御性报错）；volumes/runtime/packages/network
-    // 显式拒绝（审计约束：防止"申请的约束没生效"）。见 validate_executor_sandbox。
+    // 沙箱档案校验（R6e + 9/3 方案②）：executor 支持契约声明的 workspace_subdirs
+    // 子集挂载（R6e 块B：非空挂载保证，空声明防御性报错）+ 只读参考卷 volumes
+    // （宿主材料进路，逐卷校验）；runtime/packages/network 仍显式拒绝（审计约束：
+    // 防止"申请的约束没生效"）。见 validate_executor_sandbox。
     validate_executor_sandbox(&opts.assignment.sandbox)?;
     let started_at = now_rfc3339();
     let run_id = match opts.run_dir.file_name().and_then(|s| s.to_str()) {
@@ -244,12 +254,14 @@ pub fn execute_run(
     let compose_path = run_dir.join("executor.compose.yaml");
     // R6e：executor 容器挂载 = workspace_subdirs 声明子集（rw），非全量 ws（块B：
     // 非空挂载保证——空 subdirs 已被 validate_executor_sandbox 防御性报错）。
-    // 参考卷仍拒绝（sandbox 校验已拒 volumes）；AGT 拦写层照 reviewer 范式接入：
-    // 策略目录 /tmp/.agt ro（agent 不可改策略）+ 审计子目录 rw（审计落宿主）。
+    // 9/3 方案②：契约 sandbox.volumes 的宿主参考材料以 ro 挂进执行容器（挂载矩阵
+    // "只读参考卷由编排器按 SandboxProfile.volumes 动态追加"）；逐卷校验已过
+    // （validate_executor_sandbox → validate_ref_volume）。AGT 拦写层照
+    // reviewer 范式接入：策略目录 /tmp/.agt ro + 审计子目录 rw（审计落宿主）。
     let mounts = ExecutorMounts {
         workspace_subdirs: opts.assignment.sandbox.workspace_subdirs.clone(),
-        // 参考卷：sandbox 校验已拒绝 volumes（执行驱动不支持），恒空。
-        ref_volumes: vec![],
+        // 参考卷：契约声明的只读宿主材料卷（方案②动态追加挂载）。
+        ref_volumes: opts.assignment.sandbox.volumes.clone(),
         agt_dir: agt_work.clone(),
         agt_audit_dir: agt_work.as_ref().map(|p| p.join("audit")),
     };
@@ -293,6 +305,14 @@ pub fn execute_run(
         agt_ext,
         agt_policy_path,
         agt_audit_path,
+        // 9/3 方案②：参考卷容器内挂载点注入 AGT 豁免面（AGT_REF_VOLUMES）。
+        ref_volume_dirs: opts
+            .assignment
+            .sandbox
+            .volumes
+            .iter()
+            .map(|v| v.container_path.clone())
+            .collect(),
         task_name: "alfred-executor".to_string(),
     })?;
     std::fs::write(&driver_py, py)?;

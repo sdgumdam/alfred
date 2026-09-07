@@ -33,6 +33,9 @@ pub struct TaskGenParams {
     pub agt_policy_path: String,
     /// AGT 审计文件容器内路径（"/tmp/.agt/audit/audit.jsonl"）；与 `agt_ext` 同空。
     pub agt_audit_path: String,
+    /// 只读参考卷容器内挂载点列表（9/3 方案②；注入 driver env
+    /// `AGT_REF_VOLUMES`——AGT 扩展边界判定豁免面）。空 = 无参考卷。
+    pub ref_volume_dirs: Vec<String>,
     /// 样本 id（run id）。
     pub run_id: String,
     /// settled 后的宽限秒数（进程未在 EOF 退出则 kill）。
@@ -88,6 +91,10 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
         ("__AGT_EXT_JSON__", json(&params.agt_ext)?),
         ("__AGT_POLICY_PATH_JSON__", json(&params.agt_policy_path)?),
         ("__AGT_AUDIT_PATH_JSON__", json(&params.agt_audit_path)?),
+        (
+            "__REF_VOLUMES_JSON__",
+            json(&params.ref_volume_dirs.join(":"))?,
+        ),
         ("__RUN_ID_JSON__", json(&params.run_id)?),
         (
             "__SETTLE_GRACE_SECONDS__",
@@ -114,7 +121,8 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
         "__BRIDGE_MODEL_JSON__",
         "__MAX_TOKENS__",
         "__WORKSPACE_DIR_JSON__",
-        "__SANDBOX_USER_JSON__",
+        "__AGT_AUDIT_PATH_JSON__",
+        "__REF_VOLUMES_JSON__",
         "__AGT_EXT_JSON__",
         "__AGT_POLICY_PATH_JSON__",
         "__AGT_AUDIT_PATH_JSON__",

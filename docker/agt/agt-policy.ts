@@ -96,6 +96,35 @@ export function workspaceDir(): string {
   return dir && dir.trim() !== "" ? dir.trim().replace(/\/+$/, "") : DEFAULT_WORKSPACE_DIR;
 }
 
+/** 只读参考卷容器内挂载点（9/3 方案②：宿主材料进路）。
+ *
+ *  执行容器按契约 `sandbox.volumes` 把宿主参考材料以 ro 挂到 `/workspace` 之外的
+ *  独立路径（如 /references）。这些路径物理 ro（docker `:ro`），读取放行无需额外
+ *  拦写；但边界判定（pathEscapesWorkspace / commandEscapesWorkspace）按"/workspace
+ *  之外 = 逃逸"处理，会把 `cat /references/x.md` 误杀。此处在边界判定上把参考卷
+ *  子树视为工作区内（ro 物理只读兜底，写仍由挂载层拒绝）。
+ *
+ *  注入：driver env `AGT_REF_VOLUMES`（冒号分隔容器内绝对路径列表，如
+ *  `/references:/docs`；空/未设 = 无参考卷，语义不变）。运行时读取（每次调用），
+ *  同一扩展文件可被不同 env 的进程加载。
+ */
+export function refVolumeDirs(): string[] {
+  const raw = process.env.AGT_REF_VOLUMES;
+  if (!raw || raw.trim() === "") return [];
+  return raw
+    .split(":")
+    .map((d) => d.trim().replace(/\/+$/, ""))
+    .filter((d) => d.startsWith("/"));
+}
+
+/** 路径是否落在某个只读参考卷子树内（边界判定豁免面）。 */
+export function inRefVolume(p: string): boolean {
+  const abs = normalizePath(p);
+  return refVolumeDirs().some(
+    (dir) => abs === dir || abs.startsWith(dir + "/"),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 路径/命令逃逸判定（沙箱边界语义）
 // ---------------------------------------------------------------------------
@@ -117,20 +146,24 @@ export function normalizePath(p: string, cwd = workspaceDir()): string {
   return "/" + parts.join("/");
 }
 
-/** 路径是否逃逸工作区（绝对路径不在工作区根下，或 .. 上跳出）。 */
+/** 路径是否逃逸工作区（绝对路径不在工作区根下，或 .. 上跳出）。
+ *  9/3 方案②：只读参考卷子树不视为逃逸（物理 ro，读放行；写由挂载层拒绝）。 */
 export function pathEscapesWorkspace(p: string, cwd = workspaceDir()): boolean {
   const ws = workspaceDir();
   const abs = normalizePath(p, cwd);
+  if (inRefVolume(abs)) return false;
   return abs !== ws && !abs.startsWith(ws + "/");
 }
 
-/** 从命令文本提取的绝对路径 token 中，是否有任何逃逸工作区。 */
+/** 从命令文本提取的绝对路径 token 中，是否有任何逃逸工作区。
+ *  9/3 方案②：参考卷子树 token 豁免（cat /references/... 读宿主参考材料放行）。 */
 export function commandEscapesWorkspace(command: string): boolean {
   const tokens = String(command).match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
   for (const tok of tokens) {
     const t = tok.replace(/^['"]|['"]$/g, "");
     if (t.startsWith("/")) {
       if (!pathEscapesWorkspace(t)) continue;
+      if (inRefVolume(t)) continue;
       // 排除常见无害的只读系统工具参数（白名单）
       if (/^\/(usr|bin|sbin|opt)\//.test(t)) continue;
       return true;

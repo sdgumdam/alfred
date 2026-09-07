@@ -74,6 +74,63 @@ pub fn validate_workspace_subdir(sub: &str) -> Result<()> {
     Ok(())
 }
 
+/// 校验只读参考卷声明（9/3 方案②，放行条件真源——`validate_executor_sandbox`
+/// 与 `generate_executor_compose` 共用，单一真源）：
+///
+/// - `mode` 必须为 `"ro"`：参考卷一律只读（契约 §2.5"一律只读、不 cp 进工作区"；
+///   缺省 ro 由 serde default 保证，显式非 ro 值在此拒绝）。
+/// - `host_path` 必须绝对且存在于宿主：相对路径被 docker 静默变 named volume
+///   （E1 防呆）；宿主材料不存在 = 计划缺陷（防御性报错，不静默跳过挂载——
+///   防"申请的参考材料没生效"）。
+/// - `container_path` 必须绝对、非空、不含 `..`/`.`（挂载点合法性；禁 `/workspace`
+///   与 `/tmp/.agt` 保留挂载点冲突——工作区 rw 面与 AGT 策略面不被参考卷遮蔽）。
+pub fn validate_ref_volume(vol: &VolumeMount) -> Result<()> {
+    if vol.mode != "ro" {
+        bail!(
+            "ref volume mode must be 'ro' (参考卷一律只读), got: '{}'",
+            vol.mode
+        );
+    }
+    let host = Path::new(&vol.host_path);
+    if !host.is_absolute() {
+        bail!(
+            "ref volume host_path must be absolute: {} (E1: relative -v silently becomes a named volume)",
+            vol.host_path
+        );
+    }
+    if !host.exists() {
+        bail!(
+            "ref volume host_path does not exist on host: {}（宿主参考材料缺失 = 计划缺陷，拒绝静默跳过）",
+            vol.host_path
+        );
+    }
+    let target = Path::new(&vol.container_path);
+    if vol.container_path.is_empty() || !target.is_absolute() {
+        bail!(
+            "ref volume container_path must be an absolute path, got: '{}'",
+            vol.container_path
+        );
+    }
+    if target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    {
+        bail!(
+            "ref volume container_path must not contain '..' or '.': '{}'",
+            vol.container_path
+        );
+    }
+    for reserved in ["/workspace", "/tmp/.agt"] {
+        if target == Path::new(reserved) || target.starts_with(reserved) {
+            bail!(
+                "ref volume container_path '{}' conflicts with reserved mount point '{reserved}'",
+                vol.container_path
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 生成 executor 容器 compose：network none + `workspace_subdirs` 投影 + 参考卷 ro
 /// + AGT 挂载（R6a：矩阵 §1.1 executor 行落码）。
 ///
@@ -119,15 +176,10 @@ pub fn generate_executor_compose(
         volumes.push(format!("{}:{}:rw", host.display(), target));
     }
     for vol in &mounts.ref_volumes {
-        // E1 防呆：参考卷宿主路径必须绝对（相对路径被 docker 静默变 named volume）
-        let host = Path::new(&vol.host_path);
-        if !host.is_absolute() {
-            bail!(
-                "ref volume host_path must be absolute: {} (E1: relative -v silently becomes a named volume)",
-                vol.host_path
-            );
-        }
-        let host_abs = host
+        // 9/3 方案②：逐卷校验真源（mode ro + host 存在 + container 合法）与
+        // validate_executor_sandbox 共用（单一真源）。
+        validate_ref_volume(vol)?;
+        let host_abs = Path::new(&vol.host_path)
             .canonicalize()
             .with_context(|| format!("canonicalize ref volume host {}", vol.host_path))?;
         volumes.push(format!("{}:{}:ro", host_abs.display(), vol.container_path));

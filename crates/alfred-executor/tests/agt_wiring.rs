@@ -158,6 +158,7 @@ fn params(agt: (&str, &str, &str)) -> TaskGenParams {
         agt_ext: agt.0.into(),
         agt_policy_path: agt.1.into(),
         agt_audit_path: agt.2.into(),
+        ref_volume_dirs: vec![],
         run_id: "run-1".into(),
         settle_grace_seconds: 20.0,
         time_limit_secs: 600,

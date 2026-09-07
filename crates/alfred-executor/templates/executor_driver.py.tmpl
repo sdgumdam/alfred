@@ -64,6 +64,9 @@ SANDBOX_USER = __SANDBOX_USER_JSON__
 AGT_EXT = __AGT_EXT_JSON__
 AGT_POLICY_PATH = __AGT_POLICY_PATH_JSON__
 AGT_AUDIT_PATH = __AGT_AUDIT_PATH_JSON__
+# 只读参考卷容器内挂载点（冒号分隔；空 = 无）。注入 pi env AGT_REF_VOLUMES，
+# AGT 扩展边界判定把参考卷子树豁免（物理 ro，读放行写拒绝）——9/3 方案②。
+REF_VOLUMES = __REF_VOLUMES_JSON__
 RUN_ID = __RUN_ID_JSON__
 SETTLE_GRACE_SECONDS = float(__SETTLE_GRACE_SECONDS__)
 TIME_LIMIT_SECS = float(__TIME_LIMIT_SECS__)
@@ -221,7 +224,8 @@ async def _run_container() -> None:
             if AGT_EXT:
                 env["AGT_POLICY_PATH"] = AGT_POLICY_PATH
                 env["AGT_AUDIT_PATH"] = AGT_AUDIT_PATH
-
+                if REF_VOLUMES:
+                    env["AGT_REF_VOLUMES"] = REF_VOLUMES
             cmd = ["pi", "--mode", "rpc", "--no-session", "--model", PI_MODEL]
             if AGT_EXT:
                 cmd += ["-e", AGT_EXT]

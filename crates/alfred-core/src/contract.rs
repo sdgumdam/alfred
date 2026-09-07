@@ -64,4 +64,14 @@ pub struct VolumeMount {
     pub host_path: String,
     /// 容器内挂载路径（建议独立路径如 /references，不与工作区混）。
     pub container_path: String,
+    /// 挂载模式：只许 `"ro"`（缺省 ro——参考卷一律只读，契约 §2.5：不 cp 进
+    /// 工作区）。非 ro 值在执行侧 `validate_ref_volume` 显式拒绝。
+    #[serde(default = "default_volume_mode")]
+    pub mode: String,
+}
+
+/// `VolumeMount.mode` 缺省值（"ro"——serde default 函数，字符串字段不能用
+/// `#[serde(default)]` 的 Default::default() 空串语义）。
+fn default_volume_mode() -> String {
+    "ro".to_string()
 }
