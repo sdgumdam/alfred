@@ -643,51 +643,73 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
     };
     match execute_run(&opts, &ctx.executor_model, &run.request) {
         Ok(outcome) => {
-            audit(
-                &ctx.run_dir,
-                "execution_succeeded",
-                &serde_json::json!({
-                    "task_id": node.id,
-                    "eval_status": outcome.eval_status,
-                    "artifact_changes": outcome.artifact.as_ref().map(|a| a.changes.len()),
-                }),
-            )?;
-            run.apply(GovernanceEvent::ExecutionSucceeded)?;
+            let intent = StepIntent::Proceed {
+                event: GovernanceEvent::ExecutionSucceeded,
+                payload: StepPayload {
+                    audit_name: "execution_succeeded".into(),
+                    audit_data: serde_json::json!({
+                        "task_id": node.id,
+                        "eval_status": outcome.eval_status,
+                        "artifact_changes": outcome.artifact.as_ref().map(|a| a.changes.len()),
+                    }),
+                    ..Default::default()
+                },
+            };
+            commit_intent(run, ctx, intent)?;
             Ok(())
         }
         Err(e) => {
             // 机械失败判定：driver error / timeout / crash（读 exec 子 run 的 state.json）。
             let mechanical = exec_state_is_mechanical(&exec_dir)?;
-            if mechanical {
+            let intent = if mechanical {
                 if !run.mechanical_exhausted() {
                     run.attempts_used += 1;
-                    run.apply(GovernanceEvent::ExecutionFailedRetry)?;
-                    audit(
-                        &ctx.run_dir,
-                        "mechanical_retry",
-                        &serde_json::json!({ "attempt": run.attempts_used, "budget": run.mechanical_budget, "error": format!("{e:#}") }),
-                    )?;
-                    println!(
-                        "[orchestrator] 执行机械失败，按同一契约重跑（{}/{}）：{e}",
-                        run.attempts_used, run.mechanical_budget
-                    );
+                    let attempt = run.attempts_used;
+                    // HEAD 顺序（execution_step 特有）：apply(ExecutionFailedRetry)
+                    // 在前 → mechanical_retry 审计在后（post_apply_audit 通道保序）
+                    // → println 重跑提示。
+                    StepIntent::Proceed {
+                        event: GovernanceEvent::ExecutionFailedRetry,
+                        payload: StepPayload {
+                            audit_name: "mechanical_retry".into(),
+                            audit_data: serde_json::json!({}),
+                            post_apply_audit: Some((
+                                "mechanical_retry".to_string(),
+                                serde_json::json!({
+                                    "attempt": attempt,
+                                    "budget": run.mechanical_budget,
+                                    "error": format!("{e:#}"),
+                                }),
+                            )),
+                            post_apply_notice: Some(format!(
+                                "[orchestrator] 执行机械失败，按同一契约重跑（{}/{}）：{e}",
+                                attempt, run.mechanical_budget
+                            )),
+                            ..Default::default()
+                        },
+                    }
                 } else {
-                    run.apply(GovernanceEvent::ExecutionFailedEscalate)?;
-                    audit(
-                        &ctx.run_dir,
-                        "mechanical_budget_exhausted_escalated",
-                        &serde_json::json!({ "error": format!("{e:#}") }),
-                    )?;
+                    StepIntent::Proceed {
+                        event: GovernanceEvent::ExecutionFailedEscalate,
+                        payload: StepPayload {
+                            audit_name: "mechanical_budget_exhausted_escalated".into(),
+                            audit_data: serde_json::json!({ "error": format!("{e:#}") }),
+                            ..Default::default()
+                        },
+                    }
                 }
             } else {
                 // 非机械的硬错误（如非默认沙箱档案）→ 升级属主，不悄悄放行。
-                audit(
-                    &ctx.run_dir,
-                    "execution_hard_error_escalated",
-                    &serde_json::json!({ "error": format!("{e:#}") }),
-                )?;
-                run.apply(GovernanceEvent::ExecutionFailedEscalate)?;
-            }
+                StepIntent::Proceed {
+                    event: GovernanceEvent::ExecutionFailedEscalate,
+                    payload: StepPayload {
+                        audit_name: "execution_hard_error_escalated".into(),
+                        audit_data: serde_json::json!({ "error": format!("{e:#}") }),
+                        ..Default::default()
+                    },
+                }
+            };
+            commit_intent(run, ctx, intent)?;
             Ok(())
         }
     }

@@ -67,12 +67,14 @@ pub struct StepPayload {
     pub audit_name: String,
     /// ConverseDone 维护输入（PlanProduced 路径必触发；reply_summary=计划摘要）。
     pub converse_maintain: Option<ConverseMaintain>,
-    /// apply 后审计通道（HEAD `mechanical_retry_from_verdict` 在 apply/attempts
-    /// 调整之后落——少数派顺序，显式通道保序；其余事件一律 None）。
+    /// apply 后审计通道（HEAD `mechanical_retry*` 在 apply/attempts 调整之后落
+    /// ——少数派顺序，显式通道保序；其余事件一律 None）。
     pub post_apply_audit: Option<(String, Value)>,
     /// PlanReviewed 维护输入（plan_review_rejected 路径：拒绝理由原文；
     /// disguise 投影在 maintain_after_plan_review 内做——HEAD 语义不变）。
     pub plan_reviewed_maintain: Option<String>,
+    /// apply 后属主可见提示（execution_step 机械重跑 println；转移生效后呈现）。
+    pub post_apply_notice: Option<String>,
 }
 
 /// 审查结论归档通道（区分 push 进哪条 verdict 历史）。
@@ -174,19 +176,19 @@ pub fn commit_intent(
                 }
                 run.dagspec = Some(dagspec.clone());
             }
-            if let Some(reason) = &payload.plan_reviewed_maintain {
-                // PlanReviewed 维护（审查结论落定后，apply 前）：拒绝理由经
-                // disguise 投影（属主口吻中性转写——维护者零 reviewer 痕迹）。
-                maintain_after_plan_review(run, ctx, reason)?;
-            }
+            // ---- 2. 状态机转移 ----
             run.apply(event)?;
-            // ---- 2b. apply 后审计（HEAD 顺序：mechanical_retry_from_verdict 在
-            // attempts 调整/apply 之后落——经 post_apply_audit 通道保序）。
+            // ---- 2b. apply 后审计（HEAD 顺序：mechanical_retry* 在 apply/attempts
+            // 调整之后落——post_apply_audit 通道保序）。
             if let Some((name, data)) = payload.post_apply_audit {
                 audit(&ctx.run_dir, &name, &data)?;
             }
             // ---- 3. persist 单点 ----
             persist_governance_run(&ctx.run_dir, run)?;
+            // ---- 4. apply 后属主可见提示（persist 之后，与 HEAD println 时机一致）。
+            if let Some(notice) = payload.post_apply_notice {
+                println!("{notice}");
+            }
             Ok(None)
         }
     }
