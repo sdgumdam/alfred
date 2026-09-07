@@ -24,8 +24,10 @@
 //! - **终态**（completed/abandoned）：呈现结果 + "新需求请直接说 / Ctrl-D 退出"
 //!   → 回需求收集态。
 //! - **断点恢复**：run 从 state.json 恢复（P3 每转移 persist）；流转中间态
-//!   （plan_reviewing/executing）经 `run_governance_loop` 从断点续跑；ExecReviewing
-//!   的执行 outcome 仅存驱动进程内存（不落盘），磁盘恢复到该态显式报错不静默。
+//!   （plan_reviewing/executing/exec_reviewing）经 `run_governance_loop` 从断点
+//!   续跑——执行审查输入（契约/挂载语义/ws/对话记录）全在磁盘，exec_reviewing
+//!   照常磁盘重入（9/3 欠账修复，废"执行 outcome 不落盘无法续跑"死锁）；审查
+//!   失败走治理降级（escalated 挂起属主拍板）。
 //! - **错误处理（P3）**：feed/loop 的 Err catch + 打印 + 从 state.json reload 续
 //!   REPL（不退进程）；reload 失败（state.json 不可读）才退出。
 //! - **计划摘要呈现（P2）**：pi 建图后 owner 侧呈现计划摘要——读 conversation.json
@@ -96,12 +98,10 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
     if let Some(r) = run.as_mut() {
         if matches!(
             r.state(),
-            GovernanceState::PlanReviewing | GovernanceState::Executing
+            GovernanceState::PlanReviewing
+                | GovernanceState::Executing
+                | GovernanceState::ExecReviewing
         ) {
-            println!(
-                "[chat] run 处于流转中间态（{}），从断点续跑治理环…",
-                state_label(r.state())
-            );
             match drive_loop(run.as_mut().expect("run"), &run_dir) {
                 Ok(()) => {}
                 Err(e) => reload_after_error(&mut run, &run_dir, &e)?,
@@ -117,12 +117,17 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
             // ── 流转中间态：run_governance_loop 返回时必为挂起/终态/Reply 停驻；
             //    落到此处只可能是断点恢复/feed 出错 reload——直接续跑。 ──
             Some(GovernanceState::ExecReviewing) => {
-                // 执行 outcome 仅存于驱动进程内存（跨态传递不落盘）——从磁盘恢复到
-                // 该态无法续跑，显式报错不静默（无静默出口）。
-                bail!(
-                    "alfred chat: run 停在 exec_reviewing（执行审查中断，执行 outcome 不落盘无法续跑）——重新执行或人工介入：{}",
-                    run_dir.display()
-                );
+                // 磁盘重入（9/3 欠账，用户死锁链修复②）：执行审查输入（契约/挂载
+                // 语义/ws/对话记录）全在磁盘（run 目录 contract.json/dagspec/ws/
+                // exec-N），重入执行审查直接从磁盘组装、不依赖进程内执行 outcome
+                // （exec_review_step 已无 outcome 消费）。与 plan_reviewing/executing
+                // 同构：drive_loop 推进到挂起/终态；审查失败走治理降级（escalated
+                // 挂起拍板），不再"outcome 不落盘无法续跑"死锁。
+                let mut r = run.take().expect("intermediate state has run");
+                match drive_loop(&mut r, &run_dir) {
+                    Ok(()) => run = Some(r),
+                    Err(e) => reload_after_error(&mut run, &run_dir, &e)?,
+                }
             }
             Some(GovernanceState::PlanReviewing) | Some(GovernanceState::Executing) => {
                 let mut r = run.take().expect("intermediate state has run");

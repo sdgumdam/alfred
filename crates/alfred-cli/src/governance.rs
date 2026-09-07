@@ -57,9 +57,6 @@ pub fn run_governance_loop(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
 ) -> Result<Option<String>> {
-    // 执行结果跨态传递（Executing → ExecReviewing）。
-    let mut pending_exec: Option<alfred_executor::run::RunOutcome> = None;
-
     loop {
         audit(
             &ctx.run_dir,
@@ -96,16 +93,35 @@ pub fn run_governance_loop(
                     }
                 }
             }
-            alfred_core::governance::GovernanceState::PlanReviewing => plan_review_step(run, ctx)?,
+            alfred_core::governance::GovernanceState::PlanReviewing => {
+                // 9/3 欠账：计划审查失败（reviewer 宿主驱动超时/崩溃/verdict 落盘
+                // 失败）不走 Err 穿出卡死——与 exec_review_step 同构治理降级：
+                // fail_review 已落盘 outcome（timed_out/error），此处落升级事件
+                // （escalation_source=plan_review）挂起属主拍板，不悄悄放行。
+                if let Err(e) = plan_review_step(run, ctx) {
+                    review_host_failure_escalate(run, ctx, "plan_review", e)?;
+                }
+            }
             alfred_core::governance::GovernanceState::PlanRejected => {
                 // 挂起呈现已由循环顶 [orchestrator] 状态行承担。
                 return Ok(None);
             }
             alfred_core::governance::GovernanceState::Executing => {
-                pending_exec = execution_step(run, ctx)?;
+                // 执行失败路径（机械重跑/硬错误升级）在 execution_step 内处理；
+                // 成功 outcome 无消费方（R6d 起执行容器只出产物，执行审查输入全
+                // 在磁盘）——不再跨态传递进程内数据（磁盘重入，见 exec_review_step）。
+                execution_step(run, ctx)?;
             }
             alfred_core::governance::GovernanceState::ExecReviewing => {
-                exec_review_step(run, ctx, &mut pending_exec)?;
+                // 9/3 欠账（用户死锁链 run-18d1c83accf4c04002）：执行审查失败
+                // （reviewer 宿主驱动超时/失败）不再 Err 穿出卡死在 exec_reviewing
+                // ——execute_exec_review 失败路径已落盘 outcome（timed_out/error，
+                // 容器时代 fail_exec_review 语义），此处走治理降级：ExecReviewError
+                // → Escalated（escalation_source=execution，§六继承项"审查出错升级
+                // 不悄悄放行"），属主拍板续跑。
+                if let Err(e) = exec_review_step(run, ctx) {
+                    review_host_failure_escalate(run, ctx, "exec_review", e)?;
+                }
             }
             alfred_core::governance::GovernanceState::Completed => {
                 return Ok(None);
@@ -590,11 +606,9 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
     Ok(())
 }
 
-/// 返回执行结果（成功时 Some）；失败路径在函数内处理路由（重跑/升级）并返回 None。
-fn execution_step(
-    run: &mut GovernanceRun,
-    ctx: &GovernanceContext,
-) -> Result<Option<alfred_executor::run::RunOutcome>> {
+/// 执行成功/失败路由（机械重跑/硬错误升级）全在函数内处理；R6d 起执行容器只出
+/// 产物、执行审查输入全在磁盘——成功 outcome 无进程内消费方，不再返回。
+fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
     let dagspec = run
         .dagspec
         .clone()
@@ -649,7 +663,7 @@ fn execution_step(
                 }),
             )?;
             run.apply(GovernanceEvent::ExecutionSucceeded)?;
-            Ok(Some(outcome))
+            Ok(())
         }
         Err(e) => {
             // 机械失败判定：driver error / timeout / crash（读 exec 子 run 的 state.json）。
@@ -684,7 +698,7 @@ fn execution_step(
                 )?;
                 run.apply(GovernanceEvent::ExecutionFailedEscalate)?;
             }
-            Ok(None)
+            Ok(())
         }
     }
 }
@@ -697,18 +711,16 @@ fn execution_step(
 /// 4000B/文件截断的内容。
 /// 离线回退（ALFRED_OFFLINE=1 或 ALFRED_EXEC_REVIEW_OFFLINE=1）：不跑 pi——
 /// 执行无审查结论 → 升级属主（§六继承项，不悄悄放行）。
-fn exec_review_step(
-    run: &mut GovernanceRun,
-    ctx: &GovernanceContext,
-    pending: &mut Option<alfred_executor::run::RunOutcome>,
-) -> Result<()> {
-    // 消费执行 outcome（Executing → ExecReviewing 跨态传递；R6d 后执行容器
-    // 不携带审查结论，仅保留跨态约束）。
-    pending
-        .take()
-        .context("governance state ExecReviewing without execution outcome")?;
+///
+/// 磁盘重入（9/3 欠账，用户死锁链修复②）：执行审查输入（契约/挂载语义/ws/
+/// 对话记录）全部在磁盘（run 目录 contract.json / dagspec / ws / exec-N），本步
+/// 不读任何进程内执行 outcome——进程在 Executing → ExecReviewing 之间崩溃后，
+/// 从 state.json=exec_reviewing 重入照常重跑执行审查（R6d 起执行容器不携带审查
+/// 结论，outcome 仅是历史跨态约束，已无消费方）。
+fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
     let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
         || std::env::var("ALFRED_EXEC_REVIEW_OFFLINE").as_deref() == Ok("1");
+
 
     let (verdict, unscored_reason) = if offline {
         (
@@ -821,6 +833,44 @@ fn exec_review_step(
             run.apply(GovernanceEvent::ExecReviewError)?;
         }
     }
+    Ok(())
+}
+
+/// 计划/执行审查宿主驱动失败 → 治理降级（9/3 欠账，用户自由使用路径死锁修复）。
+///
+/// reviewer 宿主 pi 超时/崩溃/产出失败时，`execute_plan_review` /
+/// `execute_exec_review` 的失败路径已把 outcome 落盘到审查目录（state.json +
+/// verdict.json，eval_status=timed_out/error，容器时代 fail_exec_review 语义）。
+/// 本函数在编排层接住穿出的 Err：落升级审计 → apply 升级事件（PlanReviewError /
+/// ExecReviewError → Escalated，来源 plan_review/execution）→ persist——run 挂起
+/// 属主拍板续跑，绝不 Err 穿出把 run 卡死在流转中间态。
+///
+/// 升级事件本身失败（审计/转移/persist Err）才向上穿出：磁盘不可写时静默吞掉
+/// 等于丢状态，宁可显式失败。
+fn review_host_failure_escalate(
+    run: &mut GovernanceRun,
+    ctx: &GovernanceContext,
+    mode: &str,
+    e: anyhow::Error,
+) -> Result<()> {
+    let event = match mode {
+        "plan_review" => GovernanceEvent::PlanReviewError,
+        "exec_review" => GovernanceEvent::ExecReviewError,
+        other => bail!("review_host_failure_escalate: 未知审查模式 {other:?}"),
+    };
+    audit(
+        &ctx.run_dir,
+        "review_host_failure_escalated",
+        &serde_json::json!({ "mode": mode, "error": format!("{e:#}") }),
+    )?;
+    run.apply(event)?;
+    persist_governance_run(&ctx.run_dir, run)?;
+    println!(
+        "[orchestrator] {}审查失败已升级属主（state=Escalated，挂起；审查 outcome 已落盘）。\n\
+         \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
+        if mode == "plan_review" { "计划" } else { "执行" },
+        ctx.run_dir.display()
+    );
     Ok(())
 }
 
