@@ -46,6 +46,12 @@ VERDICT = sys.argv[3] if len(sys.argv) > 3 else '{"pass": true, "reason": "plan 
 WRITE_TOOL = "write"
 VERDICT_OUTPUT = os.environ.get("ALFRED_MOCK_VERDICT_OUTPUT", "/outputs/verdict.json")
 TOOL_CALL_ID = "call_r6d_plan_write"
+# exec-review 停摆模式（exec-review-deadlock.sh）：ALFRED_MOCK_EXEC_STALL 非空时，
+# 请求目标是 exec-review 产出（prompt 给出的 verdict 绝对路径含 /exec-review/）→
+# 永不回包——pi 挂起不退出，宿主 driver 等满 time-limit 强制 kill →
+# "reviewer host pi timed out after Ns"（复现用户死锁链的 reviewer 超时）。
+# 计划审查请求（/plan-review/）照常返回 write 工具调用（正常写 verdict 闭环）。
+EXEC_STALL = bool(os.environ.get("ALFRED_MOCK_EXEC_STALL"))
 # 工具循环收尾纯文本（pi 拿到无 tool_calls 的回复即 settle）。
 CLOSE_TEXT = f"Verdict written to {VERDICT_OUTPUT}. Task complete."
 
@@ -125,11 +131,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             req = {}
         model = req.get("model", "unknown")
         usage = {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18}
+        # 本请求的 driver prompt 全文（system + user，字符串/分段两种形态都扫）——
+        # 判请求目标是计划审查还是执行审查（宿主形态 verdict 路径只在 prompt 里）。
+        prompt_text = ""
+        for m in req.get("messages") or []:
+            c = m.get("content")
+            if isinstance(c, str):
+                prompt_text += c + "\n"
+            elif isinstance(c, list):
+                prompt_text += " ".join(
+                    x.get("text", "") for x in c if isinstance(x, dict)
+                ) + "\n"
 
+        if EXEC_STALL and "/exec-review/" in prompt_text:
+            # exec-review 停摆：请求已记录，但**永不回包**——pi 的 LLM 请求挂起，
+            # pi 进程不退出，宿主 driver 等满 time-limit 强制 kill →
+            # "reviewer host pi timed out after Ns"（用户死锁链同款超时语义，
+            # 复现 run-18d1c83accf4c04002 的 reviewer driver timed_out）。
+            # 线程化 server（ThreadingTCPServer）下挂住本连接不影响其他请求。
+            import threading
+            threading.Event().wait()  # 永久阻塞
+            return
         if has_pi_write_tool(req) and not has_tool_role_message(req):
             # 计划审查首请求：驱动 pi 经正常 write 工具循环写 verdict.json。
+            # 路径单一真源 = driver prompt 给出的 outputs/verdict.json 绝对路径
+            # （宿主形态路径只在 prompt 里；ALFRED_MOCK_VERDICT_OUTPUT 仅旧容器
+            # 形态兜底）。找不到路径 → 兜底默认值（保持历史行为）。
+            import re
+            m = re.search(r"(/\S+/outputs/verdict\.json)", prompt_text)
+            write_path = m.group(1) if m else VERDICT_OUTPUT
             arguments = json.dumps(
-                {"path": VERDICT_OUTPUT, "content": VERDICT}, ensure_ascii=False
+                {"path": write_path, "content": VERDICT}, ensure_ascii=False
             )
             resp = {
                 "id": "chatcmpl-r6dmock-tool",
