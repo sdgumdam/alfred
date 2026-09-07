@@ -8,3 +8,4 @@
 //! driver 子命令（脚本/e2e 接口）。
 
 pub mod governance;
+pub mod governance_intent;

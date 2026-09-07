@@ -338,7 +338,7 @@ fn maintainer_opts(run: &GovernanceRun, ctx: &GovernanceContext) -> PlannerHostO
 /// `owner_message` = 本轮规划器 converse 的属主消息原文——维护者据此把原始
 /// 需求/属主补充固化进 key_conclusions（原始用例修复：轮1建图失败无答复时，
 /// 需求此前从未进会话记忆，下轮规划器"无需求基线"）。
-fn maintain_after_converse(
+pub(crate) fn maintain_after_converse(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
     read_paths: Vec<String>,
@@ -372,7 +372,7 @@ fn maintain_after_converse(
 /// 触发审查意见维护（PlanReviewed）：审查理由先经 `disguise_rejection` 转写为
 /// 属主口吻中性文本（disguise 投影——维护者不可见审查语义），再喂维护者落
 /// review_summary（磁盘真源字段名不变，投影层才改名 owner_feedback）。
-fn maintain_after_plan_review(
+pub(crate) fn maintain_after_plan_review(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
     reason: &str,
@@ -888,7 +888,7 @@ fn exec_state_is_mechanical(exec_dir: &Path) -> Result<bool> {
 }
 
 /// 落盘 dagspec.json。
-fn write_dagspec(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
+pub(crate) fn write_dagspec(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
     let text = serde_json::to_string_pretty(dagspec).context("serialize dagspec")?;
     std::fs::write(run_dir.join("dagspec.json"), text).context("write dagspec.json")
 }
@@ -898,7 +898,7 @@ fn write_dagspec(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
 /// 投影真源 = [`alfred_core::DagSpec::contract_json`]（首节点契约全字段，与
 /// reviewer 输入 contract.json 同源）。dagspec 每次落定即重写——重规划轮 planner
 /// 读到的恒为最新一轮自己写的契约。
-fn write_run_contract(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
+pub(crate) fn write_run_contract(run_dir: &Path, dagspec: &alfred_core::DagSpec) -> Result<()> {
     let text = dagspec.contract_json().context("serialize run contract")?;
     std::fs::write(run_dir.join("contract.json"), text).context("write contract.json")
 }
@@ -918,7 +918,7 @@ fn write_verdict_history<T: serde::Serialize>(
 ///
 /// M4-a：conversation.json 只承载 owner↔planner 语义轮次——落计划摘要，不落
 /// 原始建图指令 JSON（中间指令属实现细节，已在 llm-calls/ 审计，避免冗余）。
-fn format_plan_reply(dagspec: &alfred_core::DagSpec) -> String {
+pub(crate) fn format_plan_reply(dagspec: &alfred_core::DagSpec) -> String {
     let nodes: Vec<String> = dagspec
         .nodes
         .iter()
