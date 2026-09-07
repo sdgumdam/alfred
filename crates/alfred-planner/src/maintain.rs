@@ -52,6 +52,9 @@ pub enum MaintainTrigger {
         read_paths: Vec<String>,
         /// 本轮对话产出摘要（答复文本或计划摘要）——维护者判 key_conclusions。
         reply_summary: String,
+        /// 属主本轮消息原文（规划器 converse 的输入）——轮1建图失败时原始需求
+        /// 也要进维护者记忆（否则下轮规划器"无需求基线"，原始用例数据流缺口）。
+        owner_message: String,
     },
     PlanReviewed {
         /// 审查理由的**伪装转写**（属主口吻中性文本，`disguise_rejection` 产物）。
@@ -136,6 +139,7 @@ fn trigger_payload_section(trigger: &MaintainTrigger) -> String {
         MaintainTrigger::ConverseDone {
             read_paths,
             reply_summary,
+            owner_message,
         } => {
             let paths = if read_paths.is_empty() {
                 "（本轮无探查读取记录）".to_string()
@@ -147,7 +151,7 @@ fn trigger_payload_section(trigger: &MaintainTrigger) -> String {
                     .join("\n")
             };
             format!(
-                "本轮探查读过（宿主路径，判关键性收 key_file_paths）：\n{paths}\n\n本轮对话产出摘要（判 key_conclusions）：\n{reply_summary}"
+                "本轮探查读过（宿主路径，判关键性收 key_file_paths）：\n{paths}\n\n属主本轮消息（判 key_conclusions——属主确立的要求/结论固化进记忆）：\n{owner_message}\n\n本轮对话产出摘要（判 key_conclusions）：\n{reply_summary}"
             )
         }
         MaintainTrigger::PlanReviewed { disguised_review } => {
@@ -298,17 +302,38 @@ mod tests {
         }
     }
 
-    /// ConverseDone 载荷：喂路径清单 + 产出摘要（prompt 构造同源）。
+    /// ConverseDone 载荷：喂路径清单 + 属主本轮消息 + 产出摘要（prompt 构造同源）。
     #[test]
     fn converse_done_payload_lists_read_paths() {
         let trigger = MaintainTrigger::ConverseDone {
             read_paths: vec!["/ws/src/main.rs".into()],
+            owner_message: "需求：create hello.txt".into(),
             reply_summary: "答复：确认用 Rust".into(),
         };
         let prompt = trigger_payload_section(&trigger);
         assert!(prompt.contains("/ws/src/main.rs"));
         assert!(prompt.contains("答复：确认用 Rust"));
         assert!(prompt.contains("key_file_paths"));
+    }
+
+    /// 属主本轮消息进维护者 prompt（原始用例修复）：轮1建图失败无答复时，
+    /// 原始需求经 ConverseDone 载荷进维护者记忆——下轮 converse 才有需求基线。
+    #[test]
+    fn converse_done_payload_carries_owner_message() {
+        let trigger = MaintainTrigger::ConverseDone {
+            read_paths: vec![],
+            owner_message: "需求：create hello.txt\n\nCreate a file named hello.txt，\n\n验收标准：hello.txt exists".into(),
+            reply_summary: "（本轮无答复——建图失败）".into(),
+        };
+        let prompt = trigger_payload_section(&trigger);
+        assert!(
+            prompt.contains("属主本轮消息"),
+            "载荷缺属主本轮消息段标记：{prompt}"
+        );
+        assert!(
+            prompt.contains("Create a file named hello.txt"),
+            "属主消息原文未进维护者载荷：{prompt}"
+        );
     }
 
     /// PlanReviewed 载荷：只喂伪装转写（属主口吻），无审查语义词。
@@ -355,6 +380,7 @@ mod tests {
             let doc = SessionDoc::default();
             let trigger = MaintainTrigger::ConverseDone {
                 read_paths: vec![],
+                owner_message: "需求：create hello.txt".into(),
                 reply_summary: "答复：确认用 Rust".into(),
             };
             let updated = run_maintain(&opts, &model, &doc, &trigger)

@@ -318,14 +318,20 @@ fn maintainer_opts(run: &GovernanceRun, ctx: &GovernanceContext) -> PlannerHostO
 /// （run_maintain 内部落 role=maintain 记录）+ **推进持久审计基线**（维护成功
 /// 后才推进——失败/崩溃行不丢，下轮补提取）。维护失败**显式报错**——记忆坏了
 /// 要可见，不悄悄放行（无静默出口）。
+///
+/// `owner_message` = 本轮规划器 converse 的属主消息原文——维护者据此把原始
+/// 需求/属主补充固化进 key_conclusions（原始用例修复：轮1建图失败无答复时，
+/// 需求此前从未进会话记忆，下轮规划器"无需求基线"）。
 fn maintain_after_converse(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
     read_paths: Vec<String>,
+    owner_message: &str,
     reply_summary: &str,
 ) -> Result<()> {
     let trigger = MaintainTrigger::ConverseDone {
         read_paths,
+        owner_message: owner_message.to_string(),
         reply_summary: reply_summary.to_string(),
     };
     run.session_doc = run_maintain(
@@ -457,7 +463,13 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
             // 即用上新记忆。
             let read_paths =
                 alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
-            maintain_after_converse(run, ctx, read_paths, &format_plan_reply(&dagspec))?;
+            maintain_after_converse(
+                run,
+                ctx,
+                read_paths,
+                &owner_message,
+                &format_plan_reply(&dagspec),
+            )?;
             run.dagspec = Some(dagspec);
             run.apply(GovernanceEvent::PlanProduced)?;
             Ok(None)
@@ -479,10 +491,11 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
                 "converse_reply",
                 &serde_json::json!({ "record": record_path }),
             )?;
-            // ConverseDone 滚动维护：答复文本作为 reply_summary（key_conclusions 语义）。
+            // ConverseDone 滚动维护：答复文本作为 reply_summary（key_conclusions 语义）；
+            // 属主本轮消息一并进维护者记忆（原始用例修复：需求进 key_conclusions）。
             let read_paths =
                 alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
-            maintain_after_converse(run, ctx, read_paths, &reply)?;
+            maintain_after_converse(run, ctx, read_paths, &owner_message, &reply)?;
             Ok(Some(reply))
         }
     }

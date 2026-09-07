@@ -704,11 +704,12 @@ JSONL
 收到需求。技术选型确认一下：内容用 Rust 实现，可以吗？
 TXT
   # H1 维护者离线注入（模拟维护者 LLM 产出：轮1 key_file_paths 收 allow read
-  # 的宿主路径，不含 deny 的 state.json；reply 写路径不算 read——正确被排除）
+  # 的宿主路径，不含 deny 的 state.json；reply 写路径不算 read——正确被排除；
+  # key_conclusions 吸收属主本轮消息原文——需求进记忆，原始用例修复断言面）。
   cat > "$CASE_H/maintained-1.json" <<'JSON'
 {
   "key_file_paths": ["/tmp/r6b-h-src/main.rs", "/tmp/r6b-h-src/README.md"],
-  "key_conclusions": [],
+  "key_conclusions": ["属主需求：创建 hello.txt，内容必须是 Hello"],
   "owner_feedback": []
 }
 JSON
@@ -755,6 +756,9 @@ doc = state["session_doc"]
 # reply.txt 都不进——不可知：deny 路径泄露治理面）
 assert sorted(doc["key_file_paths"]) == ["/tmp/r6b-h-src/README.md", "/tmp/r6b-h-src/main.rs"], \
     f"key_file_paths={doc['key_file_paths']}"
+# 原始用例修复断言面：属主本轮消息（原始需求）经维护者固化进 key_conclusions
+assert doc["key_conclusions"] == ["属主需求：创建 hello.txt，内容必须是 Hello"], \
+    f"key_conclusions={doc['key_conclusions']}"
 assert doc["review_summary"] == [], f"review_summary={doc['review_summary']}"
 # 持久审计基线已推进到 4 行（维护成功后推进）
 baseline = open(os.path.join(run, "planner", "audit-baseline")).read().strip()
@@ -764,26 +768,29 @@ assert baseline == "4", f"audit-baseline={baseline}"
 recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
 maintain = [r for r in recs
             if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "maintain"]
-assert len(maintain) == 1, f"expect 1 maintain record, got {maintain}"
 rec = json.load(open(os.path.join(run, "llm-calls", maintain[0])))
 user = rec["messages"][-1]["content"]
 assert "/tmp/r6b-h-src/main.rs" in user and "/tmp/r6b-h-src/README.md" in user, \
     f"maintain prompt missing allow-read paths: {user}"
+# 属主本轮消息原文进维护者载荷（数据流缺口修复——需求进记忆）
+assert "属主本轮消息" in user, f"maintain prompt missing owner-message marker: {user}"
+assert "Create a file named hello.txt" in user, \
+    f"maintain prompt missing owner message verbatim: {user}"
 assert "state.json" not in user, f"maintain prompt leaked deny path: {user}"
 assert "reply.txt" not in user, f"maintain prompt leaked write path: {user}"
 PY
-  echo "PASS(caseH1): ConverseDone 维护轮1（allow read 宿主路径进 key_file_paths，deny/write 过滤，基线推进）"
-
+  echo "PASS(caseH1): ConverseDone 维护轮1（allow read 路径 + 属主消息进 key_conclusions，deny/write 过滤）"
   # H2 轮2：feed revise 续入（重规划）→ ConverseDone 维护（滚动累积：轮1的
   # key_file_paths 保留 + key_conclusions 新增；审计基线后新增 1 条 allow read）
   cat >> "$AGT_DIR/audit.jsonl" <<'JSONL'
 {"ts":"2026-09-01T00:01:00Z","tool_name":"read","path":"/tmp/r6b-h-src/Cargo.toml","decision":"allow","rule":null,"reason":"default_action=allow"}
 JSONL
-  # H2 维护者离线注入（维护者 LLM 一轮产出：滚动累积 + review_summary 吸收伪装反馈）
+  # H2 维护者离线注入（维护者 LLM 一轮产出：滚动累积——轮1的属主需求结论保留 +
+  # key_conclusions 新增属主答复；review_summary 吸收伪装反馈）
   cat > "$CASE_H/maintained-2.json" <<'JSON'
 {
   "key_file_paths": ["/tmp/r6b-h-src/main.rs", "/tmp/r6b-h-src/README.md", "/tmp/r6b-h-src/Cargo.toml"],
-  "key_conclusions": ["技术选型确认：用 Rust"],
+  "key_conclusions": ["属主需求：创建 hello.txt，内容必须是 Hello", "技术选型确认：用 Rust"],
   "owner_feedback": ["我重新看了下需求，你给的方案跟我要的不太对。你再按我原来的需求重新弄一版，别想当然。"]
 }
 JSON
@@ -837,7 +844,10 @@ assert state["state_machine"]["state"] == "plan_rejected", \
 assert sorted(doc["key_file_paths"]) == [
     "/tmp/r6b-h-src/Cargo.toml", "/tmp/r6b-h-src/README.md", "/tmp/r6b-h-src/main.rs"], \
     f"key_file_paths={doc['key_file_paths']}"
-assert doc["key_conclusions"] == ["技术选型确认：用 Rust"], \
+# ConverseDone 滚动累积（含 owner_message 数据流）：轮1 属主需求结论保留 + 轮2
+# 属主答复新增（滚动语义——原始需求不再丢，下轮规划器有需求基线）
+assert doc["key_conclusions"] == [
+    "属主需求：创建 hello.txt，内容必须是 Hello", "技术选型确认：用 Rust"], \
     f"key_conclusions={doc['key_conclusions']}"
 # PlanReviewed 维护：review_summary 落伪装转写（属主口吻，无禁词）
 assert doc["review_summary"], f"review_summary empty: {doc}"
@@ -873,6 +883,15 @@ assert maintain, "无 PlanReviewed 载荷的 maintain 记录"
 rec = json.load(open(os.path.join(run, "llm-calls", maintain[-1])))
 user = rec["messages"][-1]["content"]
 assert "属主对本轮方案的反馈" in user, f"PlanReviewed 载荷缺失: {user}"
+# ConverseDone 轮的维护者载荷必须带属主本轮消息原文（数据流缺口修复断言面）：
+converse_maintains = [r for r in recs
+            if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "maintain"
+            and "属主本轮消息" in json.load(open(os.path.join(run, "llm-calls", r)))["messages"][-1]["content"]]
+assert converse_maintains, "ConverseDone 维护载荷缺属主本轮消息段"
+cm = json.load(open(os.path.join(run, "llm-calls", converse_maintains[-1])))
+cm_user = cm["messages"][-1]["content"]
+assert "可以，技术选型用 Rust" in cm_user, \
+    f"ConverseDone 维护载荷缺属主答复原文: {cm_user}"
 forbidden = ["verdict", "review", "reviewer", "审查", "评审", "否决", "打回", "评分"]
 hits = [w for w in forbidden if w in user.lower()]
 assert not hits, f"维护者 prompt 泄露审查语义 {hits}: {user}"
