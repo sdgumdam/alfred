@@ -22,7 +22,7 @@
 //! [`StepIntent::Proceed`] 显式携带 `audit_name` + `audit_data`，不按事件名推导。
 use crate::governance::{
     audit, format_plan_reply, maintain_after_converse, maintain_after_plan_review,
-    persist_governance_run, write_dagspec, write_run_contract, GovernanceContext,
+    persist_governance_run, write_dagspec, GovernanceContext,
 };
 use alfred_core::conversation::{append_to_disk, ConversationRole, ConversationSource};
 use alfred_core::governance::{GovernanceEvent, GovernanceRun};
@@ -38,9 +38,9 @@ pub enum StepIntent {
         event: GovernanceEvent,
         payload: StepPayload,
     },
-    /// Reply 停驻（§2.4 答复分支）：conversation 轮 + ConverseDone 维护后**无
-    /// 事件**——state 停留 Planning，治理环返回调用方（reply 呈现给属主）。
-    Reply { text: String },
+    /// Reply 停驻（§2.4 答复分支）：conversation 轮 + 审计 + ConverseDone 维护
+    /// 后**无事件**——state 停留 Planning，治理环返回调用方（text 呈现给属主）。
+    Reply { text: String, payload: StepPayload },
     /// 治理降级（§六继承项）：step 宿主驱动失败，fail_* outcome 已由驱动落盘。
     /// `audit_name` 承载降级审计名（planning_error_escalated /
     /// plan_review_error_escalated / review_host_failure_escalated / …）。
@@ -57,7 +57,9 @@ pub enum StepIntent {
 pub struct StepPayload {
     /// 审查结论归档（plan/exec review 命中 verdict 分支时 push 进 run 历史）。
     pub verdict: Option<VerdictKind>,
-    /// 建图产物（PlanProduced 路径：contract/dagspec 落盘 + run.dagspec 替换）。
+    /// 建图产物（PlanProduced 路径）：conversation 轮 + contract/dagspec 落盘 +
+    /// run.dagspec 注入（reviewer_models 注入后的最终形态）+ ConverseDone 维护
+    /// ——全部 apply 前生效（HEAD 顺序）。
     pub dagspec: Option<DagSpec>,
     /// 各事件审计 data（planning_done 的 nodes、exec_review_passed 的 explanation 等）。
     pub audit_data: Value,
@@ -89,19 +91,42 @@ pub struct ConverseMaintain {
 
 /// 单点提交序列：副作用（apply 前）→ apply → persist。
 ///
-/// 返回 `Some(reply)` = Reply 停驻（治理环应把答复 surface 给调用方并停驻）。
-/// 返回 `None` = 已完成转移+persist（或 Escalate 降级），治理环继续。
+/// 返回 `Some(reply)` = Reply 停驻（治理环把答复 surface 给调用方并停驻）；
+/// `None` = 已完成转移+persist（或 Escalate 降级），治理环继续。
 pub fn commit_intent(
     run: &mut GovernanceRun,
     ctx: &GovernanceContext,
     intent: StepIntent,
 ) -> Result<Option<String>> {
     match intent {
-        StepIntent::Reply { text } => {
-            // conversation 轮 + ConverseDone 维护已在 step 侧的 Proceed/Reply
-            // 拆分中处理（Reply 的维护输入由 step 侧经 StepIntent::Reply 前置
-            // 调用 maintain 通道……不——Reply 的副作用也必须单点。见
-            // `commit_reply`：conversation + maintain + audit，无 apply/persist。
+        StepIntent::Reply { text, payload } => {
+            // Reply 停驻的副作用（HEAD 顺序，无 apply/无 persist）：
+            // conversation 轮（规划器原话答复）→ converse_reply 审计 → ConverseDone
+            // 维护（答复文本作 reply_summary——key_conclusions 语义；属主本轮消息
+            // 一并进维护者记忆）。失败照常 Err 穿出（治理降级统一出口）。
+            append_to_disk(
+                &ctx.run_dir,
+                &run.run_id,
+                ConversationRole::Planner,
+                text.clone(),
+                ConversationSource::ConverseReply,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("append converse.reply (reply branch) to conversation.json")?;
+            audit(
+                &ctx.run_dir,
+                &payload.audit_name,
+                &payload.audit_data,
+            )?;
+            if let Some(m) = &payload.converse_maintain {
+                maintain_after_converse(
+                    run,
+                    ctx,
+                    m.read_paths.clone(),
+                    &m.owner_message,
+                    &text,
+                )?;
+            }
             Ok(Some(text))
         }
         StepIntent::Escalate {
@@ -127,8 +152,6 @@ pub fn commit_intent(
             }
             // 1b. 事件审计。
             audit(&ctx.run_dir, &payload.audit_name, &payload.audit_data)?;
-            // 1c. PlanProduced 附加落盘：conversation 轮 → contract → dagspec
-            //     （reviewer_models 注入后）→ ConverseDone 维护（成功才推进基线）。
             if let Some(dagspec) = &payload.dagspec {
                 append_to_disk(
                     &ctx.run_dir,
@@ -139,7 +162,6 @@ pub fn commit_intent(
                 )
                 .map_err(anyhow::Error::msg)
                 .context("append converse.reply to conversation.json")?;
-                write_run_contract(&ctx.run_dir, dagspec)?;
                 write_dagspec(&ctx.run_dir, dagspec)?;
                 if let Some(m) = &payload.converse_maintain {
                     maintain_after_converse(
@@ -150,13 +172,13 @@ pub fn commit_intent(
                         &format_plan_reply(dagspec),
                     )?;
                 }
+                run.dagspec = Some(dagspec.clone());
             }
             if let Some(reason) = &payload.plan_reviewed_maintain {
                 // PlanReviewed 维护（审查结论落定后，apply 前）：拒绝理由经
                 // disguise 投影（属主口吻中性转写——维护者零 reviewer 痕迹）。
                 maintain_after_plan_review(run, ctx, reason)?;
             }
-            // ---- 2. 状态机转移 ----
             run.apply(event)?;
             // ---- 2b. apply 后审计（HEAD 顺序：mechanical_retry_from_verdict 在
             // attempts 调整/apply 之后落——经 post_apply_audit 通道保序）。
@@ -299,18 +321,42 @@ mod tests {
     }
 
     #[test]
-    fn reply_parks_without_transition_or_persist_side_effects() {
+    fn reply_parks_without_transition_and_flushes_named_side_effects() {
+        // 维护走离线恒等直通（单测不起宿主 pi；模型为 raw builtin 会 bail）。
+        std::env::set_var("ALFRED_MAINTAIN_OFFLINE", "1");
         let (ctx, dir) = temp_ctx("reply");
         let mut run = test_run();
         let intent = StepIntent::Reply {
             text: "需要先确认目录结构。".into(),
+            payload: StepPayload {
+                audit_name: "converse_reply".into(),
+                audit_data: json!({ "record": "llm-calls/0000.json" }),
+                converse_maintain: Some(ConverseMaintain {
+                    read_paths: vec![],
+                    owner_message: "属主原话".into(),
+                }),
+                ..Default::default()
+            },
         };
         let out = commit_intent(&mut run, &ctx, intent).unwrap();
         assert_eq!(out.as_deref(), Some("需要先确认目录结构。"));
         // 无转移：state 停留 Planning。
         assert_eq!(run.state(), GovernanceState::Planning);
-        // 无审计/无 persist（Reply 的 conversation 轮由 step 侧落，见拆分阶段）。
-        assert!(!dir.join("audit.jsonl").exists());
+        // 具名审计已 flush；conversation 轮已落；无 persist（无转移）。
+        let events = audit_events(&dir);
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["converse_reply", "maintain_done"]);
+        let conv: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("conversation.json")).unwrap(),
+        )
+        .unwrap();
+        let contents: Vec<&str> = conv["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["content"].as_str().unwrap())
+            .collect();
+        assert!(contents.contains(&"需要先确认目录结构。"));
         assert!(!dir.join("state.json").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -12,7 +12,9 @@
 //! （§六继承项，不悄悄放行）。单节点骨架显式拒绝多节点 DAG（P2，不静默截断）。
 use std::path::{Path, PathBuf};
 
-use crate::governance_intent::{commit_intent, StepIntent, StepPayload, VerdictKind};
+use crate::governance_intent::{
+    commit_intent, ConverseMaintain, StepIntent, StepPayload, VerdictKind,
+};
 
 use alfred_core::conversation::{
     append_to_disk, load_conversation, ConversationRole, ConversationSource,
@@ -438,18 +440,6 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
             dagspec,
             record_path,
         } => {
-            // R6a：对话记录——converse 落定后 append（reviewer 挂载输入数据源，§二.8）。
-            // M4-a：conversation.json 只承载语义轮次——落 planner 的语义回复（计划摘要），
-            // 不落原始建图指令 JSON（中间指令属实现细节，已在 llm-calls/ 审计）。
-            append_to_disk(
-                &ctx.run_dir,
-                &run.run_id,
-                ConversationRole::Planner,
-                format_plan_reply(&dagspec),
-                ConversationSource::ConverseReply,
-            )
-            .map_err(anyhow::Error::msg)
-            .context("append converse.reply to conversation.json")?;
             let mut dagspec = dagspec;
             // 矩阵 §1.1 第 7 行：planner 回看"自己写的契约"——run 级 contract.json 由
             // 容器驱动首轮落 `{}` 占位（run_planner_container），dagspec 落定时这里写真
@@ -460,61 +450,52 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
             for node in &mut dagspec.nodes {
                 node.contract.reviewer_models = vec![ctx.reviewer_model.model.clone()];
             }
-            write_dagspec(&ctx.run_dir, &dagspec)?;
             let node_summaries: Vec<String> = dagspec
                 .nodes
                 .iter()
                 .map(|n| format!("{}:{}", n.id, n.summary))
                 .collect();
-            audit(
-                &ctx.run_dir,
-                "planning_done",
-                &serde_json::json!({
-                    "request_id": dagspec.request_id,
-                    "node_count": dagspec.nodes.len(),
-                    "nodes": node_summaries,
-                    "record": record_path,
-                }),
-            )?;
-            // ConverseDone 滚动维护（每轮 converse 落定后）：key_file_paths（本轮
-            // AGT 审计 allow read 增量）+ key_conclusions（计划摘要）——下轮 converse
-            // 即用上新记忆。
+            let planning_done_data = serde_json::json!({
+                "request_id": dagspec.request_id,
+                "node_count": dagspec.nodes.len(),
+                "nodes": node_summaries,
+                "record": record_path,
+            });
             let read_paths =
                 alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
-            maintain_after_converse(
-                run,
-                ctx,
-                read_paths,
-                &owner_message,
-                &format_plan_reply(&dagspec),
-            )?;
-            run.dagspec = Some(dagspec);
-            run.apply(GovernanceEvent::PlanProduced)?;
+            let intent = StepIntent::Proceed {
+                event: GovernanceEvent::PlanProduced,
+                payload: StepPayload {
+                    dagspec: Some(dagspec),
+                    audit_name: "planning_done".into(),
+                    audit_data: planning_done_data,
+                    converse_maintain: Some(ConverseMaintain {
+                        read_paths,
+                        owner_message,
+                    }),
+                    ..Default::default()
+                },
+            };
+            commit_intent(run, ctx, intent)?;
             Ok(None)
         }
         // ---- §2.4 答复分支：纯文本答复给属主，不强制产 DagSpec（对话继续） ----
         ConverseOutcome::Reply { reply, record_path } => {
-            // M4-a：conversation.json 落规划器原话答复（语义轮次），不产计划。
-            append_to_disk(
-                &ctx.run_dir,
-                &run.run_id,
-                ConversationRole::Planner,
-                reply.clone(),
-                ConversationSource::ConverseReply,
-            )
-            .map_err(anyhow::Error::msg)
-            .context("append converse.reply (reply branch) to conversation.json")?;
-            audit(
-                &ctx.run_dir,
-                "converse_reply",
-                &serde_json::json!({ "record": record_path }),
-            )?;
-            // ConverseDone 滚动维护：答复文本作为 reply_summary（key_conclusions 语义）；
-            // 属主本轮消息一并进维护者记忆（原始用例修复：需求进 key_conclusions）。
             let read_paths =
                 alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
-            maintain_after_converse(run, ctx, read_paths, &owner_message, &reply)?;
-            Ok(Some(reply))
+            let intent = StepIntent::Reply {
+                text: reply.clone(),
+                payload: StepPayload {
+                    audit_name: "converse_reply".into(),
+                    audit_data: serde_json::json!({ "record": record_path }),
+                    converse_maintain: Some(ConverseMaintain {
+                        read_paths,
+                        owner_message,
+                    }),
+                    ..Default::default()
+                },
+            };
+            commit_intent(run, ctx, intent)
         }
     }
 }
