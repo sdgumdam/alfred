@@ -57,8 +57,12 @@ impl Default for SandboxProfile {
 }
 
 /// 挂载卷（限界上下文 §6.3.1）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+///
+/// **反序列化容错（原始用例修复）**：pi 建图偶尔按教学输出的字段名写
+/// `readonly` 别名（实测 `readonly: true`）——规范 schema `deny_unknown_fields`
+/// 直接拒绝会把真需求打成 planning_error_escalated。这里接受常见别名并归一
+/// 成 `mode`；规范 `mode` 字段在场即权威；未知字段仍拒（防真错）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VolumeMount {
     /// 宿主机路径（planner 申请的范围，计划审查按最小权限审）。
     pub host_path: String,
@@ -66,12 +70,85 @@ pub struct VolumeMount {
     pub container_path: String,
     /// 挂载模式：只许 `"ro"`（缺省 ro——参考卷一律只读，契约 §2.5：不 cp 进
     /// 工作区）。非 ro 值在执行侧 `validate_ref_volume` 显式拒绝。
-    #[serde(default = "default_volume_mode")]
     pub mode: String,
 }
 
-/// `VolumeMount.mode` 缺省值（"ro"——serde default 函数，字符串字段不能用
-/// `#[serde(default)]` 的 Default::default() 空串语义）。
+/// `VolumeMount.mode` 缺省值（"ro"——无任何 mode/别名字段时的缺省；参考卷
+/// 一律只读）。
 fn default_volume_mode() -> String {
     "ro".to_string()
+}
+
+/// `readonly` / `read_only` 别名的取值形态（bool 或字符串，untagged）。
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum VolumeModeAlias {
+    Bool(bool),
+    Str(String),
+}
+
+impl VolumeModeAlias {
+    /// 归一成 `mode`：`true`/"ro"/"readonly"/"read-only"/"read_only" → "ro"；
+    /// `false`/"rw"/"readwrite"/"read-write"/"read_write" → "rw"。`false` 照实
+    /// 落 "rw"（语义不静默改写）——参考卷只读闸门由执行侧
+    /// `validate_ref_volume` 对非 ro 显式拒绝，解析层绝不悄悄升 ro。
+    fn into_mode(self) -> Result<String, String> {
+        match self {
+            VolumeModeAlias::Bool(true) => Ok("ro".to_string()),
+            VolumeModeAlias::Bool(false) => Ok("rw".to_string()),
+            VolumeModeAlias::Str(s) => match s.trim().to_lowercase().as_str() {
+                "ro" | "readonly" | "read-only" | "read_only" => Ok("ro".to_string()),
+                "rw" | "readwrite" | "read-write" | "read_write" => Ok("rw".to_string()),
+                other => Err(format!(
+                    "unknown volume mode value '{other}' (expected ro/rw, or readonly: true/false)"
+                )),
+            },
+        }
+    }
+}
+
+/// 反序列化中间形态：`deny_unknown_fields` 保留在中间层——规范字段之外只多认
+/// `readonly` / `read_only` 两个别名，其余未知字段仍报错（字段漂移防线不变）。
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VolumeMountInput {
+    host_path: String,
+    container_path: String,
+    /// 规范字段：在场即权威（原样透传，即便与别名并存——矛盾交给执行侧显式
+    /// 拒绝，解析层不改写 canonical 值）；缺省 ro。
+    #[serde(default)]
+    mode: Option<String>,
+    /// 教学输出常见别名（bool：true→ro / false→rw）。
+    #[serde(default)]
+    readonly: Option<VolumeModeAlias>,
+    /// 同上（蛇形拼写）。
+    #[serde(default)]
+    read_only: Option<VolumeModeAlias>,
+}
+
+impl VolumeMountInput {
+    fn into_volume_mount(self) -> Result<VolumeMount, String> {
+        let mode = if let Some(mode) = self.mode {
+            mode
+        } else if let Some(alias) = self.readonly {
+            alias.into_mode()?
+        } else if let Some(alias) = self.read_only {
+            alias.into_mode()?
+        } else {
+            default_volume_mode()
+        };
+        Ok(VolumeMount {
+            host_path: self.host_path,
+            container_path: self.container_path,
+            mode,
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VolumeMount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        VolumeMountInput::deserialize(deserializer)?
+            .into_volume_mount()
+            .map_err(serde::de::Error::custom)
+    }
 }

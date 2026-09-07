@@ -5,6 +5,97 @@ use alfred_core::{
     FileEntry, OwnerRequest, SandboxProfile, TaskAssignment, VerdictGrade,
 };
 
+#[test]
+fn volume_mount_accepts_readonly_bool_alias() {
+    // 原始用例实测形态（pi 按教学输出把 mode 写成 readonly: true）——必须解析
+    // 归一成 mode="ro"，而不是 planning_error_escalated。
+    let v: alfred_core::VolumeMount = serde_json::from_str(
+        r#"{"host_path":"/tmp/docs","container_path":"/references","readonly":true}"#,
+    )
+    .expect("readonly: true 别名必须解析");
+    assert_eq!(v.mode, "ro");
+    assert_eq!(v.host_path, "/tmp/docs");
+    assert_eq!(v.container_path, "/references");
+
+    // readonly: false 照实落 "rw"（语义不静默改写——只读闸门由执行侧显式拒绝）。
+    let rw: alfred_core::VolumeMount = serde_json::from_str(
+        r#"{"host_path":"/tmp/docs","container_path":"/references","readonly":false}"#,
+    )
+    .expect("readonly: false 别名必须解析");
+    assert_eq!(rw.mode, "rw");
+}
+
+#[test]
+fn volume_mount_accepts_readonly_string_aliases() {
+    for (alias, want) in [
+        ("ro", "ro"),
+        ("readonly", "ro"),
+        ("read-only", "ro"),
+        ("read_only", "ro"),
+        ("rw", "rw"),
+        ("readwrite", "rw"),
+        ("read-write", "rw"),
+        ("read_write", "rw"),
+    ] {
+        let json = format!(
+            r#"{{"host_path":"/tmp/docs","container_path":"/references","readonly":"{alias}"}}"#
+        );
+        let v: alfred_core::VolumeMount =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("readonly=\"{alias}\" 应解析: {e}"));
+        assert_eq!(v.mode, want, "readonly=\"{alias}\" → mode={want}");
+    }
+    // read_only（蛇形拼写）同面。
+    let snake: alfred_core::VolumeMount = serde_json::from_str(
+        r#"{"host_path":"/tmp/docs","container_path":"/references","read_only":true}"#,
+    )
+    .expect("read_only: true 别名必须解析");
+    assert_eq!(snake.mode, "ro");
+}
+
+#[test]
+fn volume_mount_canonical_mode_wins_and_defaults_ro() {
+    // 规范 mode 字段在场即权威（原样透传）。
+    let v: alfred_core::VolumeMount = serde_json::from_str(
+        r#"{"host_path":"/tmp/docs","container_path":"/references","mode":"rw"}"#,
+    )
+    .expect("canonical mode 解析");
+    assert_eq!(v.mode, "rw");
+    // 无任何 mode/别名字段 → 缺省 ro（legacy JSON 兼容不变）。
+    let legacy: alfred_core::VolumeMount =
+        serde_json::from_str(r#"{"host_path":"/tmp/x","container_path":"/references"}"#)
+            .expect("legacy JSON 解析");
+    assert_eq!(legacy.mode, "ro");
+    // 非法 mode 值 → 报错（不静默归一）。
+    let bad = serde_json::from_str::<alfred_core::VolumeMount>(
+        r#"{"host_path":"/tmp/docs","container_path":"/references","readonly":"bogus"}"#,
+    );
+    assert!(bad.is_err(), "非法 mode 值必须报错");
+}
+
+#[test]
+fn volume_mount_still_denies_unknown_fields() {
+    // 容错只认 readonly/read_only 两个别名；其余未知字段仍拒（字段漂移防线不变）。
+    let bad = serde_json::from_str::<alfred_core::VolumeMount>(
+        r#"{"host_path":"/tmp/docs","container_path":"/references","mount_options":"ro"}"#,
+    );
+    assert!(bad.is_err(), "未知字段必须仍被拒绝");
+}
+
+#[test]
+fn volume_mount_serializes_canonical_form() {
+    let v = alfred_core::VolumeMount {
+        host_path: "/tmp/docs".into(),
+        container_path: "/references".into(),
+        mode: "ro".into(),
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    // 序列化仍是规范三字段（round-trip 稳定；别名只在入方向）。
+    assert!(json.contains(r#""mode":"ro""#), "{json}");
+    assert!(!json.contains("readonly"), "{json}");
+    let back: alfred_core::VolumeMount = serde_json::from_str(&json).unwrap();
+    assert_eq!(v, back);
+}
+
 fn sample_request() -> OwnerRequest {
     OwnerRequest::new(
         "req-1",
