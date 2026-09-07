@@ -18,10 +18,10 @@
 //!
 //! **审计名的单一真源**：同一状态机事件可对应多个审计名（如
 //! `ExecutionFailedEscalate` → `mechanical_budget_exhausted_escalated` 或
+//! `execution_hard_error_escalated`，按机械/硬错误分支二选一）——所以
 //! [`StepIntent::Proceed`] 显式携带 `audit_name` + `audit_data`，不按事件名推导。
-
 use crate::governance::{
-    audit, format_plan_reply, maintain_after_converse,
+    audit, format_plan_reply, maintain_after_converse, maintain_after_plan_review,
     persist_governance_run, write_dagspec, write_run_contract, GovernanceContext,
 };
 use alfred_core::conversation::{append_to_disk, ConversationRole, ConversationSource};
@@ -68,6 +68,9 @@ pub struct StepPayload {
     /// apply 后审计通道（HEAD `mechanical_retry_from_verdict` 在 apply/attempts
     /// 调整之后落——少数派顺序，显式通道保序；其余事件一律 None）。
     pub post_apply_audit: Option<(String, Value)>,
+    /// PlanReviewed 维护输入（plan_review_rejected 路径：拒绝理由原文；
+    /// disguise 投影在 maintain_after_plan_review 内做——HEAD 语义不变）。
+    pub plan_reviewed_maintain: Option<String>,
 }
 
 /// 审查结论归档通道（区分 push 进哪条 verdict 历史）。
@@ -147,6 +150,11 @@ pub fn commit_intent(
                         &format_plan_reply(dagspec),
                     )?;
                 }
+            }
+            if let Some(reason) = &payload.plan_reviewed_maintain {
+                // PlanReviewed 维护（审查结论落定后，apply 前）：拒绝理由经
+                // disguise 投影（属主口吻中性转写——维护者零 reviewer 痕迹）。
+                maintain_after_plan_review(run, ctx, reason)?;
             }
             // ---- 2. 状态机转移 ----
             run.apply(event)?;

@@ -569,26 +569,30 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
         &dagspec,
         Some(&run.session_doc),
     )?;
-    match outcome.verdict {
+    let intent = match outcome.verdict {
         Some(v) => {
-            run.plan_verdicts.push(v.clone());
+            // verdict 归档由 commit_intent 的 verdict 通道执行（单点副作用）。
             if v.pass {
-                audit(
-                    &ctx.run_dir,
-                    "plan_review_passed",
-                    &serde_json::json!({ "reason": v.reason }),
-                )?;
-                run.apply(GovernanceEvent::PlanReviewPassed)?;
+                StepIntent::Proceed {
+                    event: GovernanceEvent::PlanReviewPassed,
+                    payload: StepPayload {
+                        verdict: Some(VerdictKind::Plan(v.clone())),
+                        audit_name: "plan_review_passed".into(),
+                        audit_data: serde_json::json!({ "reason": v.reason }),
+                        ..Default::default()
+                    },
+                }
             } else {
-                audit(
-                    &ctx.run_dir,
-                    "plan_review_rejected",
-                    &serde_json::json!({ "reason": v.reason }),
-                )?;
-                // PlanReviewed 维护（审查结论落定后）：拒绝理由经 disguise 投影
-                // （属主口吻中性转写——维护者零 reviewer 痕迹）落 review_summary。
-                maintain_after_plan_review(run, ctx, &v.reason)?;
-                run.apply(GovernanceEvent::PlanReviewRejected)?;
+                StepIntent::Proceed {
+                    event: GovernanceEvent::PlanReviewRejected,
+                    payload: StepPayload {
+                        verdict: Some(VerdictKind::Plan(v.clone())),
+                        audit_name: "plan_review_rejected".into(),
+                        audit_data: serde_json::json!({ "reason": v.reason }),
+                        plan_reviewed_maintain: Some(v.reason),
+                        ..Default::default()
+                    },
+                }
             }
         }
         None => {
@@ -597,14 +601,17 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                 .unscored_reason
                 .or(outcome.error)
                 .unwrap_or_else(|| "plan review unscored".to_string());
-            audit(
-                &ctx.run_dir,
-                "plan_review_error_escalated",
-                &serde_json::json!({ "reason": reason }),
-            )?;
-            run.apply(GovernanceEvent::PlanReviewError)?;
+            StepIntent::Proceed {
+                event: GovernanceEvent::PlanReviewError,
+                payload: StepPayload {
+                    audit_name: "plan_review_error_escalated".into(),
+                    audit_data: serde_json::json!({ "reason": reason }),
+                    ..Default::default()
+                },
+            }
         }
-    }
+    };
+    commit_intent(run, ctx, intent)?;
     Ok(())
 }
 
@@ -774,7 +781,7 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
 
     let intent = match verdict {
         Some(v) => {
-            run.exec_verdicts.push(v.clone());
+            // verdict 归档由 commit_intent 的 verdict 通道执行（单点副作用）。
             let decision = alfred_core::route(&v).map_err(|e| anyhow::anyhow!(e))?;
             match decision {
                 alfred_core::RoutingDecision::Advance => StepIntent::Proceed {
