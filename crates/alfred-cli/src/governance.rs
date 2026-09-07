@@ -12,6 +12,8 @@
 //! （§六继承项，不悄悄放行）。单节点骨架显式拒绝多节点 DAG（P2，不静默截断）。
 use std::path::{Path, PathBuf};
 
+use crate::governance_intent::{commit_intent, StepIntent, StepPayload, VerdictKind};
+
 use alfred_core::conversation::{
     append_to_disk, load_conversation, ConversationRole, ConversationSource,
 };
@@ -770,69 +772,91 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
         )
     };
 
-    match verdict {
+    let intent = match verdict {
         Some(v) => {
             run.exec_verdicts.push(v.clone());
             let decision = alfred_core::route(&v).map_err(|e| anyhow::anyhow!(e))?;
             match decision {
-                alfred_core::RoutingDecision::Advance => {
-                    audit(
-                        &ctx.run_dir,
-                        "exec_review_passed",
-                        &serde_json::json!({ "value": "C", "explanation": v.explanation }),
-                    )?;
-                    run.apply(GovernanceEvent::ExecReviewPassed)?;
-                }
+                alfred_core::RoutingDecision::Advance => StepIntent::Proceed {
+                    event: GovernanceEvent::ExecReviewPassed,
+                    payload: StepPayload {
+                        verdict: Some(VerdictKind::Exec(v.clone())),
+                        audit_name: "exec_review_passed".into(),
+                        audit_data: serde_json::json!({
+                            "value": "C",
+                            "explanation": v.explanation,
+                        }),
+                        ..Default::default()
+                    },
+                },
                 alfred_core::RoutingDecision::MechanicalRetry => {
                     if !run.mechanical_exhausted() {
                         run.attempts_used += 1;
-                        run.apply(GovernanceEvent::ExecReviewMechanicalRetry)?;
-                        audit(
-                            &ctx.run_dir,
-                            "mechanical_retry_from_verdict",
-                            &serde_json::json!({ "attempt": run.attempts_used, "budget": run.mechanical_budget }),
-                        )?;
+                        StepIntent::Proceed {
+                            event: GovernanceEvent::ExecReviewMechanicalRetry,
+                            payload: StepPayload {
+                                verdict: Some(VerdictKind::Exec(v.clone())),
+                                audit_name: "mechanical_retry_from_verdict".into(),
+                                audit_data: serde_json::json!({
+                                    "attempt": run.attempts_used,
+                                    "budget": run.mechanical_budget,
+                                }),
+                                ..Default::default()
+                            },
+                        }
                     } else {
-                        run.apply(GovernanceEvent::ExecReviewMechanicalEscalate)?;
-                        audit(
-                            &ctx.run_dir,
-                            "mechanical_budget_exhausted_escalated",
-                            &serde_json::json!({ "value": format!("{:?}", v.value), "failure_class": format!("{:?}", v.failure_class) }),
-                        )?;
+                        StepIntent::Proceed {
+                            event: GovernanceEvent::ExecReviewMechanicalEscalate,
+                            payload: StepPayload {
+                                verdict: Some(VerdictKind::Exec(v.clone())),
+                                audit_name: "mechanical_budget_exhausted_escalated".into(),
+                                audit_data: serde_json::json!({
+                                    "value": format!("{:?}", v.value),
+                                    "failure_class": format!("{:?}", v.failure_class),
+                                }),
+                                ..Default::default()
+                            },
+                        }
                     }
                 }
                 alfred_core::RoutingDecision::Escalate {
                     suggest_contract_change,
                 } => {
-                    run.apply(GovernanceEvent::ExecReviewSemanticEscalate)?;
-                    audit(
-                        &ctx.run_dir,
-                        "exec_review_escalated",
-                        &serde_json::json!({
-                            "value": format!("{:?}", v.value),
-                            "failure_class": format!("{:?}", v.failure_class),
-                            "suggest_contract_change": suggest_contract_change,
-                            "explanation": v.explanation,
-                        }),
-                    )?;
                     if suggest_contract_change {
                         println!(
                             "[orchestrator] 执行审查 contract_fault：预标注『建议改契约』，升级属主。"
                         );
+                    }
+                    StepIntent::Proceed {
+                        event: GovernanceEvent::ExecReviewSemanticEscalate,
+                        payload: StepPayload {
+                            verdict: Some(VerdictKind::Exec(v.clone())),
+                            audit_name: "exec_review_escalated".into(),
+                            audit_data: serde_json::json!({
+                                "value": format!("{:?}", v.value),
+                                "failure_class": format!("{:?}", v.failure_class),
+                                "suggest_contract_change": suggest_contract_change,
+                                "explanation": v.explanation,
+                            }),
+                            ..Default::default()
+                        },
                     }
                 }
             }
         }
         None => {
             // §六继承项：执行审查本身出错（unscored / 离线回退）→ 升级，不悄悄放行。
-            audit(
-                &ctx.run_dir,
-                "exec_review_error_escalated",
-                &serde_json::json!({ "reason": unscored_reason }),
-            )?;
-            run.apply(GovernanceEvent::ExecReviewError)?;
+            StepIntent::Proceed {
+                event: GovernanceEvent::ExecReviewError,
+                payload: StepPayload {
+                    audit_name: "exec_review_error_escalated".into(),
+                    audit_data: serde_json::json!({ "reason": unscored_reason }),
+                    ..Default::default()
+                },
+            }
         }
-    }
+    };
+    commit_intent(run, ctx, intent)?;
     Ok(())
 }
 

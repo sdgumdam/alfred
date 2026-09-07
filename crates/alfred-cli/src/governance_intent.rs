@@ -65,6 +65,9 @@ pub struct StepPayload {
     pub audit_name: String,
     /// ConverseDone 维护输入（PlanProduced 路径必触发；reply_summary=计划摘要）。
     pub converse_maintain: Option<ConverseMaintain>,
+    /// apply 后审计通道（HEAD `mechanical_retry_from_verdict` 在 apply/attempts
+    /// 调整之后落——少数派顺序，显式通道保序；其余事件一律 None）。
+    pub post_apply_audit: Option<(String, Value)>,
 }
 
 /// 审查结论归档通道（区分 push 进哪条 verdict 历史）。
@@ -147,6 +150,11 @@ pub fn commit_intent(
             }
             // ---- 2. 状态机转移 ----
             run.apply(event)?;
+            // ---- 2b. apply 后审计（HEAD 顺序：mechanical_retry_from_verdict 在
+            // attempts 调整/apply 之后落——经 post_apply_audit 通道保序）。
+            if let Some((name, data)) = payload.post_apply_audit {
+                audit(&ctx.run_dir, &name, &data)?;
+            }
             // ---- 3. persist 单点 ----
             persist_governance_run(&ctx.run_dir, run)?;
             Ok(None)
