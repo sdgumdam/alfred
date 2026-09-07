@@ -16,8 +16,10 @@ import {
   appendAudit,
   commandEscapesWorkspace,
   evaluateToolCall,
+  inRefVolume,
   parsePolicy,
   pathEscapesWorkspace,
+  refVolumeDirs,
 } from "../../../docker/agt/agt-policy.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -95,6 +97,57 @@ assert(pathEscapesWorkspace("hello.txt") === false, "pathEscapes(hello.txt)=fals
 assert(pathEscapesWorkspace("../etc/x") === true, "pathEscapes(../etc/x)=true（相对..逃逸）");
 assert(commandEscapesWorkspace("cat /etc/passwd") === true, "commandEscapes(cat /etc/passwd)=true");
 assert(commandEscapesWorkspace("ls /workspace") === false, "commandEscapes(ls /workspace)=false");
+
+console.log("== 9/3 方案②：只读参考卷边界豁免（AGT_REF_VOLUMES） ==");
+// 9/3 方案②：executor 宿主材料进路——参考卷以 ro 挂到 /workspace 之外
+// （如 /references），边界判定必须放行读取（物理 ro 兜底，写由挂载层拒绝）。
+assert(refVolumeDirs().length === 0, "未设 AGT_REF_VOLUMES → 空参考卷集（语义不变）");
+
+process.env.AGT_REF_VOLUMES = "/references:/design-docs/";
+assert(
+  JSON.stringify(refVolumeDirs()) === JSON.stringify(["/references", "/design-docs"]),
+  `refVolumeDirs 解析冒号分隔 + 剥尾斜杠（got ${JSON.stringify(refVolumeDirs())}）`
+);
+
+// 逃逸判定：参考卷子树不视为逃逸
+assert(pathEscapesWorkspace("/references/docs/治理架构.md") === false, "pathEscapes(/references/…) = false（豁免面）");
+assert(inRefVolume("/references") === true, "inRefVolume(/references) = true");
+assert(inRefVolume("/references/a/b.md") === true, "inRefVolume 子树 = true");
+assert(inRefVolume("/references/a/../b.md") === true, "inRefVolume 归一化子树（.. 内部解析）= true");
+assert(inRefVolume("/referenceE") === false, "前缀相似路径不误命中");
+assert(inRefVolume("/workspace/x") === false, "工作区内路径不属参考卷");
+
+// 命令级：cat /references/... 不再命中 no-host-path-touch
+const rv1 = evaluateToolCall(policy, bash("cat /references/治理架构.md"));
+assert(rv1.decision === "allow", `cat /references/治理架构.md → allow（got ${rv1.decision}/${rv1.rule}）`);
+const rv2 = evaluateToolCall(policy, bash("ls -la /references && head -20 /design-docs/README.md"));
+assert(rv2.decision === "allow", `ls/head 参考卷 → allow（got ${rv2.decision}/${rv2.rule}）`);
+const rv3 = evaluateToolCall(policy, bash("grep -rn 治理 /references/ | wc -l"));
+assert(rv3.decision === "allow", `grep 参考卷 → allow（got ${rv3.decision}/${rv3.rule}）`);
+
+// read 工具直读参考卷（path_escapes_workspace 上下文位放行 → default allow）
+const rv4 = evaluateToolCall(policy, read("/references/docs/限界上下文.md"));
+assert(rv4.decision === "allow", `read /references/... → allow（got ${rv4.decision}/${rv4.rule}）`);
+
+// 豁免面外仍拦：非参考卷宿主路径
+const rv5 = evaluateToolCall(policy, bash("cat /etc/passwd"));
+assert(rv5.decision === "deny" && rv5.rule === "no-host-path-touch", `cat /etc/passwd 仍 deny（got ${rv5.decision}/${rv5.rule}）`);
+// 相对路径 .. 穿越仍拦（豁免面不看相对形态——normalize 后落参考卷才豁免）
+assert(commandEscapesWorkspace("cat ../../etc/x") === true, "相对 .. 穿越仍 true");
+
+// 写参考卷：策略层与 /workspace 内写同语义（不命中 deny 规则 → default allow）——
+// 参考卷的写防护是**物理 ro 挂载**（docker :ro，写入直接 EROFS），策略层不重复拦
+// （9/3 方案②原话：ro 物理只读无需额外拦写）。策略面只保证"读放行"。
+const rv6 = evaluateToolCall(policy, write("/references/hacked.md"));
+assert(rv6.decision === "allow", `write 参考卷 → allow（写防护由物理 ro 挂载承担，got ${rv6.decision}/${rv6.rule}）`);
+// 对照：写参考卷外宿主路径仍被 workspace-write-only 拦（豁免面没有放大写边界）
+const rv7 = evaluateToolCall(policy, write("/etc/hacked.md"));
+assert(rv7.decision === "deny" && rv7.rule === "workspace-write-only", `write /etc → 仍 deny（got ${rv7.decision}/${rv7.rule}）`);
+
+delete process.env.AGT_REF_VOLUMES;
+assert(refVolumeDirs().length === 0, "delete env → 参考卷集清空");
+
+// 恢复无参考卷基线语义（后续段落不受豁免影响）
 assert(commandEscapesWorkspace("node /usr/bin/foo.js") === false, "commandEscapes(/usr 白名单)=false");
 assert(commandEscapesWorkspace("cat ../../etc/x") === true, "commandEscapes(cat ../../etc/x)=true");
 
