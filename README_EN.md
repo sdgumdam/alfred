@@ -7,9 +7,9 @@ an owner submits a request → a planner decomposes it into a DAG → a plan
 reviewer judges fidelity → an executor (pi) runs in a sandboxed container →
 an execution reviewer grades the artifact → tiered routing (advance /
 mechanical retry / escalate to owner) → the owner decides and the loop
-resumes. Every state transition is auditable and resumable; the executor and
-reviewer are isolated; the executor container has no network and holds no
-real credentials.
+resumes. Every state transition is auditable and resumable; the planner and
+reviewer run as independent host pi processes while the executor runs in an
+offline sandboxed container (no real credentials inside).
 
 This repository is the rewritten skeleton implementation (v0.1.0, full
 rewrite; v1 code is not retained). R1–R4 are delivered; R5 closes out (AGT
@@ -36,12 +36,26 @@ documentation sync).
 ```
 Owner (human)
   └─ alfred library (Rust; governance driver alfred-cli::governance, owner
-       interaction goes through the codux terminal → feed_owner_message; the
-       orchestrator state machine lives in alfred-core, called in-process)
-       ├─ planner: in-container pi conversation agent (converse graph-building;
-       │            maintain session-doc **pending redo** — half-implementation
-       │            rolled back), calls the model through the bridge
-       │            (container offline + host relays) → output → DagSpec
+       interaction goes through `alfred chat`, a persistent REPL scheduled by
+       the codux terminal → run_governance_loop / feed_owner_message; the
+       orchestrator state machine lives in alfred-core, called in-process;
+       steps decide purely, emitting a StepIntent plus per-channel Effects
+       flushed by the single governance_intent::commit_intent)
+       ├─ planner: host pi agent (driven by planner host.rs: `pi -p
+       │            --no-session -nc`, cwd = the governed project root; the
+       │            run-level pi-config models.json is projected from config.yml
+       │            roles.planner — the single model source; AGT extension
+       │            injected via env: blocks writes outside the project root and
+       │            reads of run governance artifacts, planner stays unaware)
+       │            converse graph-building: prompt (stdin) = session-doc
+       │            projection + owner message + output-path rules → output to
+       │            `<run>/planner/outputs/` (instructions.json | reply.txt,
+       │            exactly one, harvested by the host) → DagSpec
+       │    └─ maintain session-doc maintainer (redone): same-pattern host pi,
+       │            rolling triggers (ConverseDone / PlanReviewed;
+       │            key_file_paths from AGT audit allow-read increments, deny
+       │            records never extracted) →
+       │            `<run>/planner/outputs/session.json`
        ├─ execution: generate a host-side container driver script (driver.py,
        │             not an eval Task) → spawn `python3 driver.py`
        │    └─ Inspect container-management interface: starts a docker sandbox
@@ -51,25 +65,32 @@ Owner (human)
        │         └─ in-container pi: sees only the contract prompt, calls the
        │                    model through the bridge (no keys in container)
        │    ← polls `<work>/driver.done.json` for the done record → reads the
-       │                              bind-mount artifacts
-       ├─ plan review / exec review: same mechanism in a dedicated reviewer
-       │            container (driver.py drives in-container pi to judge DagSpec
-       │            fidelity vs OwnerRequest / artifact vs acceptance) →
-       │            verdict.json
-       └─ persistence: run-<id>/{state.json, audit.jsonl, llm-calls/, exec-N/}
-                       (driver.done.json + driver.stdout/stderr.log under exec-N/
-                       are the driver evidence, replacing the old evals/)
+       │                              bind-mount artifacts (ws/)
+       ├─ plan review / exec review: host pi agent (reviewer host.rs, same
+       │            pattern as converse; cwd = project root with full
+       │            visibility — materials land in `<run>/<mode>/inputs/`,
+       │            verdict history / conversation transcript / ws artifacts
+       │            read freely via absolute paths; AGT allows writes only into
+       │            the outputs dir) judges DagSpec fidelity vs OwnerRequest /
+       │            artifact vs acceptance → verdict written to
+       │            `<run>/<mode>/outputs/verdict.json` (harvested by the host)
+       └─ persistence: run-<id>/{state.json, audit.jsonl, dagspec.json,
+                       conversation.json, llm-calls/, planner/, plan-review/,
+                       exec-review/, exec-N/, ws/}
+                       (driver.done.json + driver.stdout/stderr.log under
+                       exec-N/ are the execution driver evidence; llm-calls/
+                       records every LLM call, replacing the old evals/)
 ```
 
 ### Crates (Cargo workspace, 5 crates)
 
 | crate | responsibility |
 |---|---|
-| `alfred-core` | Shared cross-crate entities (single source of truth): OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc + the **governance state machine** (`governance.rs`, §3.3 routing table in code) |
-| `alfred-planner` | Planner (converse graph-building / disguise rejection / **maintain session-doc maintainer** — host pi rolling maintenance, see below); host pi conversation agent (cwd=project root, run-level pi-config model, AGT unaware policy), `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
-| `alfred-executor` | Execution side: generates the Inspect container-management driver (`driver.py`, not an eval Task), the sandbox compose, spawn/poll the driver (done record), artifact collection, config loading |
-| `alfred-reviewer` | Review side: plan/exec review both run in a dedicated reviewer container (driver.py in-container pi, judging fidelity → PlanVerdict / acceptance → ExecVerdict) |
-| `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message`, owner interaction via codux terminal) + real `alfred` bin (codux-schedulable CLI driver: run/feed/status, consumes leading `--append-system-prompt`; the injected project context is appended to the planner pi's system prompt) |
+| `alfred-core` | Shared cross-crate entities (single source of truth): OwnerRequest / DagSpec / GraphBuilder / Contract / TaskAssignment / ExecVerdict / PlanVerdict / SessionDoc / ConversationLog / visibility-matrix schema + the **governance state machine** (`governance.rs`, §3.3 routing table in code) |
+| `alfred-planner` | The three planner-side components, all host pi (`host.rs` shared spawn/harvest primitive: cwd = project root, run-level pi-config single model source, AGT unawareness policy): converse graph-building / disguise rejection / **maintain session-doc maintainer (redone: rolling maintenance + AGT-audit data source, see Governance Loop)**; `llm-calls/` on disk; `ALFRED_OFFLINE=1` deterministic bypass |
+| `alfred-executor` | Execution side (the only container component): generates the Inspect container-management driver (`driver.py`, not an eval Task) + sandbox compose + spawn/poll of the driver (done record) + artifact collection + config loading + the shared AGT write-interception source (`agt.rs`, on by default) |
+| `alfred-reviewer` | Review side: plan/exec review both run as host pi agents (`host.rs`-driven, cwd = project root with full visibility, judging fidelity → PlanVerdict / acceptance → ExecVerdict into `<run>/<mode>/outputs/verdict.json`) |
+| `alfred-cli` | Governance-loop library driver (`governance::run_governance_loop` / `feed_owner_message` / `init_governance_run` / `build_governance_context`; steps decide purely, emitting StepIntent + Effects flushed by the single `governance_intent::commit_intent`) + real `alfred` bin (**owner persistent-session entry `chat`**: deterministic REPL for requirement intake / dialogue routing / owner decisions / resume, a persistent session process scheduled by codux) + codux-schedulable CLI driver: run/feed/status (script/e2e technical interface, consumes a leading `--append-system-prompt`; the injected project context is appended to the planner pi system prompt) |
 
 ---
 
@@ -242,8 +263,8 @@ land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 | No network by default | sandbox compose `network_mode: none` (only loopback in container) | R0 experiment + carried into r1 |
 | No keys in container | in-container models.json uses a dummy key; real keys stay in the host driver process (`env_clear` + allowlist) | R0 audit (`docker inspect env` zero hits) |
 | Out-of-workspace write blocked | workspace-only volume; paths outside it land on the container overlay, not the host | `tests/e2e/escape.sh` (two-way PASS) |
-| Review isolation | Non-claim, enforced by the mount surface: contract full text / acceptance criteria / conversation transcript are not mounted into the executor container; the reviewer container independently mounts ws full (ro) + conversation transcript for scoring; the planner is unaware of reviewer/executor | r2/r3 e2e assertions |
-| Tool-level policy (AGT write-interception layer, **on by default**) | AGT-style pi extension intercepts `tool_call` (rm -rf / sudo / secret read / out-of-workspace write): mounted by default in all three containers (staged policy → compose mounts `/tmp/.agt` ro + audit subdir rw, driver env injects the `-e` extension). Built-in default policies `docker/agt/{executor,planner,reviewer}/policy.json` are embedded at compile time and shipped with the binary; `ALFRED_AGT_DIR` overrides with an explicit dir, `ALFRED_AGT_DISABLE=1` turns it off | `tests/e2e/agt/` (deterministic eval + live demo + `exec-demo.sh` out-of-workspace write denied + audit deny), `tests/e2e/agt-default.sh` (default-on/opt-out black box: no env → staged built-in policies + in-container audit allow; DISABLE=1 → no staging/mounts/injection; real-container probe denies out-of-workspace write) |
+| Review isolation | Executor container: contract full text / acceptance criteria / conversation transcript are not mounted (non-claim enforced by the mount surface); the reviewer is a fully-visible host pi (materials land in `<run>/<mode>/inputs/`; verdict history / conversation transcript / ws artifacts read freely via absolute paths; AGT allows writes only into the outputs dir); the planner is unaware of reviewer/executor (AGT blocks reads of run governance artifacts) | r2/r3 e2e assertions |
+| Tool-level policy (AGT write-interception layer, **on by default**) | AGT-style pi extension intercepts `tool_call` (rm -rf / sudo / secret read / out-of-workspace write): the executor container mounts it (staged policy → compose mounts `/tmp/.agt` ro + audit subdir rw, driver env injects the `-e` extension); planner/reviewer are host pi with env injection (`AGT_POLICY_PATH`/`AGT_AUDIT_PATH`/`AGT_WORKSPACE_DIR` + the `-e` extension, policy staged to `<run>/{planner,reviewer}/agt/`). Built-in default policies `docker/agt/{executor,planner,reviewer}/policy.json` are embedded at compile time and shipped with the binary; `ALFRED_AGT_DIR` overrides with an explicit dir, `ALFRED_AGT_DISABLE=1` turns it off | `tests/e2e/agt/` (deterministic eval + live demo + `exec-demo.sh` out-of-workspace write denied + audit deny), `tests/e2e/agt-default.sh` (default-on/opt-out black box: no env → staged built-in policies + in-container audit allow; DISABLE=1 → no staging/mounts/injection; real-container probe denies out-of-workspace write) |
 
 ---
 
@@ -251,17 +272,17 @@ land in `tests/e2e/.runs/skeleton-<ts>/<step>.log`.
 
 ```
 crates/
-  alfred-core/      entities + state machine + routing + GraphBuilder
-  alfred-planner/   converse / disguise / container / task_gen / llm (maintain rolled back, pending redo)
-  alfred-executor/  task_gen / compose_gen / driver / artifact / run / config + templates/executor_driver.py.tmpl
-  alfred-reviewer/  plan_review / exec_review / container / task_gen / verdict
-  alfred-cli/       src/{main.rs (alfred bin: run/feed/status), governance.rs, lib.rs}
+  alfred-core/      entities (incl. conversation transcript / visibility matrix) + state machine + routing + GraphBuilder
+  alfred-planner/   converse / disguise / maintain (maintainer, redone) / host (shared host-pi driver primitive) / llm
+  alfred-executor/  task_gen / compose_gen / driver / artifact / run / config / agt + templates/executor_driver.py.tmpl
+  alfred-reviewer/  plan_review / exec_review / host (host-pi driver) / verdict
+  alfred-cli/       src/{main.rs (alfred bin: chat/run/feed/status), chat.rs, governance.rs, governance_intent.rs, lib.rs}
 docker/
   Dockerfile        sandbox image (inspect base + Node 22 + pi-coding-agent 0.84.3)
   agt/              AGT built-in default policy assets (three role policy.json + shared agt-policy.ts, embedded at compile time)
   pi-sandbox.compose.yaml   zero-mount reference base (network none)
 tests/
-  e2e/              r1-r4 / escape / skeleton / agt/
+  e2e/              r1-r4 / r6b-r6d / chat / escape / equiv / skeleton / agt/ / harness/ etc.
 .plans/             implementation plan + per-phase delivery/verification reports
                     + AGT评估.md (gitignored, not in version history)
 ```
