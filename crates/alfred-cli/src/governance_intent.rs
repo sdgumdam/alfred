@@ -48,6 +48,11 @@ pub enum StepIntent {
     Escalate {
         event: GovernanceEvent,
         audit_name: String,
+        /// 审计 data。`None` = 默认 `{ "error": reason }`（HEAD planning_error_
+        /// escalated 单字段形态）；`Some(v)` = 显式 data
+        /// （review_host_failure_escalated 的 `{mode, error}` 双字段形态）。
+        audit_data: Option<Value>,
+        /// 错误文本（data 未显式给时落 `"error"` 键）。
         reason: String,
     },
 }
@@ -134,9 +139,11 @@ pub fn commit_intent(
         StepIntent::Escalate {
             event,
             audit_name,
+            audit_data,
             reason,
         } => {
-            audit(&ctx.run_dir, &audit_name, &json!({ "reason": reason }))?;
+            let data = audit_data.unwrap_or_else(|| json!({ "error": reason }));
+            audit(&ctx.run_dir, &audit_name, &data)?;
             run.apply(event)?;
             persist_governance_run(&ctx.run_dir, run)?;
             Ok(None)
@@ -175,6 +182,11 @@ pub fn commit_intent(
                     )?;
                 }
                 run.dagspec = Some(dagspec.clone());
+            }
+            if let Some(reason) = &payload.plan_reviewed_maintain {
+                // PlanReviewed 维护（审查结论落定后，apply 前）：拒绝理由经
+                // disguise 投影（属主口吻中性转写——维护者零 reviewer 痕迹）。
+                maintain_after_plan_review(run, ctx, reason)?;
             }
             // ---- 2. 状态机转移 ----
             run.apply(event)?;
@@ -304,6 +316,7 @@ mod tests {
         let intent = StepIntent::Escalate {
             event: GovernanceEvent::PlanReviewError,
             audit_name: "plan_review_error_escalated".into(),
+            audit_data: None,
             reason: "offline: reviewer skipped".into(),
         };
         let out = commit_intent(&mut run, &ctx, intent).unwrap();
@@ -313,7 +326,7 @@ mod tests {
         let events = audit_events(&dir);
         let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["plan_review_error_escalated"]);
-        assert_eq!(events[0].1["reason"], "offline: reviewer skipped");
+        assert_eq!(events[0].1["error"], "offline: reviewer skipped");
         let state: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap())
                 .unwrap();

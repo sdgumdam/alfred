@@ -81,13 +81,19 @@ pub fn run_governance_loop(
                     Ok(None) => {}
                     Ok(Some(reply)) => return Ok(Some(reply)),
                     Err(e) => {
-                        audit(
-                            &ctx.run_dir,
-                            "planning_error_escalated",
-                            &serde_json::json!({ "error": format!("{e:#}") }),
+                        // 收表（步骤④）：PlanningError 降级走 commit_intent 单点
+                        // （audit → apply → persist 同 HEAD 序列；随后 inline return
+                        // ——Planning 态降级是 loop 内联返回路径，非继续流转）。
+                        commit_intent(
+                            run,
+                            ctx,
+                            StepIntent::Escalate {
+                                event: GovernanceEvent::PlanningError,
+                                audit_name: "planning_error_escalated".into(),
+                                audit_data: None,
+                                reason: format!("{e:#}"),
+                            },
                         )?;
-                        run.apply(GovernanceEvent::PlanningError)?;
-                        persist_governance_run(&ctx.run_dir, run)?;
                         println!(
                             "[orchestrator] 规划失败已升级属主（state=Escalated，挂起）。\n\
                              \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
@@ -892,13 +898,21 @@ fn review_host_failure_escalate(
         "exec_review" => GovernanceEvent::ExecReviewError,
         other => bail!("review_host_failure_escalate: 未知审查模式 {other:?}"),
     };
-    audit(
-        &ctx.run_dir,
-        "review_host_failure_escalated",
-        &serde_json::json!({ "mode": mode, "error": format!("{e:#}") }),
+    // 收表（步骤④）：降级也走 commit_intent 单点——review_host_failure_escalated
+    // 审计 → apply 升级事件 → persist（HEAD 提交序列同构；notice 在 persist 后）。
+    commit_intent(
+        run,
+        ctx,
+        StepIntent::Escalate {
+            event,
+            audit_name: "review_host_failure_escalated".into(),
+            audit_data: Some(serde_json::json!({
+                "mode": mode,
+                "error": format!("{e:#}"),
+            })),
+            reason: format!("{mode}: {e:#}"),
+        },
     )?;
-    run.apply(event)?;
-    persist_governance_run(&ctx.run_dir, run)?;
     println!(
         "[orchestrator] {}审查失败已升级属主（state=Escalated，挂起；审查 outcome 已落盘）。\n\
          \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
