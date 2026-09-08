@@ -74,6 +74,30 @@ pub fn validate_workspace_subdir(sub: &str) -> Result<()> {
     Ok(())
 }
 
+/// 校验 workspace_subdirs 列表声明：逐项 [`validate_workspace_subdir`] + 首子目录名
+/// 重复声明拒绝（A4 挂载锚窄边界）。
+///
+/// 挂载语义（task_gen::mount_anchor_prompt）：workspace_subdirs[0] 直接挂为执行者
+/// /workspace 根，锚断言「/workspace 下不存在同名嵌套子目录」。首名若在其余位
+/// 重复声明，compose 会把同一宿主目录双挂载（/workspace 与 /workspace/<同名>
+/// 指向同一宿主目录）——锚断言与执行者所见矛盾（执行者透过挂载看见
+/// /workspace/<同名>/）。显式报错防重复挂载，不静默去重（重复声明是计划缺陷，
+/// 计划审查应打回重规划）。`validate_executor_sandbox` 与
+/// `generate_executor_compose` 共用（单一真源，代码质量红线 1）。
+pub fn validate_workspace_subdirs(subs: &[String]) -> Result<()> {
+    for sub in subs {
+        validate_workspace_subdir(sub)?;
+    }
+    if let Some(first) = subs.first() {
+        if subs.iter().skip(1).any(|s| s == first) {
+            bail!(
+                "workspace_subdirs 首子目录名 '{first}' 在其余位重复声明：重复项与首挂载（/workspace 根）指向同一宿主目录造成双挂载，且与挂载锚「/workspace 下不存在同名嵌套子目录」矛盾（拒绝重复声明，不静默去重）"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// 校验只读参考卷声明（9/3 方案②，放行条件真源——`validate_executor_sandbox`
 /// 与 `generate_executor_compose` 共用，单一真源）：
 ///
@@ -142,6 +166,7 @@ pub fn validate_ref_volume(vol: &VolumeMount) -> Result<()> {
 /// - AGT 审计子目录 → `/tmp/.agt/audit`（rw，审计 JSONL 落此）。
 /// 空 subdirs → 防御性报错（R6e 块B：executor ws 挂载非空保证——空声明是计划
 /// 缺陷，计划审查应打回重规划；executor 不静默跳过、不静默回退挂全量）。
+/// 首名重复声明 → 显式报错（A4 挂载锚：防双挂载同宿主目录 + 锚断言矛盾）。
 pub fn generate_executor_compose(
     workspace_host_dir: &Path,
     image: &str,
@@ -156,10 +181,10 @@ pub fn generate_executor_compose(
             "executor 沙箱 workspace_subdirs 为空：计划审查应拦截，executor 挂载不能为空（拒绝空声明，不挂全量）"
         );
     }
+    // R6a + A4：逐项相对/越界 + 首名重复声明拒绝（列表级校验与 run.rs
+    // `validate_executor_sandbox` 共用 `validate_workspace_subdirs`，单一真源）。
+    validate_workspace_subdirs(&mounts.workspace_subdirs)?;
     for (i, sub) in mounts.workspace_subdirs.iter().enumerate() {
-        // R6a：子目录必须相对且不越界（校验与 run.rs 预建子目录共用
-        // `validate_workspace_subdir`，单一真源）。
-        validate_workspace_subdir(sub)?;
         let host = abs.join(sub);
         if !host.exists() {
             bail!(

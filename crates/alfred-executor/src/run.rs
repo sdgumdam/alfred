@@ -28,7 +28,7 @@ use serde::Serialize;
 
 use crate::artifact::{collect_artifact, snapshot_workspace};
 use crate::compose_gen::{self, canonicalize_workspace, generate_executor_compose,
-    validate_workspace_subdir, ExecutorMounts, CONTAINER_WORKSPACE_DIR};
+    validate_workspace_subdir, validate_workspace_subdirs, ExecutorMounts, CONTAINER_WORKSPACE_DIR};
 use crate::config::ExecutorModel;
 use crate::driver::{absolutize_cwd, poll_container_driver, spawn_container_driver, DriverOutcome};
 use crate::task_gen::{generate_task_py, TaskGenParams};
@@ -170,7 +170,9 @@ pub fn init_workspace_git(dir: &Path) -> Result<()> {
 /// 校验 executor 沙箱档案（R6e + 9/3 方案②：宿主材料进路 ref_volumes 打通）。
 ///
 /// - `workspace_subdirs`：非空强制（R6e 块B：executor ws 挂载非空保证——空声明
-///   是计划缺陷，计划审查应打回重规划；不静默跳过挂载、不静默回退挂全量）。
+///   是计划缺陷，计划审查应打回重规划；不静默跳过挂载、不静默回退挂全量）+
+///   首子目录名重复声明拒绝（A4 挂载锚：防 compose 双挂载同宿主目录 + 锚断言
+///   矛盾，校验真源 [`compose_gen::validate_workspace_subdirs`]，单一真源）。
 /// - `volumes`：**只读参考卷放行**（宿主材料进路：planner 声明
 ///   `{"host_path","container_path","mode"}`，把任务要读的宿主材料以 ro 挂进
 ///   执行容器）。逐卷校验放行条件：mode == "ro" + host 路径存在于宿主 +
@@ -194,6 +196,9 @@ fn validate_executor_sandbox(sandbox: &SandboxProfile) -> Result<()> {
             "executor 沙箱 workspace_subdirs 为空：计划审查应拦截，executor 挂载不能为空（拒绝空声明，不挂全量）"
         );
     }
+    // A4 挂载锚：首子目录名重复声明显式拒绝（防 compose 双挂载同宿主目录 +
+    // mount_anchor_prompt 锚断言矛盾）。列表级校验与 compose 生成共用（单一真源）。
+    validate_workspace_subdirs(&sandbox.workspace_subdirs)?;
     Ok(())
 }
 
@@ -231,8 +236,9 @@ pub fn execute_run(
     let workspace_host = resolve_workspace_dir(run_dir, &opts.workspace_dir);
     std::fs::create_dir_all(&workspace_host)?;
     // R6e：契约声明的 workspace_subdirs 先建目录（空目录 = 执行者工作区根/可见子集）。
-    // 校验与 compose 生成共用 validate_workspace_subdir（单一真源）；挂载点父目录 rw，
-    // 执行者可在其下动态新建子目录（新建即宿主可见/git 可见）。
+    // 逐项校验与 compose 生成共用 validate_workspace_subdir（单一真源）；列表级
+    // 校验（非空 + 首名重复声明拒绝）已在 validate_executor_sandbox 入口做过。
+    // 挂载点父目录 rw，执行者可在其下动态新建子目录（新建即宿主可见/git 可见）。
     for sub in &opts.assignment.sandbox.workspace_subdirs {
         validate_workspace_subdir(sub)?;
         std::fs::create_dir_all(workspace_host.join(sub))
