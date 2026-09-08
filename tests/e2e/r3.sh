@@ -254,6 +254,22 @@ events = [json.loads(l)["event"] for l in open(sys.argv[2])]
 mech = [e for e in events if e == "mechanical_retry"]
 assert len(mech) >= 2, f"mechanical_retry count={len(mech)}"
 assert "mechanical_budget_exhausted_escalated" in events, "budget exhausted missing"
+# C：timed_out 自适应放大轨迹——机械重跑 #1 把节点上限 1s→2s、#2 把 2s→4s
+# （×2、cap 3600）；放大写回 dagspec 后 exec-N/driver.py 重渲染新 TIME_LIMIT；
+# 耗尽升级 audit 带最终预算（属主决策信息充分）。
+records = [json.loads(l) for l in open(sys.argv[2])]
+adjusts = [r["data"].get("time_limit_adjusted") for r in records if r["event"] == "mechanical_retry"]
+assert adjusts == [{"from": 1, "to": 2}, {"from": 2, "to": 4}], f"amplify trajectory: {adjusts}"
+for r in records:
+    if r["event"] == "mechanical_retry":
+        assert r["data"]["failure_status"] == "timed_out", r["data"]
+exhausted = [r for r in records if r["event"] == "mechanical_budget_exhausted_escalated"][0]
+assert exhausted["data"]["time_limit_secs"] == 4, f"final budget: {exhausted['data']}"
+run_dir = sys.argv[1].rsplit("/", 1)[0]
+d2 = open(run_dir + "/exec-2/driver.py", encoding="utf-8").read()
+assert "TIME_LIMIT_SECS = float(2)" in d2, "exec-2/driver.py 未渲染放大后的 TIME_LIMIT=2"
+d3 = open(run_dir + "/exec-3/driver.py", encoding="utf-8").read()
+assert "TIME_LIMIT_SECS = float(4)" in d3, "exec-3/driver.py 未渲染放大后的 TIME_LIMIT=4"
 PY
 echo "PASS(case2a): 机械重跑2次 → 预算耗尽 → Escalated"
 

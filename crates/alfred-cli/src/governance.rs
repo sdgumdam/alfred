@@ -687,41 +687,79 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
             Ok(())
         }
         Err(e) => {
-            // 机械失败判定：driver error / timeout / crash（读 exec 子 run 的 state.json）。
-            let mechanical = exec_state_is_mechanical(&exec_dir)?;
-            let intent = if mechanical {
-                if !run.mechanical_exhausted() {
-                    run.attempts_used += 1;
-                    let attempt = run.attempts_used;
-                    // HEAD 顺序（execution_step 特有）：apply(ExecutionFailedRetry)
-                    // 在前 → mechanical_retry 审计在后（audits 通道 post_apply 段
-                    // 保序）→ println 重跑提示（post_apply_notices 通道）。
-                    let mut effects = Effects::default();
-                    effects.post_apply_audit(
-                        "mechanical_retry",
-                        serde_json::json!({
+            // 机械失败判定：driver timed_out / error / crash（读 exec 子 run 的
+            // state.json 的 eval_status）。
+            let failure_status = exec_failure_status(&exec_dir)?;
+            let intent = if let Some(status) = failure_status {
+                match route_mechanical_failure(
+                    &status,
+                    &dagspec,
+                    run.options.exec_time_limit_secs,
+                    run.attempts_used,
+                    run.mechanical_budget,
+                ) {
+                    MechanicalFailureRouting::Retry {
+                        attempt,
+                        amplified_dagspec,
+                        time_limit_adjusted,
+                    } => {
+                        run.attempts_used += 1;
+                        // HEAD 顺序（execution_step 特有）：apply(ExecutionFailedRetry)
+                        // 在前 → mechanical_retry 审计在后（audits 通道 post_apply 段
+                        // 保序）→ println 重跑提示（post_apply_notices 通道）。
+                        let mut effects = Effects::default();
+                        // C：放大后的 dagspec 经通道写回（dagspec.json 落盘 +
+                        // run.dagspec 注入，与 PlanProduced 同机制）——下轮
+                        // execution_step 用节点新值重新渲染 driver.py（execute_run
+                        // 每次 exec-N 全新生成）。
+                        if let Some(dagspec) = amplified_dagspec {
+                            effects.dagspec = Some(dagspec);
+                        }
+                        let mut data = serde_json::json!({
                             "attempt": attempt,
                             "budget": run.mechanical_budget,
                             "error": format!("{e:#}"),
-                        }),
-                    );
-                    effects.post_apply_notice(format!(
-                        "[orchestrator] 执行机械失败，按同一契约重跑（{}/{}）：{e}",
-                        attempt, run.mechanical_budget
-                    ));
-                    StepIntent::Proceed {
-                        event: GovernanceEvent::ExecutionFailedRetry,
-                        effects,
+                            "failure_status": status,
+                        });
+                        let notice = match time_limit_adjusted {
+                            Some((from, to)) => {
+                                data["time_limit_adjusted"] =
+                                    serde_json::json!({ "from": from, "to": to });
+                                format!(
+                                    "[orchestrator] 执行超时（timed_out），自适应放大时间上限重跑（{attempt}/{}，time_limit {from}s→{to}s）：{e}",
+                                    run.mechanical_budget
+                                )
+                            }
+                            None => format!(
+                                "[orchestrator] 执行机械失败，按同一契约重跑（{attempt}/{}）：{e}",
+                                run.mechanical_budget
+                            ),
+                        };
+                        effects.post_apply_audit("mechanical_retry", data);
+                        effects.post_apply_notice(notice);
+                        StepIntent::Proceed {
+                            event: GovernanceEvent::ExecutionFailedRetry,
+                            effects,
+                        }
                     }
-                } else {
-                    let mut effects = Effects::default();
-                    effects.audit(
-                        "mechanical_budget_exhausted_escalated",
-                        serde_json::json!({ "error": format!("{e:#}") }),
-                    );
-                    StepIntent::Proceed {
-                        event: GovernanceEvent::ExecutionFailedEscalate,
-                        effects,
+                    MechanicalFailureRouting::Exhausted {
+                        final_time_limit_secs,
+                    } => {
+                        // 放大后仍耗尽 → 照旧升级；data 带最终预算（属主决策
+                        // 信息充分：知道系统已把上限抬到哪、仍不够）。
+                        let mut effects = Effects::default();
+                        effects.audit(
+                            "mechanical_budget_exhausted_escalated",
+                            serde_json::json!({
+                                "error": format!("{e:#}"),
+                                "failure_status": status,
+                                "time_limit_secs": final_time_limit_secs,
+                            }),
+                        );
+                        StepIntent::Proceed {
+                            event: GovernanceEvent::ExecutionFailedEscalate,
+                            effects,
+                        }
                     }
                 }
             } else {
@@ -953,17 +991,87 @@ fn review_host_failure_escalate(
     Ok(())
 }
 
-/// 读 exec 子 run 的 state.json，判是否为机械失败（state.json 的 eval_status 即容器驱动状态，!= success）。
-fn exec_state_is_mechanical(exec_dir: &Path) -> Result<bool> {
+/// 读 exec 子 run 的 state.json 的失败形态（C：细分 timed_out vs error/crashed）。
+///
+/// `Some(status)` = 机械失败（eval_status 即容器驱动状态：timed_out / error /
+/// crashed，!= success）；`None` = 无 state.json（execute_run 写盘前硬失败，
+/// 非机械）或 success。
+fn exec_failure_status(exec_dir: &Path) -> Result<Option<String>> {
     let path = exec_dir.join("state.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         // 无 state.json = execute_run 在写盘前就硬失败（非机械）。
-        return Ok(false);
+        return Ok(None);
     };
     let v: Value =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     let status = v["run"]["eval_status"].as_str().unwrap_or("success");
-    Ok(status != "success")
+    Ok((status != "success").then(|| status.to_string()))
+}
+
+// ---- C：timed_out 自适应重跑（治理层修复） ----
+
+/// timed_out 重跑时间上限放大上限（秒）：×2 放大不越过此值。
+const EXEC_TIME_LIMIT_AMPLIFY_CAP_SECS: u32 = 3600;
+
+/// 机械失败的路由决策（C：timed_out 与 error/crashed 分流）。
+#[derive(Debug, Clone, PartialEq)]
+enum MechanicalFailureRouting {
+    /// 预算内重跑。`amplified_dagspec` = 时间上限已放大的节点计划（timed_out
+    /// 且未到放大上限时 Some，经 effects.dagspec 通道写回 dagspec.json +
+    /// run.dagspec；error/crashed / 已到上限 = None，同契约原样重跑）；
+    /// `time_limit_adjusted` = (from, to) 放大轨迹（audit 用）。
+    Retry {
+        attempt: u32,
+        amplified_dagspec: Option<alfred_core::DagSpec>,
+        time_limit_adjusted: Option<(u32, u32)>,
+    },
+    /// 预算耗尽 → 升级属主。`final_time_limit_secs` = 最终生效预算（含历次
+    /// 放大；属主决策信息充分）。
+    Exhausted { final_time_limit_secs: u32 },
+}
+
+/// 机械失败重跑决策（纯函数，execution_step 消费）。
+///
+/// timed_out：预算硬死线是根因——同死线重跑必再超，节点时间上限自适应放大
+/// （×2，cap [`EXEC_TIME_LIMIT_AMPLIFY_CAP_SECS`]）写回 dagspec 后重跑；
+/// error/crashed：与时间预算无关，同契约原样重跑。预算耗尽（attempts_used ≥
+/// mechanical_budget，镜像 [`GovernanceRun::mechanical_exhausted`]）→ 升级，
+/// 带最终预算。
+fn route_mechanical_failure(
+    failure_status: &str,
+    dagspec: &alfred_core::DagSpec,
+    exec_time_limit_secs: u32,
+    attempts_used: u32,
+    mechanical_budget: u32,
+) -> MechanicalFailureRouting {
+    let current = dagspec
+        .nodes
+        .first()
+        .map(|n| n.resolved_time_limit_secs(exec_time_limit_secs))
+        .unwrap_or(exec_time_limit_secs);
+    if attempts_used >= mechanical_budget {
+        return MechanicalFailureRouting::Exhausted {
+            final_time_limit_secs: current,
+        };
+    }
+    let mut amplified_dagspec = None;
+    let mut time_limit_adjusted = None;
+    if failure_status == "timed_out" {
+        let to = (current.saturating_mul(2)).min(EXEC_TIME_LIMIT_AMPLIFY_CAP_SECS);
+        if to > current {
+            let mut dagspec = dagspec.clone();
+            if let Some(node) = dagspec.nodes.first_mut() {
+                node.time_limit_secs = Some(to);
+            }
+            amplified_dagspec = Some(dagspec);
+            time_limit_adjusted = Some((current, to));
+        }
+    }
+    MechanicalFailureRouting::Retry {
+        attempt: attempts_used + 1,
+        amplified_dagspec,
+        time_limit_adjusted,
+    }
 }
 
 /// 落盘 dagspec.json。
@@ -1154,4 +1262,159 @@ pub fn build_governance_context(run_dir: &Path) -> Result<GovernanceContext> {
         reviewer_model: load_reviewer_model()?,
         append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alfred_core::{Contract, DagSpec, PlanNode};
+
+    fn temp_exec_dir(tag: &str, state_json: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "alfred-exec-failure-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = state_json {
+            std::fs::write(dir.join("state.json"), text).unwrap();
+        }
+        dir
+    }
+
+    fn single_node_dagspec(time_limit_secs: Option<u32>) -> DagSpec {
+        let contract = Contract {
+            prompt: "p".into(),
+            acceptance_criteria: "a".into(),
+            reviewer_models: vec![],
+        };
+        let mut node = PlanNode::new("task-1", "s", contract);
+        node.time_limit_secs = time_limit_secs;
+        DagSpec::new("req-1", vec![node])
+    }
+
+    #[test]
+    fn exec_failure_status_distinguishes_timed_out_error_and_success() {
+        // C：细分机械失败形态（timed_out / error / crashed = Some；success /
+        // 无 state.json = None 非机械）。
+        let mk = |status: &str| {
+            format!(
+                r#"{{"run": {{"run_id": "exec-1", "eval_status": "{status}"}}}}"#
+            )
+        };
+        let dir = temp_exec_dir("timed-out", Some(&mk("timed_out")));
+        assert_eq!(
+            exec_failure_status(&dir).unwrap().as_deref(),
+            Some("timed_out")
+        );
+        let dir = temp_exec_dir("error", Some(&mk("error")));
+        assert_eq!(exec_failure_status(&dir).unwrap().as_deref(), Some("error"));
+        let dir = temp_exec_dir("crashed", Some(&mk("crashed")));
+        assert_eq!(
+            exec_failure_status(&dir).unwrap().as_deref(),
+            Some("crashed")
+        );
+        let dir = temp_exec_dir("success", Some(&mk("success")));
+        assert_eq!(exec_failure_status(&dir).unwrap(), None);
+        let dir = temp_exec_dir("missing", None);
+        assert_eq!(exec_failure_status(&dir).unwrap(), None);
+    }
+
+    #[test]
+    fn timeout_retry_amplifies_time_limit() {
+        // C：timed_out ×2 放大（cap 3600）——600→1200、2400→3600（4800 截到
+        // cap）、声明 1800→3600；dagspec 节点字段被写回（放大落点）。
+        let dag = single_node_dagspec(None);
+        let r = route_mechanical_failure("timed_out", &dag, 600, 0, 2);
+        match &r {
+            MechanicalFailureRouting::Retry {
+                attempt,
+                amplified_dagspec,
+                time_limit_adjusted,
+            } => {
+                assert_eq!(*attempt, 1);
+                assert_eq!(*time_limit_adjusted, Some((600, 1200)));
+                assert_eq!(
+                    amplified_dagspec.as_ref().unwrap().nodes[0].time_limit_secs,
+                    Some(1200)
+                );
+            }
+            other => panic!("expected Retry, got {other:?}"),
+        }
+
+        let dag = single_node_dagspec(Some(2400));
+        let r = route_mechanical_failure("timed_out", &dag, 600, 1, 2);
+        match &r {
+            MechanicalFailureRouting::Retry {
+                time_limit_adjusted, ..
+            } => assert_eq!(*time_limit_adjusted, Some((2400, 3600))),
+            other => panic!("expected Retry, got {other:?}"),
+        }
+
+        let dag = single_node_dagspec(Some(1800));
+        let r = route_mechanical_failure("timed_out", &dag, 600, 0, 2);
+        match &r {
+            MechanicalFailureRouting::Retry {
+                time_limit_adjusted, ..
+            } => assert_eq!(*time_limit_adjusted, Some((1800, 3600))),
+            other => panic!("expected Retry, got {other:?}"),
+        }
+
+        // 已到 cap：无法再放大 → 同契约原样重跑（无放大轨迹）。
+        let dag = single_node_dagspec(Some(3600));
+        let r = route_mechanical_failure("timed_out", &dag, 600, 0, 2);
+        match &r {
+            MechanicalFailureRouting::Retry {
+                amplified_dagspec,
+                time_limit_adjusted,
+                ..
+            } => {
+                assert_eq!(*time_limit_adjusted, None);
+                assert!(amplified_dagspec.is_none());
+            }
+            other => panic!("expected Retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_and_crash_retry_same_contract() {
+        // C：error/crashed 与时间预算无关 → 同契约重跑（无放大、无 dagspec 写回）。
+        for status in ["error", "crashed"] {
+            let dag = single_node_dagspec(None);
+            let r = route_mechanical_failure(status, &dag, 600, 0, 2);
+            match &r {
+                MechanicalFailureRouting::Retry {
+                    amplified_dagspec,
+                    time_limit_adjusted,
+                    ..
+                } => {
+                    assert_eq!(*time_limit_adjusted, None, "status={status}");
+                    assert!(amplified_dagspec.is_none(), "status={status}");
+                }
+                other => panic!("expected Retry, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_escalation_carries_final_budget() {
+        // C：放大后仍耗尽 → 升级带最终预算（含历次放大；未放大 = 治理缺省）。
+        let dag = single_node_dagspec(Some(2400));
+        let r = route_mechanical_failure("timed_out", &dag, 600, 2, 2);
+        assert_eq!(
+            r,
+            MechanicalFailureRouting::Exhausted {
+                final_time_limit_secs: 2400
+            }
+        );
+
+        let dag = single_node_dagspec(None);
+        let r = route_mechanical_failure("timed_out", &dag, 600, 2, 2);
+        assert_eq!(
+            r,
+            MechanicalFailureRouting::Exhausted {
+                final_time_limit_secs: 600
+            }
+        );
+    }
 }
