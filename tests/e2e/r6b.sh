@@ -902,6 +902,85 @@ hits = [w for w in forbidden if w in user.lower()]
 assert not hits, f"维护者 prompt 泄露审查语义 {hits}: {user}"
 PY
   echo "PASS(caseH2): 重规划轮 ConverseDone 滚动累积 + PlanReviewed disguise 维护（零审查语义泄露）+ PlanRejected"
+  # ---- Case I：A5 维护者收割 Err 降级行为覆盖（DebtInventory A5）----
+  # run_maintain 收割失败 → planning_step Err → StepIntent::Escalate（
+  # planning_error_escalated，escalation_source=planning）此前只有编译期同构、
+  # 零行为证据。确定性触发：ALFRED_MAINTAIN_OFFLINE_FILE 指向非法会话文档
+  # （非三字段合法形态）→ converse 离线成功（Reply 分支，converse_reply 已落）→
+  # 维护者收割解析显式 Err → 治理降级挂起拍板（记忆坏了要可见，不悄悄放行）。
+  CASE_I="$R6B_RUNS/run-r6b-maintain-err-escalate"
+  rm -rf "$CASE_I"
+  mkdir -p "$CASE_I"
+  cat > "$CASE_I/request.json" <<'JSON'
+{
+  "id": "req-r6b-c9",
+  "title": "create hello.txt",
+  "description": "Create a file named hello.txt in the workspace. Its content must be exactly: Hello",
+  "acceptance_criteria": "hello.txt exists in the workspace and its content is exactly 'Hello'",
+  "created_at": "2026-09-01T00:00:00Z"
+}
+JSON
+  cat > "$CASE_I/reply.txt" <<'TXT'
+收到需求。技术选型确认一下：内容用 Rust 实现，可以吗？
+TXT
+  printf '{{{ not a session doc' > "$CASE_I/maintain-bad.json"
+  echo "[r6b] caseI: driver run（离线 Reply 成功 → 维护者收割坏 JSON → planning_error_escalated） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_I/reply.txt" ALFRED_MAINTAIN_OFFLINE_FILE="$CASE_I/maintain-bad.json" cargo run --quiet -p alfred-cli --bin alfred -- run --request "$CASE_I/request.json" --run-dir "$CASE_I" --time-limit 60 --review-time-limit 60 --planner-time-limit 60
+
+  python3 - "$CASE_I" <<'PY' || { echo "FAIL(caseI1): 维护者收割失败降级断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+# 治理降级：Escalated + 来源 planning（不悄悄放行，不卡任何中间态）
+assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
+assert state.get("escalation_source") == "planning", f"escalation_source={state.get('escalation_source')}"
+# 审计序：converse 成功已落（converse_reply）→ 维护失败降级（Reply 分支 Err 臂）
+events = [json.loads(l)["event"] for l in open(os.path.join(run, "audit.jsonl"))]
+assert events == ["governance_started", "state_entered", "converse_reply",
+                  "planning_error_escalated", "governance_paused"], f"events={events}"
+# 失败可见：降级事件带收割解析失败原因（记忆坏了要可见）
+esc = [json.loads(l) for l in open(os.path.join(run, "audit.jsonl"))
+       if json.loads(l)["event"] == "planning_error_escalated"]
+assert "not valid SessionDoc" in esc[0]["data"]["error"], f"error={esc[0]['data']}"
+# Reply 分支：失败发生在维护环节，不产计划
+assert not os.path.exists(os.path.join(run, "dagspec.json")), "Reply 分支不应产 dagspec"
+PY
+  echo "PASS(caseI1): 维护者收割坏 JSON → planning_error_escalated（source=planning，失败原因可见）"
+
+  # 恢复拍板：修复注入（合法三字段文档）→ feed retry → Escalated(planning) 路由回
+  # Planning → converse 重答 + 维护成功（maintain_done）→ 对话继续，环不死锁。
+  cat > "$CASE_I/maintained.json" <<'JSON'
+{
+  "key_file_paths": [],
+  "key_conclusions": ["技术选型确认：用 Rust"],
+  "owner_feedback": []
+}
+JSON
+  echo "[r6b] caseI: driver feed retry（修复维护注入 → 拍板恢复 → maintain_done → Planning） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_REPLY_FILE="$CASE_I/reply.txt" ALFRED_MAINTAIN_OFFLINE_FILE="$CASE_I/maintained.json" cargo run --quiet -p alfred-cli --bin alfred -- feed --run-dir "$CASE_I" --decision retry
+
+  python3 - "$CASE_I" <<'PY' || { echo "FAIL(caseI2): 降级恢复断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+state = json.load(open(os.path.join(run, "state.json")))
+# 恢复：retry 拍板 → 重规划轮 converse 重答停驻 Planning（对话继续，非再降级）
+assert state["state_machine"]["state"] == "planning", f"state={state['state_machine']['state']}"
+# 维护成功：修复后的注入被收割（key_conclusions 固化）
+assert state["session_doc"]["key_conclusions"] == ["技术选型确认：用 Rust"], \
+    f"key_conclusions={state['session_doc']['key_conclusions']}"
+events = [json.loads(l)["event"] for l in open(os.path.join(run, "audit.jsonl"))]
+assert events[-5:] == ["feed_owner_message", "state_entered", "converse_reply",
+                       "maintain_done", "governance_paused"], f"events={events}"
+# 维护 llm-calls 记录照落（role=maintain，offline 直通）
+recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
+maintain = [r for r in recs
+            if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "maintain"]
+assert maintain, f"no maintain llm-call record: {recs}"
+rec = json.load(open(os.path.join(run, "llm-calls", maintain[0])))
+assert rec["offline"] is True and rec["transport"] == "offline", \
+    f"offline={rec['offline']} transport={rec['transport']}"
+PY
+  echo "PASS(caseI2): 修复注入 → feed retry 恢复（maintain_done + 对话回 Planning，环不死锁）"
 
   unset ALFRED_CONFIG
 
