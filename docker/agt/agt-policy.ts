@@ -441,7 +441,10 @@ export default function (pi: ExtensionAPI) {
     const pol = ensurePolicy();
     if (!pol) {
       // denyOnPolicyError 语义（AGT default-policy.json：denyOnPolicyError: true）
-      const reason = `AGT policy load failed (fail-closed): ${policyLoadError}`;
+      // A1 脱敏（DebtInventory）：block reason 保持中性——policyLoadError 含策略
+      // 文件完整路径 + run 布局，planner 直面即泄露；planner 只见中性拒绝，
+      // 完整错误原文只落审计 JSONL（AGT_AUDIT_PATH 宿主侧，agent 不可读）。
+      const reason = "策略不可用，操作被拒绝";
       appendAudit(auditPath, {
         ts,
         tool_name: event.toolName,
@@ -452,7 +455,8 @@ export default function (pi: ExtensionAPI) {
         path,
         decision: "deny",
         rule: "__policy_load_error__",
-        reason,
+        // 错误原文唯一出口（生产者-消费者契约：审计行 = 宿主排障真源）。
+        reason: `AGT policy load failed (fail-closed): ${policyLoadError}`,
       });
       return { block: true, reason };
     }

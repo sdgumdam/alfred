@@ -552,6 +552,87 @@ console.log("== 审计 path 契约（key_file_paths 数据源 = allow read 行 p
     assert(/\bpath\b/.test(entry), `appendAudit 条目携带 path：${entry.replace(/\s+/g, " ").trim()}`);
   }
 }
+// ============================================================================
+// fail-closed reason 脱敏契约（A1/DebtInventory）：策略加载失败 → planner 直面
+// 的 block reason 中性（零路径 / 零错误原文），完整错误只落审计 JSONL（宿主侧
+// AGT_AUDIT_PATH，agent 不可读）。真工厂驱动（default export + 桩 pi 收集
+// handler）：block 面（planner 可见）与审计面（JSONL 行）两侧各自钉死——
+// 生产者-消费者契约：脱敏的是模型反馈面，不是审计排障面。
+// ============================================================================
+console.log("== fail-closed reason 脱敏（block 中性 + 错误原文仅入审计） ==");
+{
+  const { default: agtFactory } = await import("../../../docker/agt/agt-policy.ts");
+  const auditDir = makeTempDir("alfred-agt-failclosed-");
+  const auditFile = path.join(auditDir, "audit.jsonl");
+  process.env.AGT_AUDIT_PATH = auditFile;
+  process.env.AGT_POLICY_PATH = path.join(auditDir, "missing-policy.json"); // 必然加载失败
+  const handlers = {};
+  agtFactory({ on: (ev, fn) => { handlers[ev] = fn; } });
+
+  // planner 直面①：block reason 恰为中性句——零路径 / 零错误原文 / 零实现细节
+  const block = await handlers["tool_call"]({
+    toolName: "bash", toolCallId: "fc-bash", input: { command: "echo hi" },
+  });
+  assert(block && block.block === true,
+    `fail-closed → block=true（got ${JSON.stringify(block)}）`);
+  assert(block.reason === "策略不可用，操作被拒绝",
+    `fail-closed block reason 恰为中性句（got ${JSON.stringify(block.reason)}）`);
+
+  // planner 直面②：write 事件的 block 同样中性（策略加载失败对所有工具一致脱敏）
+  const blockW = await handlers["tool_call"]({
+    toolName: "write", toolCallId: "fc-write", input: { path: "/tmp/x.txt", content: "x" },
+  });
+  assert(blockW && blockW.block === true && blockW.reason === "策略不可用，操作被拒绝",
+    `fail-closed write block 同样中性（got ${JSON.stringify(blockW)}）`);
+
+  // 审计面：完整错误原文（含策略路径）落 JSONL——宿主排障真源；block 面丢的
+  // 信息这里必须找得回（生产者-消费者契约的消费侧验证）。
+  const lines = readFileSync(auditFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert(lines.length === 2, `fail-closed 审计 2 行（got ${lines.length}）`);
+  for (const line of lines) {
+    assert(line.decision === "deny" && line.rule === "__policy_load_error__",
+      `审计行 deny/__policy_load_error__（got ${line.decision}/${line.rule}）`);
+    assert(line.reason.includes("AGT policy load failed (fail-closed)")
+      && line.reason.includes("missing-policy.json"),
+      `审计行含完整错误原文（策略路径在列）：${line.reason}`);
+    assert(!line.reason.includes('"策略不可用"'),
+      "审计行不回填中性句（错误原文与中性反馈各走各的面）");
+  }
+  assert(lines[1].path === "/tmp/x.txt",
+    `fail-closed 审计行携带 path（P0 契约延续）：${JSON.stringify(lines[1])}`);
+
+  // 对照组：正常加载路径不受影响——engine deny 的 block 模板不变、allow 放行。
+  process.env.AGT_POLICY_PATH = path.join(here, "../../../docker/agt/executor/policy.json");
+  const handlersOk = {};
+  agtFactory({ on: (ev, fn) => { handlersOk[ev] = fn; } });
+  const denyBlock = await handlersOk["tool_call"]({
+    toolName: "bash", toolCallId: "ok-deny", input: { command: "rm -rf /workspace" },
+  });
+  assert(denyBlock && denyBlock.block === true && denyBlock.reason.startsWith("操作被策略拒绝："),
+    `正常加载 engine deny block 模板不变（got ${JSON.stringify(denyBlock?.reason)}）`);
+  const allowPass = await handlersOk["tool_call"]({
+    toolName: "bash", toolCallId: "ok-allow", input: { command: "ls -la" },
+  });
+  assert(allowPass === undefined, `正常加载 allow 放行不 block（got ${JSON.stringify(allowPass)}）`);
+
+  delete process.env.AGT_POLICY_PATH;
+  delete process.env.AGT_AUDIT_PATH;
+  rmSync(auditDir, { recursive: true, force: true });
+}
+// 源码级钉（⑤b 同款，防回归）：fail-closed 分支 block reason 不得插值
+// policyLoadError——脱敏后回退（reason 拼 `${policyLoadError}`）即红。
+{
+  const extSource = readFileSync(path.join(here, "../../../docker/agt/agt-policy.ts"), "utf8");
+  const fcBranch = extSource.slice(
+    extSource.indexOf("if (!pol) {"),
+    extSource.indexOf("const decision = evaluateToolCall"),
+  );
+  assert(fcBranch.includes('const reason = "策略不可用，操作被拒绝";'),
+    "源码级：fail-closed block reason 中性字面量");
+  assert(fcBranch.includes('reason: `AGT policy load failed (fail-closed): ${policyLoadError}`')
+    && !fcBranch.includes("return { block: true, reason: `"),
+    "源码级：错误原文仅在审计条目，block return 无插值");
+}
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
