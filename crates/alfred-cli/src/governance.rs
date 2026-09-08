@@ -12,9 +12,7 @@
 //! （§六继承项，不悄悄放行）。单节点骨架显式拒绝多节点 DAG（P2，不静默截断）。
 use std::path::{Path, PathBuf};
 
-use crate::governance_intent::{
-    commit_intent, ConverseMaintain, StepIntent, StepPayload, VerdictKind,
-};
+use crate::governance_intent::{commit_intent, ConverseMaintain, Effects, StepIntent, VerdictKind};
 
 use alfred_core::conversation::{
     append_to_disk, load_conversation, ConversationRole, ConversationSource,
@@ -469,18 +467,26 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
             });
             let read_paths =
                 alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
+            // v3 分通道收集：决策纯——通道只收集不执行（flush 在 commit_intent，
+            // 通道序 = HEAD 副作用序：审计 → conversation 轮 → dagspec 落盘/注入
+            // → ConverseDone 维护）。
+            let plan_reply = format_plan_reply(&dagspec);
+            let mut effects = Effects::default();
+            effects.audit("planning_done", planning_done_data);
+            effects.conversation_turn(
+                ConversationRole::Planner,
+                plan_reply.clone(),
+                ConversationSource::ConverseReply,
+            );
+            effects.dagspec = Some(dagspec);
+            effects.converse_maintain(ConverseMaintain {
+                read_paths,
+                owner_message,
+                reply_summary: plan_reply,
+            });
             let intent = StepIntent::Proceed {
                 event: GovernanceEvent::PlanProduced,
-                payload: StepPayload {
-                    dagspec: Some(dagspec),
-                    audit_name: "planning_done".into(),
-                    audit_data: planning_done_data,
-                    converse_maintain: Some(ConverseMaintain {
-                        read_paths,
-                        owner_message,
-                    }),
-                    ..Default::default()
-                },
+                effects,
             };
             commit_intent(run, ctx, intent)?;
             Ok(None)
@@ -489,17 +495,26 @@ fn planning_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<Opt
         ConverseOutcome::Reply { reply, record_path } => {
             let read_paths =
                 alfred_planner::host::extract_allow_read_paths(&ctx.run_dir, audit_baseline);
+            // v3 分通道收集：conversation 轮 + 审计 + ConverseDone 维护触发
+            // 全部收集进通道（flush 在 commit_intent：turn 落盘 → 审计 → 维护）。
+            let mut effects = Effects::default();
+            effects.audit(
+                "converse_reply",
+                serde_json::json!({ "record": record_path }),
+            );
+            effects.conversation_turn(
+                ConversationRole::Planner,
+                reply.clone(),
+                ConversationSource::ConverseReply,
+            );
+            effects.converse_maintain(ConverseMaintain {
+                read_paths,
+                owner_message,
+                reply_summary: reply.clone(),
+            });
             let intent = StepIntent::Reply {
                 text: reply.clone(),
-                payload: StepPayload {
-                    audit_name: "converse_reply".into(),
-                    audit_data: serde_json::json!({ "record": record_path }),
-                    converse_maintain: Some(ConverseMaintain {
-                        read_paths,
-                        owner_message,
-                    }),
-                    ..Default::default()
-                },
+                effects,
             };
             commit_intent(run, ctx, intent)
         }
@@ -558,27 +573,27 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
     )?;
     let intent = match outcome.verdict {
         Some(v) => {
-            // verdict 归档由 commit_intent 的 verdict 通道执行（单点副作用）。
+            // verdict 归档由 commit_intent 的 verdicts 通道执行（分通道 flush）。
+            let mut effects = Effects::default();
+            effects.verdicts.push(VerdictKind::Plan(v.clone()));
             if v.pass {
+                effects.audit(
+                    "plan_review_passed",
+                    serde_json::json!({ "reason": v.reason }),
+                );
                 StepIntent::Proceed {
                     event: GovernanceEvent::PlanReviewPassed,
-                    payload: StepPayload {
-                        verdict: Some(VerdictKind::Plan(v.clone())),
-                        audit_name: "plan_review_passed".into(),
-                        audit_data: serde_json::json!({ "reason": v.reason }),
-                        ..Default::default()
-                    },
+                    effects,
                 }
             } else {
+                effects.audit(
+                    "plan_review_rejected",
+                    serde_json::json!({ "reason": v.reason.clone() }),
+                );
+                effects.plan_reviewed_maintain(v.reason);
                 StepIntent::Proceed {
                     event: GovernanceEvent::PlanReviewRejected,
-                    payload: StepPayload {
-                        verdict: Some(VerdictKind::Plan(v.clone())),
-                        audit_name: "plan_review_rejected".into(),
-                        audit_data: serde_json::json!({ "reason": v.reason }),
-                        plan_reviewed_maintain: Some(v.reason),
-                        ..Default::default()
-                    },
+                    effects,
                 }
             }
         }
@@ -588,13 +603,14 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                 .unscored_reason
                 .or(outcome.error)
                 .unwrap_or_else(|| "plan review unscored".to_string());
+            let mut effects = Effects::default();
+            effects.audit(
+                "plan_review_error_escalated",
+                serde_json::json!({ "reason": reason }),
+            );
             StepIntent::Proceed {
                 event: GovernanceEvent::PlanReviewError,
-                payload: StepPayload {
-                    audit_name: "plan_review_error_escalated".into(),
-                    audit_data: serde_json::json!({ "reason": reason }),
-                    ..Default::default()
-                },
+                effects,
             }
         }
     };
@@ -649,17 +665,19 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
     };
     match execute_run(&opts, &ctx.executor_model, &run.request) {
         Ok(outcome) => {
+            // v3 分通道收集：单条事件主审计（pre_apply 段）。
+            let mut effects = Effects::default();
+            effects.audit(
+                "execution_succeeded",
+                serde_json::json!({
+                    "task_id": node.id,
+                    "eval_status": outcome.eval_status,
+                    "artifact_changes": outcome.artifact.as_ref().map(|a| a.changes.len()),
+                }),
+            );
             let intent = StepIntent::Proceed {
                 event: GovernanceEvent::ExecutionSucceeded,
-                payload: StepPayload {
-                    audit_name: "execution_succeeded".into(),
-                    audit_data: serde_json::json!({
-                        "task_id": node.id,
-                        "eval_status": outcome.eval_status,
-                        "artifact_changes": outcome.artifact.as_ref().map(|a| a.changes.len()),
-                    }),
-                    ..Default::default()
-                },
+                effects,
             };
             commit_intent(run, ctx, intent)?;
             Ok(())
@@ -672,47 +690,46 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
                     run.attempts_used += 1;
                     let attempt = run.attempts_used;
                     // HEAD 顺序（execution_step 特有）：apply(ExecutionFailedRetry)
-                    // 在前 → mechanical_retry 审计在后（post_apply_audit 通道保序）
-                    // → println 重跑提示。
+                    // 在前 → mechanical_retry 审计在后（audits 通道 post_apply 段
+                    // 保序）→ println 重跑提示（post_apply_notices 通道）。
+                    let mut effects = Effects::default();
+                    effects.post_apply_audit(
+                        "mechanical_retry",
+                        serde_json::json!({
+                            "attempt": attempt,
+                            "budget": run.mechanical_budget,
+                            "error": format!("{e:#}"),
+                        }),
+                    );
+                    effects.post_apply_notice(format!(
+                        "[orchestrator] 执行机械失败，按同一契约重跑（{}/{}）：{e}",
+                        attempt, run.mechanical_budget
+                    ));
                     StepIntent::Proceed {
                         event: GovernanceEvent::ExecutionFailedRetry,
-                        payload: StepPayload {
-                            audit_name: "mechanical_retry".into(),
-                            audit_data: serde_json::json!({}),
-                            post_apply_audit: Some((
-                                "mechanical_retry".to_string(),
-                                serde_json::json!({
-                                    "attempt": attempt,
-                                    "budget": run.mechanical_budget,
-                                    "error": format!("{e:#}"),
-                                }),
-                            )),
-                            post_apply_notice: Some(format!(
-                                "[orchestrator] 执行机械失败，按同一契约重跑（{}/{}）：{e}",
-                                attempt, run.mechanical_budget
-                            )),
-                            ..Default::default()
-                        },
+                        effects,
                     }
                 } else {
+                    let mut effects = Effects::default();
+                    effects.audit(
+                        "mechanical_budget_exhausted_escalated",
+                        serde_json::json!({ "error": format!("{e:#}") }),
+                    );
                     StepIntent::Proceed {
                         event: GovernanceEvent::ExecutionFailedEscalate,
-                        payload: StepPayload {
-                            audit_name: "mechanical_budget_exhausted_escalated".into(),
-                            audit_data: serde_json::json!({ "error": format!("{e:#}") }),
-                            ..Default::default()
-                        },
+                        effects,
                     }
                 }
             } else {
                 // 非机械的硬错误（如非默认沙箱档案）→ 升级属主，不悄悄放行。
+                let mut effects = Effects::default();
+                effects.audit(
+                    "execution_hard_error_escalated",
+                    serde_json::json!({ "error": format!("{e:#}") }),
+                );
                 StepIntent::Proceed {
                     event: GovernanceEvent::ExecutionFailedEscalate,
-                    payload: StepPayload {
-                        audit_name: "execution_hard_error_escalated".into(),
-                        audit_data: serde_json::json!({ "error": format!("{e:#}") }),
-                        ..Default::default()
-                    },
+                    effects,
                 }
             };
             commit_intent(run, ctx, intent)?;
@@ -738,7 +755,6 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
 fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
     let offline = std::env::var("ALFRED_OFFLINE").as_deref() == Ok("1")
         || std::env::var("ALFRED_EXEC_REVIEW_OFFLINE").as_deref() == Ok("1");
-
 
     let (verdict, unscored_reason) = if offline {
         (
@@ -790,48 +806,53 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
 
     let intent = match verdict {
         Some(v) => {
-            // verdict 归档由 commit_intent 的 verdict 通道执行（单点副作用）。
+            // verdict 归档由 commit_intent 的 verdicts 通道执行（分通道 flush）。
             let decision = alfred_core::route(&v).map_err(|e| anyhow::anyhow!(e))?;
             match decision {
-                alfred_core::RoutingDecision::Advance => StepIntent::Proceed {
-                    event: GovernanceEvent::ExecReviewPassed,
-                    payload: StepPayload {
-                        verdict: Some(VerdictKind::Exec(v.clone())),
-                        audit_name: "exec_review_passed".into(),
-                        audit_data: serde_json::json!({
+                alfred_core::RoutingDecision::Advance => {
+                    let mut effects = Effects::default();
+                    effects.verdicts.push(VerdictKind::Exec(v.clone()));
+                    effects.audit(
+                        "exec_review_passed",
+                        serde_json::json!({
                             "value": "C",
                             "explanation": v.explanation,
                         }),
-                        ..Default::default()
-                    },
-                },
+                    );
+                    StepIntent::Proceed {
+                        event: GovernanceEvent::ExecReviewPassed,
+                        effects,
+                    }
+                }
                 alfred_core::RoutingDecision::MechanicalRetry => {
                     if !run.mechanical_exhausted() {
                         run.attempts_used += 1;
+                        let mut effects = Effects::default();
+                        effects.verdicts.push(VerdictKind::Exec(v.clone()));
+                        effects.audit(
+                            "mechanical_retry_from_verdict",
+                            serde_json::json!({
+                                "attempt": run.attempts_used,
+                                "budget": run.mechanical_budget,
+                            }),
+                        );
                         StepIntent::Proceed {
                             event: GovernanceEvent::ExecReviewMechanicalRetry,
-                            payload: StepPayload {
-                                verdict: Some(VerdictKind::Exec(v.clone())),
-                                audit_name: "mechanical_retry_from_verdict".into(),
-                                audit_data: serde_json::json!({
-                                    "attempt": run.attempts_used,
-                                    "budget": run.mechanical_budget,
-                                }),
-                                ..Default::default()
-                            },
+                            effects,
                         }
                     } else {
+                        let mut effects = Effects::default();
+                        effects.verdicts.push(VerdictKind::Exec(v.clone()));
+                        effects.audit(
+                            "mechanical_budget_exhausted_escalated",
+                            serde_json::json!({
+                                "value": format!("{:?}", v.value),
+                                "failure_class": format!("{:?}", v.failure_class),
+                            }),
+                        );
                         StepIntent::Proceed {
                             event: GovernanceEvent::ExecReviewMechanicalEscalate,
-                            payload: StepPayload {
-                                verdict: Some(VerdictKind::Exec(v.clone())),
-                                audit_name: "mechanical_budget_exhausted_escalated".into(),
-                                audit_data: serde_json::json!({
-                                    "value": format!("{:?}", v.value),
-                                    "failure_class": format!("{:?}", v.failure_class),
-                                }),
-                                ..Default::default()
-                            },
+                            effects,
                         }
                     }
                 }
@@ -843,32 +864,34 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                             "[orchestrator] 执行审查 contract_fault：预标注『建议改契约』，升级属主。"
                         );
                     }
+                    let mut effects = Effects::default();
+                    effects.verdicts.push(VerdictKind::Exec(v.clone()));
+                    effects.audit(
+                        "exec_review_escalated",
+                        serde_json::json!({
+                            "value": format!("{:?}", v.value),
+                            "failure_class": format!("{:?}", v.failure_class),
+                            "suggest_contract_change": suggest_contract_change,
+                            "explanation": v.explanation,
+                        }),
+                    );
                     StepIntent::Proceed {
                         event: GovernanceEvent::ExecReviewSemanticEscalate,
-                        payload: StepPayload {
-                            verdict: Some(VerdictKind::Exec(v.clone())),
-                            audit_name: "exec_review_escalated".into(),
-                            audit_data: serde_json::json!({
-                                "value": format!("{:?}", v.value),
-                                "failure_class": format!("{:?}", v.failure_class),
-                                "suggest_contract_change": suggest_contract_change,
-                                "explanation": v.explanation,
-                            }),
-                            ..Default::default()
-                        },
+                        effects,
                     }
                 }
             }
         }
         None => {
             // §六继承项：执行审查本身出错（unscored / 离线回退）→ 升级，不悄悄放行。
+            let mut effects = Effects::default();
+            effects.audit(
+                "exec_review_error_escalated",
+                serde_json::json!({ "reason": unscored_reason }),
+            );
             StepIntent::Proceed {
                 event: GovernanceEvent::ExecReviewError,
-                payload: StepPayload {
-                    audit_name: "exec_review_error_escalated".into(),
-                    audit_data: serde_json::json!({ "reason": unscored_reason }),
-                    ..Default::default()
-                },
+                effects,
             }
         }
     };
@@ -916,7 +939,11 @@ fn review_host_failure_escalate(
     println!(
         "[orchestrator] {}审查失败已升级属主（state=Escalated，挂起；审查 outcome 已落盘）。\n\
          \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
-        if mode == "plan_review" { "计划" } else { "执行" },
+        if mode == "plan_review" {
+            "计划"
+        } else {
+            "执行"
+        },
         ctx.run_dir.display()
     );
     Ok(())
