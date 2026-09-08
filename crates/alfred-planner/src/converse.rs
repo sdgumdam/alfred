@@ -18,7 +18,7 @@
 //!   `ALFRED_OFFLINE_REPLY_FILE=<reply.txt>` → 答复分支；仍把 would-be 请求
 //!   落盘 llm-calls/（e2e 从记录断言会话文档/伪装消息）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alfred_core::builder::{BuildInstruction, GraphBuilder};
 use alfred_core::dagspec::DagSpec;
@@ -76,6 +76,7 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 - 契约 prompt 的产物路径措辞必须按执行者视角自锚定（执行者只看得到挂载结果，看不到宿主 ws 布局）：产物落在首个子目录（即执行者的 /workspace 根）时，表述为"在 /workspace 根下创建 <文件>"，或"在 <首子目录> 下创建"并附明确落点（如"在 src 下创建 hello.txt，落点 /workspace/hello.txt"）；禁止会产生 /workspace/<首子目录>/<文件> 之类多嵌套一层的歧义表述；产物落在其余子目录时写 /workspace/<子目录>/<文件>。
 - 默认用缺省沙箱（volumes 空、runtime null、packages 空、network false），workspace_subdirs 按上条必须非空；除非任务确实需要，才声明额外权限。
 - 任务需要读工作区之外的宿主参考材料（如设计文档、规格说明）时：声明只读参考卷 volumes（sandbox.volumes 数组），每项 {"host_path":"<宿主项目内路径>","container_path":"<容器内挂载点>","mode":"ro"}——host_path 必须是本会话可见的宿主项目内**绝对路径**且真实存在（容器以 ro 挂载，执行者只读）；container_path 用独立路径（建议 /references 或 /references/<名>），不得用 /workspace、/tmp/.agt 及其子路径。参考材料必须经 volumes 挂载进执行容器，契约 prompt 按 container_path 措辞（如"阅读 /references 下的设计文档"）——不要假设执行者能看到宿主任意路径，也不要把参考材料措辞成本地路径。runtime/packages/network 仍保持缺省（执行驱动不支持，声明了会被拒绝）。
+- 声明参考卷前先用工具探查宿主材料体积（如 wc -c / du -sk <宿主路径>）；材料 MB 级（>5MB）时：①add_node 声明足额 time_limit_secs（可选整数秒字段，节点执行时间上限；1800 起步，每多 10MB 再加 600，向上取整——未声明时系统缺省仅 600 秒，大材料分块提炼必超）；②contract.prompt 必须明确提示执行者：参考卷超出上下文容量，用 head/tail/jq/node 等工具分块提炼所需信息，勿尝试通读。
 - 计划必须忠实反映属主需求，不要做属主没要求的事。
 - 答复属主时用自然语言直接、清晰，不要夹带建图指令。"#;
 
@@ -244,11 +245,101 @@ pub fn instructions_to_dagspec(text: &str, request: &OwnerRequest) -> Result<Dag
             .apply(inst)
             .map_err(|e| anyhow::anyhow!("builder error: {e}"))?;
     }
-    let dagspec = builder
+    let mut dagspec = builder
         .build()
         .map_err(|e| anyhow::anyhow!("builder error: {e}"))?;
     validate_dagspec(&dagspec, request)?;
+    // B：大文件感知兜底——契约 time_limit_secs 字段在此写入（planner 产
+    // instructions.json 的 dagspec 构造处）。提示词指导 planner 主动写对，
+    // 这里是 LLM 漏写时的确定性兜底（>5MB 必有足额预算 + 分块提炼提示）。
+    apply_large_volume_budget(&mut dagspec);
     Ok(dagspec)
+}
+
+// ---- B：planner 大文件感知（大参考卷预算兜底的确定性真源） ----
+
+/// 大参考卷判定阈值：节点声明的只读参考卷宿主材料总量 >5MB 即超上下文容量。
+pub const LARGE_REF_VOLUME_BYTES: u64 = 5 * 1024 * 1024;
+/// 大参考卷 time_limit_secs 下限基数（秒）。
+const LARGE_REF_BASE_SECS: u32 = 1800;
+/// 超出阈值后每开始一个 10MB 块追加的秒数。
+const LARGE_REF_PER_10MB_SECS: u32 = 600;
+/// 10MB（字节）。
+const TEN_MB_BYTES: u64 = 10 * 1024 * 1024;
+/// 执行者分块提炼提示查重标记（planner 已按指导词写对则不重复注入）。
+const LARGE_VOLUME_HINT_MARKER: &str = "勿尝试通读";
+
+/// 大参考卷预算兜底：逐节点看 `sandbox.volumes` 宿主材料总量，>5MB 时——
+///
+/// ① `time_limit_secs` 未达规模下限则抬到下限（`1800 + 600×ceil((总量-5MB)/10MB)`；
+///    已声明更高值不动——planner/属主的显式声明优先）；
+/// ② `contract.prompt` 缺分块提炼提示则补系统提示（执行者勿通读，分块提炼）。
+///
+/// 根因对位：28.6MB omp 会话参考卷在 600s 硬死线内分块提炼不可能完成（三连
+/// timed_out 机械重跑耗尽升级）——大材料任务必须在计划层就带足时间预算与
+/// 正确的执行策略。
+pub fn apply_large_volume_budget(dagspec: &mut DagSpec) {
+    for node in &mut dagspec.nodes {
+        let total = ref_volume_total_bytes(&node.sandbox.volumes);
+        if total <= LARGE_REF_VOLUME_BYTES {
+            continue;
+        }
+        let floor = scaled_time_limit_secs(total);
+        if floor > node.time_limit_secs.unwrap_or(0) {
+            node.time_limit_secs = Some(floor);
+        }
+        if !node.contract.prompt.contains(LARGE_VOLUME_HINT_MARKER) {
+            node.contract
+                .prompt
+                .push_str(&large_volume_prompt_hint(total));
+        }
+    }
+}
+
+/// 节点只读参考卷宿主材料总量（字节；不存在/不可读路径计 0——放行校验在
+/// executor validate_ref_volume，这里不重复拒绝）。
+fn ref_volume_total_bytes(volumes: &[alfred_core::VolumeMount]) -> u64 {
+    volumes.iter().map(|v| host_path_size(&v.host_path)).sum()
+}
+
+/// 宿主路径体积：文件 = 长度；目录 = 递归求和（symlink 跟随目标计实体）。
+fn host_path_size(path: &str) -> u64 {
+    match std::fs::metadata(Path::new(path)) {
+        Ok(md) if md.is_file() => md.len(),
+        Ok(md) if md.is_dir() => dir_size(Path::new(path)),
+        _ => 0,
+    }
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        match entry.metadata() {
+            Ok(md) if md.is_dir() => total += dir_size(&entry.path()),
+            Ok(md) => total += md.len(),
+            Err(_) => {}
+        }
+    }
+    total
+}
+
+/// 大参考卷 time_limit_secs 规模下限：1800 起步，超出 5MB 部分每开始一个
+/// 10MB 块再 +600（向上取整——块内不欠账；28.6MB → 1800+600×3 = 3600）。
+fn scaled_time_limit_secs(total_bytes: u64) -> u32 {
+    let over = total_bytes.saturating_sub(LARGE_REF_VOLUME_BYTES);
+    let blocks = (over + TEN_MB_BYTES - 1) / TEN_MB_BYTES;
+    LARGE_REF_BASE_SECS + LARGE_REF_PER_10MB_SECS * blocks as u32
+}
+
+/// 执行者分块提炼系统提示（append 到 contract.prompt 尾部）。
+fn large_volume_prompt_hint(total_bytes: u64) -> String {
+    format!(
+        "\n\n【系统提示（执行者必读）】本任务只读参考卷总量约 {:.1} MB，远超模型上下文容量——勿尝试通读；用 head/tail/jq/node 等工具分块检索、提炼所需信息。",
+        total_bytes as f64 / 1_048_576.0
+    )
 }
 
 /// 校验 DagSpec 与请求对齐（request_id 匹配、节点非空、单节点骨架范围）。
@@ -350,4 +441,151 @@ pub fn strip_fences(text: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试参考材料目录：一次性建、drop 时整目录清理（含 >5MB 大文件）。
+    struct RefFixture(PathBuf);
+
+    impl RefFixture {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "alfred-large-ref-{tag}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn write(&self, name: &str, bytes: u64) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, vec![0u8; bytes as usize]).unwrap();
+            p
+        }
+    }
+
+    impl Drop for RefFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn owner_request() -> OwnerRequest {
+        OwnerRequest {
+            id: "req-1".into(),
+            title: "t".into(),
+            description: "d".into(),
+            acceptance_criteria: "a".into(),
+            created_at: "2026-09-08T00:00:00Z".into(),
+        }
+    }
+
+    /// 构造带单参考卷的建图指令（instructions.json 形态）。
+    fn instructions_with_volume(
+        host_path: &str,
+        time_limit_secs: Option<u32>,
+        prompt_suffix: &str,
+    ) -> String {
+        let tl = time_limit_secs
+            .map(|v| format!(",\"time_limit_secs\":{v}"))
+            .unwrap_or_default();
+        format!(
+            r#"[{{"op":"begin","request_id":"req-1"}},
+{{"op":"add_node","id":"task-1","summary":"提炼参考材料",
+"contract":{{"prompt":"阅读 /references 参考材料并完成任务。{prompt_suffix}","acceptance_criteria":"a"}},
+"sandbox":{{"volumes":[{{"host_path":"{host_path}","container_path":"/references","mode":"ro"}}],"workspace_subdirs":["src"]}}{tl}}},
+{{"op":"commit"}}]"#
+        )
+    }
+
+    #[test]
+    fn large_volume_declares_floor_time_limit_and_hint() {
+        // >5MB 触发：未声明 → 抬到规模下限（6MB：1800+600×1=2400）+ prompt 补提示。
+        let fx = RefFixture::new("6mb");
+        let big = fx.write("big.bin", 6 * 1024 * 1024);
+        let text = instructions_with_volume(big.to_str().unwrap(), None, "");
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        let node = &dag.nodes[0];
+        assert_eq!(node.time_limit_secs, Some(2400));
+        assert!(node.contract.prompt.contains(LARGE_VOLUME_HINT_MARKER));
+        assert!(node.contract.prompt.contains("head/tail/jq/node"));
+    }
+
+    #[test]
+    fn large_volume_scales_with_size() {
+        // 35MB：超出 30MB = 3 个整 10MB 块 → 1800+1800=3600；28.6MB 原始事故
+        // 体积（超出 23.6MB → 3 块）同为 3600。
+        let fx = RefFixture::new("scale");
+        let big = fx.write("big.bin", 35 * 1024 * 1024);
+        let text = instructions_with_volume(big.to_str().unwrap(), None, "");
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        assert_eq!(dag.nodes[0].time_limit_secs, Some(3600));
+
+        let incident = fx.write("omp-session.json", 30_000_000); // ≈28.6MB
+        let text = instructions_with_volume(incident.to_str().unwrap(), None, "");
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        assert_eq!(dag.nodes[0].time_limit_secs, Some(3600));
+    }
+
+    #[test]
+    fn small_volume_untouched() {
+        // ≤5MB 不触发：无声明保持 None、prompt 原样（无系统提示注入）。
+        let fx = RefFixture::new("small");
+        let small = fx.write("small.md", 1024);
+        let text = instructions_with_volume(small.to_str().unwrap(), None, "");
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        assert_eq!(dag.nodes[0].time_limit_secs, None);
+        assert_eq!(
+            dag.nodes[0].contract.prompt,
+            "阅读 /references 参考材料并完成任务。"
+        );
+    }
+
+    #[test]
+    fn declared_limit_higher_kept_lower_raised() {
+        // 显式声明优先于下限（更高不动）；低于下限被抬（planner 漏算兜底）。
+        let fx = RefFixture::new("declared");
+        let big = fx.write("big.bin", 6 * 1024 * 1024);
+
+        let text = instructions_with_volume(big.to_str().unwrap(), Some(7200), "");
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        assert_eq!(dag.nodes[0].time_limit_secs, Some(7200));
+
+        let text = instructions_with_volume(big.to_str().unwrap(), Some(600), "");
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        assert_eq!(dag.nodes[0].time_limit_secs, Some(2400));
+    }
+
+    #[test]
+    fn existing_hint_not_duplicated() {
+        // planner 已按指导词写对提示（含查重标记）→ 系统不重复注入。
+        let fx = RefFixture::new("dup");
+        let big = fx.write("big.bin", 6 * 1024 * 1024);
+        let text = instructions_with_volume(
+            big.to_str().unwrap(),
+            None,
+            "参考卷超出上下文容量，用 head/tail/jq/node 分块提炼，勿尝试通读。",
+        );
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        let prompt = &dag.nodes[0].contract.prompt;
+        assert!(!prompt.contains("【系统提示"));
+        assert_eq!(prompt.matches(LARGE_VOLUME_HINT_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn directory_volume_sums_files() {
+        // 目录卷递归求和：3MB + 3MB = 6MB > 5MB → 触发（2400）。
+        let fx = RefFixture::new("dir");
+        let sub = fx.0.join("refs");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.bin"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        std::fs::write(sub.join("b.bin"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let text = instructions_with_volume(sub.to_str().unwrap(), None, "");
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        assert_eq!(dag.nodes[0].time_limit_secs, Some(2400));
+        assert!(dag.nodes[0].contract.prompt.contains(LARGE_VOLUME_HINT_MARKER));
+    }
 }
