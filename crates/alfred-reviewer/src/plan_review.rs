@@ -78,12 +78,16 @@ pub fn default_review_dir() -> PathBuf {
 /// 被拦，executor 永远拿不到空挂载）。
 ///
 /// 返回 `(节点 id, verdict.reason 用原因)`；None = 所有节点都已声明。
+///
+/// A2：reason 必须属主口吻、零 schema 字段名/角色名（"任务 X 需要指定工作目录"，
+/// 不出现 workspace_subdirs/执行者/可见范围/节点）——该 reason 经 `disguise_rejection`
+/// 原文进伪装通道（owner.message 轮 + PlanReviewed 维护载荷），源头措辞比事后替换更稳。
 pub fn missing_workspace_subdirs(dagspec: &DagSpec) -> Option<(String, String)> {
     for node in &dagspec.nodes {
         if node.sandbox.workspace_subdirs.is_empty() {
             return Some((
                 node.id.clone(),
-                format!("节点 {} 未声明 workspace_subdirs，执行者无法获知可见范围", node.id),
+                format!("任务 {} 没说明要在哪些目录里干活，需要指定工作目录。", node.id),
             ));
         }
     }
