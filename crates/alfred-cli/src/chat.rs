@@ -520,8 +520,9 @@ fn first_n_chars(s: &str, n: usize) -> String {
 
 /// 行输入器：交互双 tty → rustyline 行编辑（↑↓ 历史、←→ 移动；进程内会话级
 /// 历史——需求收集/对话/拍板三态共享同一实例，历史贯通；不持久化文件）；否则
-/// （管道/重定向喂入）保持裸 read_line——提示打 stdout 并 flush（管道喂入时
-/// 提示与输出同流，便于黑盒断言，e2e 管道路径依赖）。
+/// （管道/重定向喂入）保持裸字节读（非 UTF-8 容错，见 sanitize_raw_line）——
+/// 提示打 stdout 并 flush（管道喂入时提示与输出同流，便于黑盒断言，e2e 管
+/// 道路径依赖）。
 struct ChatInput {
     editor: Option<Editor<(), MemHistory>>,
     stdin: io::Stdin,
@@ -565,12 +566,100 @@ impl ChatInput {
         }
         print!("{prompt}");
         io::stdout().flush().ok();
-        let mut buf = String::new();
-        match self.stdin.lock().read_line(&mut buf) {
+        // 裸读走字节级：read_line 遇非 UTF-8 字节直接 Err（属主真实使用撞到
+        // `stream did not contain valid UTF-8`，整个 REPL 崩退）。改 read_until
+        // 读原始字节 → sanitize_raw_line（lossy + 转义过滤 + 去 \n/\r 尾）。
+        let mut raw = Vec::new();
+        match self.stdin.lock().read_until(b'\n', &mut raw) {
             Ok(0) => Ok(None),
-            Ok(_) => Ok(Some(buf)),
+            Ok(_) => Ok(Some(sanitize_raw_line(&raw))),
             Err(e) => Err(e).context("alfred chat: 读 stdin 失败"),
         }
+    }
+}
+
+/// 裸读行净化（UTF-8 容错 + 控制序列过滤，只作用于裸读分支——tty 走 rustyline）：
+/// - **不崩**：`read_line` 对非 UTF-8 字节直接 Err；这里字节级过滤后
+///   `from_utf8_lossy`（非法字节 → U+FFFD 替身），坏行以替身字符照常进治理流
+///   ——属主看得见，不静默丢；
+/// - **去尾**：剥尾部 `\n`/`\r`（read_until 带回换行；read_line 三处调用点均先
+///   `trim()`，干净输入语义逐字节不变，且与 rustyline 分支无换行尾对齐）；
+/// - **过滤**：裸读无行编辑，方向键等控制序列会以原始转义字节混进消息体变成
+///   乱码"命令"。剥 CSI 序列（`ESC[` + 参数/中间字节 0x20-0x3F + 终结字节
+///   0x40-0x7E 的单序列——方向键 `ESC[A/B/C/D`、Delete `ESC[3~` 等）与裸控制
+///   字符（<0x20，`\t` 保留）。仅匹配 ASCII 单字节；UTF-8 保证多字节序列内不
+///   出现 ASCII 字节，中文安全。
+fn sanitize_raw_line(raw: &[u8]) -> String {
+    let mut end = raw.len();
+    while end > 0 && matches!(raw[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    let bytes = &raw[..end];
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1B && bytes.get(i + 1) == Some(&b'[') {
+            // 单个 CSI 序列：吞参数/中间字节直到终结字节；遇非序列字节/越界视
+            // 为残缺——只丢 ESC[ 前缀，不吞后续正文。
+            let mut j = i + 2;
+            let complete = loop {
+                match bytes.get(j) {
+                    Some(c) if (0x40..=0x7E).contains(c) => {
+                        j += 1;
+                        break true;
+                    }
+                    Some(c) if (0x20..=0x3F).contains(c) => j += 1,
+                    _ => break false,
+                }
+            };
+            i = if complete { j } else { i + 2 };
+        } else if b < 0x20 && b != b'\t' {
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_raw_line;
+
+    /// 干净 UTF-8 输入恒等：lossy 对合法输入不改内容，只剥行尾（调用点均
+    /// trim()，语义逐字节不变）。
+    #[test]
+    fn clean_utf8_identity() {
+        assert_eq!(sanitize_raw_line(b"hello\n"), "hello");
+        assert_eq!(
+            sanitize_raw_line("新需求：写 hello.txt\r\n".as_bytes()),
+            "新需求：写 hello.txt"
+        );
+        assert_eq!(sanitize_raw_line(b"eof no newline"), "eof no newline");
+    }
+
+    /// 非 UTF-8 字节不崩：→ U+FFFD 替身（坏行照常进治理流——可见，不静默丢）。
+    #[test]
+    fn invalid_bytes_become_replacement() {
+        assert_eq!(sanitize_raw_line(b"test\xff\xe6\x96\xb0\n"), "test\u{FFFD}新");
+    }
+
+    /// 方向键等 CSI 转义序列整段剥除，不进消息体。
+    #[test]
+    fn csi_sequences_filtered() {
+        assert_eq!(sanitize_raw_line(b"\x1b[Dtext\x1b[C\n"), "text");
+        assert_eq!(sanitize_raw_line(b"\x1b[3~\n"), "");
+        assert_eq!(sanitize_raw_line(b"\x1b[1;5Cgo\n"), "go");
+    }
+
+    /// 裸控制字符剥除（\t 保留）；残缺转义序列只丢 ESC[ 前缀，不吞正文。
+    #[test]
+    fn control_chars_and_malformed_escape() {
+        assert_eq!(sanitize_raw_line(b"a\x07b\x00c\n"), "abc");
+        assert_eq!(sanitize_raw_line(b"a\tb\n"), "a\tb");
+        assert_eq!(sanitize_raw_line("\x1b[新需求".as_bytes()), "新需求");
     }
 }
 
