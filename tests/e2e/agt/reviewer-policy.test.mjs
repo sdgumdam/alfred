@@ -101,6 +101,20 @@ const d4b = evaluateToolCall(policy, bash("echo x | tee /etc/contraband"));
 assert(d4b.decision === "deny" && d4b.rule === "deny-bash-write-redirect",
   `tee /etc/contraband → deny（got ${d4b.decision}/${d4b.rule}）`);
 
+// —— clobber `>|` 与读写 `<>` 重定向（A7/UnknowFinalAudit 残留）：`>>?` 形态的
+//    字符类排除 `|`，`>|file`（noclobber 强制覆盖写）与 `<>file`（读写打开）曾
+//    整族绕过——补形态后与 `>`/`>>` 同拦；产出目录白名单不收 clobber/读写形态
+//    （fail-closed：白名单只认字面 `>`/`>>`/tee）。
+const d4c = evaluateToolCall(policy, bash("echo x >|/workspace/probe.txt"));
+assert(d4c.decision === "deny" && d4c.rule === "deny-bash-write-redirect",
+  `echo >| /workspace → deny（got ${d4c.decision}/${d4c.rule}）`);
+const d4d = evaluateToolCall(policy, bash("echo x <>/workspace/probe.txt"));
+assert(d4d.decision === "deny" && d4d.rule === "deny-bash-write-redirect",
+  `echo <> /workspace → deny（got ${d4d.decision}/${d4d.rule}）`);
+const d4e = evaluateToolCall(policy, bash(`echo x >| ${OUTPUTS}/verdict.json`));
+assert(d4e.decision === "deny" && d4e.rule === "deny-bash-write-redirect",
+  `echo >| outputs → deny（clobber 形态不入白名单，got ${d4e.decision}/${d4e.rule}）`);
+
 // —— sudo / rm -rf ——
 const d6 = evaluateToolCall(policy, bash("sudo apt-get update"));
 assert(d6.decision === "deny" && d6.rule === "no-sudo", `sudo → deny(${d6.rule})`);

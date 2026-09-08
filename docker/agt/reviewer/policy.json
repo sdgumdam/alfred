@@ -30,6 +30,8 @@
       "condition": "tool_name == 'bash'",
       "command_patterns": [
         { "source": "(?:^|[;|&\\s])>>?\\s*[^\\s|;&<>]+", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])>\\|\\s*[^\\s|;&<>]+", "flags": "i" },
+        { "source": "(?:^|[;|&\\s])<>\\s*[^\\s|;&<>]+", "flags": "i" },
         { "source": "(?:^|[;|&\\s])tee\\s+(?:-a\\s+)?[^\\s|;&<>]+", "flags": "i" },
         { "source": "(?:^|[;|&\\s])dd\\b[^|;&<>]*\\bof=[^\\s|;&<>]+", "flags": "i" }
       ],

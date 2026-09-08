@@ -426,6 +426,21 @@ for (const cmd of redirectFormProbes) {
   const rd = evaluateToolCall(plannerPolicy, bash(cmd));
   assert(rd.decision === "deny", `对抗探针④ 写族漏形态 ${cmd} → deny（got ${rd.decision}/${rd.rule}）`);
 }
+// ④-3 clobber `>|` 与读写 `<>` 重定向（A7/UnknowFinalAudit 残留）：写族 `>>?`
+//    形态的字符类排除 `|`，`>|file`（noclobber 强制覆盖写）与 `<>file`（stdin/out
+//    读写打开）曾整族绕过——补形态后 deny，且必须命中写族规则本身（钉规则名，
+//    防"被别的规则顺带拦下"的假绿）。
+const clobberRedirectProbes = [
+  "echo x >|file.txt",
+  "echo x >| file.txt",
+  "echo x <>file.txt",
+  "echo x <> file.txt",
+];
+for (const cmd of clobberRedirectProbes) {
+  const rd = evaluateToolCall(plannerPolicy, bash(cmd));
+  assert(rd.decision === "deny" && rd.rule === "deny-bash-write-family",
+    `对抗探针④-3 clobber/读写重定向 ${cmd} → deny 写族（got ${rd.decision}/${rd.rule}）`);
+}
 // ④-2 fd 丢弃豁免（devnull-fix 回归面）：`2>/dev/null` / `1>/dev/null` 整条 allow；
 //    fd 指向真实文件（`2>file` / `2>>file`）仍 deny——负向先行只豁免 /dev/null 目标。
 const devnullAllowProbes = [
