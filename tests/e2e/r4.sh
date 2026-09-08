@@ -13,8 +13,11 @@
 #      driver feed --decision retry`（离线注入忠实计划）→ 重规划 → 计划审查
 #      容器在线判过 → 执行 → 执行审查离线回退 → Escalated（R6d 不悄悄放行）。
 #
-# 断言：state.json 状态推进（abandoned / escalated + 可选 hello.txt）。旧决策面板
-#   RPC（panel-session.jsonl extension_ui_request/response）已随 CLI 删除归档。
+# 断言：state.json 状态推进（abandoned / escalated）；case2 retry 产物落点强制断言
+#   （ws/<sub0>/hello.txt 内容 Hello）+ 前轮残留 ws/<sub0>/<sub0>/ 不被新产物覆盖
+#   （A4 挂载锚：锚前误嵌套写入等价物，不做运行时清理——清理有覆盖产物风险，
+#   断言兜底）。旧决策面板 RPC（panel-session.jsonl extension_ui_request/response）
+#   已随 CLI 删除归档。
 #
 # 模型：glm-5.3-flash 省钱（config.yml 或 env 覆盖）。
 # 驱动：黑盒经真实 `alfred` bin（codux 可调度 CLI driver：run/feed/status）驱动——
@@ -252,6 +255,18 @@ cargo run --quiet -p alfred-cli --bin alfred -- run \
 assert_state "$CASE2_DIR" "plan_rejected"
 echo "PASS(case2a): 不忠实计划被计划审查打回 → PlanRejected"
 
+# --- A4 挂载锚：前轮残留注入 --------------------------------------------
+# 模拟锚前执行者误嵌套写入（/workspace/<sub>/hello.txt → 宿主
+# ws/<sub>/<sub>/hello.txt，即挂载锚要治的「多嵌套一层」历史产物）。round1 计划
+# 审查打回不执行（ws 尚不存在），这里人工落残留等价生产事实：retry 重跑透过挂载
+# 可见 /workspace/<sub>/，与锚「不存在同名嵌套子目录」矛盾——断言兜底机械重跑
+# 产物仍落正确锚位，且残留不被新产物覆盖（不做运行时清理）。
+SUB0="$(python3 -c "import json;print(json.load(open('$CASE2_DIR/plan-faithful.json'))['nodes'][0]['sandbox']['workspace_subdirs'][0])")"
+RESIDUE="$CASE2_DIR/ws/$SUB0/$SUB0"
+mkdir -p "$RESIDUE"
+printf 'stale' > "$RESIDUE/hello.txt"
+echo "[r4] case2: 注入前轮残留 $RESIDUE/hello.txt（锚前误嵌套写入等价物，声明子目录=${SUB0}）"
+
 echo "[r4] case2: driver feed retry（属主重跑：planner 离线注入忠实计划 → 计划审查在线判过 → 执行 → 执行审查离线回退） ..."
 ALFRED_PLANNER_OFFLINE=1 ALFRED_EXEC_REVIEW_OFFLINE=1 \
 ALFRED_OFFLINE_PLAN_FILE="$CASE2_DIR/plan-faithful.json" \
@@ -264,11 +279,21 @@ assert_state "$CASE2_DIR" "escalated"
 # 执行审查离线回退（ALFRED_EXEC_REVIEW_OFFLINE=1）→ 升级挂起（escalated）——
 # 执行审查离线只出产物无审查结论，不悄悄放行。执行已真跑（产物落
 # ws/<workspace_subdirs[0]>），内容须正确。
+# A4 挂载锚：产物落点强制断言（升格原条件断言，r2 case1 / r3 case1 同范式）——
+# retry 真实执行产物必须落挂载锚定位 ws/<workspace_subdirs[0]>/hello.txt 且内容
+# 正确；前轮残留 ws/<sub0>/<sub0>/hello.txt 不得被新产物覆盖（执行者把产物写进
+# 嵌套残留路径 = 挂载锚语义破坏，直接 FAIL）。
 HELLO2="$(run_ws_hello "$CASE2_DIR" || true)"
-if [[ -n "$HELLO2" && -f "$HELLO2" ]]; then
-  [[ "$(cat "$HELLO2")" == "Hello" ]] || { echo "FAIL(case2): hello.txt content wrong" >&2; exit 1; }
+if [[ -z "$HELLO2" || ! -f "$HELLO2" ]]; then
+  echo "FAIL(case2): hello.txt not found under $CASE2_DIR/ws/ (declared workspace_subdirs[0]; resolved: ${HELLO2:-<none>})" >&2
+  exit 1
 fi
-echo "PASS(case2): 打回续跑闭环 → feed retry → 重规划 → 执行审查离线回退升级（决策面板 RPC 已删归档）"
+[[ "$(cat "$HELLO2")" == "Hello" ]] || { echo "FAIL(case2): hello.txt content wrong" >&2; exit 1; }
+[[ "$(cat "$RESIDUE/hello.txt" 2>/dev/null)" == "stale" ]] || {
+  echo "FAIL(case2): 前轮残留 $RESIDUE/hello.txt 被改动（执行者把产物写进嵌套残留路径——挂载锚语义破坏）" >&2
+  exit 1
+}
+echo "PASS(case2): 打回续跑闭环 → feed retry → 重规划 → 执行审查离线回退升级 + 产物落点/残留兜底断言（决策面板 RPC 已删归档）"
 
 echo ""
 echo "============================================="
