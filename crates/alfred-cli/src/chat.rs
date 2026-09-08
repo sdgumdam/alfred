@@ -37,8 +37,12 @@
 //! 语音、`[driver]` CLI driver 状态行（run/feed/status 保留不动）、`[chat]` 本壳
 //! 提示音。
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+
+use rustyline::error::ReadlineError;
+use rustyline::history::MemHistory;
+use rustyline::{Config, Editor};
 
 use alfred_cli::governance::{
     build_governance_context, default_governance_base, default_governance_dir, feed_owner_message,
@@ -109,7 +113,7 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
         }
     }
 
-    let stdin = io::stdin();
+    let mut input = ChatInput::new();
     // 终态呈现一次性标记（进入循环后第一次遇到终态时呈现结果，随后是需求收集态）。
     let mut fresh_terminal = false;
     loop {
@@ -144,7 +148,7 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                         fresh_terminal = true;
                     }
                 }
-                let Some(requirement) = collect_requirement(&stdin)? else {
+                let Some(requirement) = collect_requirement(&mut input)? else {
                     break;
                 };
                 // 确定性转写（title 按 chars() 截断 ≤40，中文安全）；验收标准
@@ -186,7 +190,7 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
             }
             // ── Planning 态：pi 已答复（§2.4 Reply 分支停驻），行=owner 消息续入对话 ──
             Some(GovernanceState::Planning) => {
-                let Some(line) = read_line(&stdin, "[chat] 对 pi 说（一行；Ctrl-D 退出）：")?
+                let Some(line) = input.read_line("[chat] 对 pi 说（一行；Ctrl-D 退出）：")?
                 else {
                     break;
                 };
@@ -205,7 +209,7 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                 let r = run.as_ref().expect("suspended state has run");
                 present_suspension(r, &run_dir);
                 let Some(line) =
-                    read_line(&stdin, "[chat] 回复：重试 / 放弃 / 或直接说修改意见：")?
+                    input.read_line("[chat] 回复：重试 / 放弃 / 或直接说修改意见：")?
                 else {
                     break;
                 };
@@ -373,9 +377,9 @@ fn parse_planning_decision(line: &str) -> (OwnerDecision, String) {
 
 /// 需求收集（单轮直提）：一行=需求（空行重问）。不追问验收标准——默认=需求
 /// 原文（pi 对话中需要澄清自然会问，Reply 分支）。EOF → None（会话结束）。
-fn collect_requirement(stdin: &io::Stdin) -> Result<Option<String>> {
+fn collect_requirement(input: &mut ChatInput) -> Result<Option<String>> {
     loop {
-        let Some(line) = read_line(stdin, "[chat] 需求（一行；Ctrl-D 退出）：")? else {
+        let Some(line) = input.read_line("[chat] 需求（一行；Ctrl-D 退出）：")? else {
             return Ok(None);
         };
         let line = line.trim().to_string();
@@ -514,16 +518,59 @@ fn first_n_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// 读一行（EOF → None）；提示打 stdout 并 flush（管道喂入时提示与输出同流，
-/// 便于黑盒断言）。
-fn read_line(stdin: &io::Stdin, prompt: &str) -> Result<Option<String>> {
-    print!("{prompt}");
-    io::stdout().flush().ok();
-    let mut buf = String::new();
-    match stdin.lock().read_line(&mut buf) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(buf)),
-        Err(e) => Err(e).context("alfred chat: 读 stdin 失败"),
+/// 行输入器：交互双 tty → rustyline 行编辑（↑↓ 历史、←→ 移动；进程内会话级
+/// 历史——需求收集/对话/拍板三态共享同一实例，历史贯通；不持久化文件）；否则
+/// （管道/重定向喂入）保持裸 read_line——提示打 stdout 并 flush（管道喂入时
+/// 提示与输出同流，便于黑盒断言，e2e 管道路径依赖）。
+struct ChatInput {
+    editor: Option<Editor<(), MemHistory>>,
+    stdin: io::Stdin,
+}
+
+impl ChatInput {
+    fn new() -> Self {
+        // 行编辑仅交互双 tty 启用：stdout 非 tty（如 `alfred chat | tee`）时编辑
+        // UI 无处渲染，回退裸读保持现状。
+        let editor = if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            match Editor::with_history(Config::default(), MemHistory::new()) {
+                Ok(ed) => Some(ed),
+                Err(e) => {
+                    eprintln!("[chat] 行编辑初始化失败（{e}），回退裸读。");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            editor,
+            stdin: io::stdin(),
+        }
+    }
+
+    /// 读一行（EOF/Ctrl-C → None，会话结束——对齐裸读时代 Ctrl-D→None、
+    /// Ctrl-C→SIGINT 终止语义，不 panic）。
+    fn read_line(&mut self, prompt: &str) -> Result<Option<String>> {
+        if let Some(editor) = self.editor.as_mut() {
+            return match editor.readline(prompt) {
+                Ok(line) => {
+                    if !line.trim().is_empty() {
+                        editor.add_history_entry(line.as_str()).ok();
+                    }
+                    Ok(Some(line))
+                }
+                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => Ok(None),
+                Err(e) => Err(e).context("alfred chat: 读 stdin 失败"),
+            };
+        }
+        print!("{prompt}");
+        io::stdout().flush().ok();
+        let mut buf = String::new();
+        match self.stdin.lock().read_line(&mut buf) {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(buf)),
+            Err(e) => Err(e).context("alfred chat: 读 stdin 失败"),
+        }
     }
 }
 

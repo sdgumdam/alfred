@@ -20,3 +20,4 @@ alfred-reviewer = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+rustyline = "18.0.1"
