@@ -326,7 +326,8 @@ if [[ "${CHAT_REAL:-0}" == "1" ]]; then
   REAL="$STATE/run-chat-real"
   # 真对话（§二.8 改口语义）：需求+先答复要求 → [pi] 真答复（Planning）→ 确认建图
   # → 自主流转 → 挂起/终态。pi 若跳过答复直接建图，后续行按"终态→新需求"路由
-  # （同样合法），断言与最终状态无关。
+  # （同样合法）；但两种排序下终局断言一致：必须走出 Planning 到终态/合法升级，
+  # 且留建图证据（见下方 A6 收紧断言）。
   # （子壳内 unset 离线注入 env——env 工具无法调用 shell 函数，走 ALFRED 函数本体）
   (
     unset ALFRED_OFFLINE ALFRED_OFFLINE_PLAN_FILE ALFRED_OFFLINE_REPLY_FILE
@@ -343,21 +344,31 @@ assert any(t["role"] == "planner" and t["source"] == "converse.reply" and t["con
            for t in log["turns"]), "无 planner converse.reply 轮"
 PY
   [[ -n "$(ls "$REAL/llm-calls" 2>/dev/null)" ]] || fail chat-real "llm-calls/ 无真实调用证据"
-  # 两轮流脚本（改口→确认建图）输入下，run 终态不得落在 escalated——escalated =
-  # driver 升级（planning_error 等），历史上正是 planner outputs 跨轮残留把两轮
-  # 路径钉死成 100% planning_error_escalated。断言收紧锁死改口→建图路径；若真
-  # 升级必须是 execution/plan_review 来源（非 planning 侧）才放行。
+  # A6 断言收紧：两轮流脚本（需求→[pi] 真答复→改口确认建图）必须驱动 run 走出
+  # Planning——终态只认 completed/abandoned；escalated 仅当升级来源非 planning
+  # （plan_review/execution 审查升级是合法挂起路径；planning 来源 = driver 在
+  # planning 侧升级，改口→建图路径断裂）。历史教训：planner outputs 跨轮残留曾
+  # 把两轮路径钉死成 100% planning_error_escalated，且 pi 停在答复轮（终态
+  # planning/plan_rejected）也放水 PASS——本轮一并锁死。
   REAL_STATE="$(state_of "$REAL")"
   case "$REAL_STATE" in
-    planning|plan_rejected|completed|abandoned) ;;
+    completed|abandoned) ;;
     escalated)
       SOURCE="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('escalation_source') or 'none')" "$REAL/state.json")"
       [[ "$SOURCE" != "planning" ]] || fail chat-real "两轮输入终态 escalated 且来源 planning（改口→建图路径断裂）"
       [[ "$SOURCE" != "none" ]] || fail chat-real "两轮输入终态 escalated 且无升级来源"
       ;;
+    planning|plan_rejected) fail chat-real "两轮输入终态停在 ${REAL_STATE}（未走出 Planning——改口→建图路径断裂）" ;;
     *) fail chat-real "run 落在非法状态 $REAL_STATE" ;;
   esac
-  pass chat-real "真容器真 LLM REPL 对话（state=$(state_of "$REAL")）"
+  # 且：必须有建图证据——dagspec.json 落盘（planner 建图产物）或进过 Executing
+  # （state.json execution_count>0，或 audit 有 execution_succeeded / plan_review
+  # 事件）——锁定"改口后真建图流转"，防 pi 永远停在答复轮仍被终态断言漏放。
+  [[ -f "$REAL/dagspec.json" ]] \
+    || [[ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('execution_count') or 0)" "$REAL/state.json")" -gt 0 ]] \
+    || grep -qE '"event":"(execution_succeeded|plan_review_)' "$REAL/audit.jsonl" \
+    || fail chat-real "无建图证据（dagspec.json / execution_count>0 / execution_succeeded+plan_review 审计全缺）"
+  pass chat-real "真容器真 LLM REPL 对话（state=$(state_of "$REAL")，建图证据在）"
 else
   echo "[chat-e2e] 跳过真 LLM 用例（设 CHAT_REAL=1 开启）"
 fi
