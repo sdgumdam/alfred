@@ -26,6 +26,15 @@ pub struct PlanNode {
     /// 沙箱档案（§2.5；缺省 = 联网拒绝、无额外挂卷——execute_run 只支持默认档案）。
     #[serde(default)]
     pub sandbox: SandboxProfile,
+    /// 节点级执行时间上限（秒；可选声明）。
+    ///
+    /// 声明时覆盖编排器缺省（governance `exec_time_limit_secs`，缺省 600）；
+    /// 未声明 = None → 编排器缺省（兼容既有契约）。写入方：planner
+    /// （add_node 声明；大参考卷任务按规模折算，见 converse 提示词与
+    /// `apply_large_volume_budget` 兜底）+ 编排器 timed_out 自适应放大
+    /// （governance execution_step 机械重跑分支写回）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_secs: Option<u32>,
 }
 
 impl PlanNode {
@@ -35,9 +44,17 @@ impl PlanNode {
             summary: summary.into(),
             contract,
             sandbox: SandboxProfile::default(),
+            time_limit_secs: None,
         }
     }
+
+    /// 节点生效执行时间上限（单一真源）：契约声明优先，未声明回退编排器
+    /// 缺省（fallback_secs = governance `exec_time_limit_secs`，CLI 缺省 600）。
+    pub fn resolved_time_limit_secs(&self, fallback_secs: u32) -> u32 {
+        self.time_limit_secs.unwrap_or(fallback_secs)
+    }
 }
+
 
 /// 计划：属主需求 → 任务节点的 DAG 拆解。
 ///

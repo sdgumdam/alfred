@@ -29,6 +29,10 @@ pub enum BuildInstruction {
         contract: Contract,
         #[serde(default)]
         sandbox: SandboxProfile,
+        /// 节点级执行时间上限（秒；可选声明——透传 PlanNode.time_limit_secs）。
+        /// planner 大参考卷任务按规模声明（converse 提示词），未声明 = None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        time_limit_secs: Option<u32>,
     },
     /// 添加一条依赖边（from 依赖 to 之前的节点——语义：from 在 to 之后执行）。
     AddEdge {
@@ -85,7 +89,8 @@ impl GraphBuilder {
                 summary,
                 contract,
                 sandbox,
-            } => self.add_node(id, summary, contract, sandbox),
+                time_limit_secs,
+            } => self.add_node(id, summary, contract, sandbox, time_limit_secs),
             BuildInstruction::AddEdge { from, to } => self.add_edge(from, to),
             BuildInstruction::SetRoutes { start } => self.set_routes(start),
             BuildInstruction::Commit => self.commit(),
@@ -112,6 +117,7 @@ impl GraphBuilder {
         summary: String,
         contract: Contract,
         sandbox: SandboxProfile,
+        time_limit_secs: Option<u32>,
     ) -> Result<(), String> {
         if !self.begun() {
             return Err("builder: add_node before begin".into());
@@ -138,6 +144,7 @@ impl GraphBuilder {
             summary,
             contract,
             sandbox,
+            time_limit_secs,
         });
         Ok(())
     }

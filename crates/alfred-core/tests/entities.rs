@@ -263,3 +263,84 @@ fn artifact_round_trip() {
     let back: Artifact = serde_json::from_str(&json).unwrap();
     assert_eq!(art, back);
 }
+
+#[test]
+fn plan_node_time_limit_secs_optional_round_trip() {
+    // A：time_limit_secs 可选声明——有值用值、无值 None 兼容旧契约、None 不落序列化。
+    let with = r#"{
+        "id": "task-1",
+        "summary": "s",
+        "contract": { "prompt": "p", "acceptance_criteria": "a" },
+        "time_limit_secs": 1800
+    }"#;
+    let node: alfred_core::PlanNode = serde_json::from_str(with).unwrap();
+    assert_eq!(node.time_limit_secs, Some(1800));
+
+    let without = r#"{
+        "id": "task-1",
+        "summary": "s",
+        "contract": { "prompt": "p", "acceptance_criteria": "a" }
+    }"#;
+    let node: alfred_core::PlanNode = serde_json::from_str(without).unwrap();
+    assert_eq!(node.time_limit_secs, None);
+    // None 不落序列化（旧 dagspec.json 断言面不变）。
+    let text = serde_json::to_string(&node).unwrap();
+    assert!(!text.contains("time_limit_secs"));
+    let back: alfred_core::PlanNode = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, node);
+}
+
+#[test]
+fn builder_add_node_time_limit_secs_threads_to_plan_node() {
+    // A：建图指令 add_node 可选 time_limit_secs → PlanNode 透传（instructions.json
+    // 的 dagspec 构造通道）。
+    use alfred_core::{BuildInstruction, GraphBuilder};
+
+    let insts = r#"[
+        {"op":"begin","request_id":"req-1"},
+        {"op":"add_node","id":"task-1","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"},
+         "sandbox":{"workspace_subdirs":["src"]},"time_limit_secs":1800},
+        {"op":"commit"}
+    ]"#;
+    let insts: Vec<BuildInstruction> = serde_json::from_str(insts).unwrap();
+    let mut builder = GraphBuilder::new();
+    for inst in insts {
+        builder.apply(inst).unwrap();
+    }
+    let dag = builder.build().unwrap();
+    assert_eq!(dag.nodes[0].time_limit_secs, Some(1800));
+
+    // 未声明 → None（兼容）。
+    let insts = r#"[
+        {"op":"begin","request_id":"req-1"},
+        {"op":"add_node","id":"task-1","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"},
+         "sandbox":{"workspace_subdirs":["src"]}},
+        {"op":"commit"}
+    ]"#;
+    let insts: Vec<BuildInstruction> = serde_json::from_str(insts).unwrap();
+    let mut builder = GraphBuilder::new();
+    for inst in insts {
+        builder.apply(inst).unwrap();
+    }
+    let dag = builder.build().unwrap();
+    assert_eq!(dag.nodes[0].time_limit_secs, None);
+}
+
+#[test]
+fn plan_node_resolved_time_limit_prefers_declaration() {
+    // A 透传真源：契约声明优先，未声明回退治理缺省（有值用值/无值 fallback 600）。
+    let contract = Contract {
+        prompt: "p".into(),
+        acceptance_criteria: "a".into(),
+        reviewer_models: vec![],
+    };
+    let declared = alfred_core::PlanNode::new("task-1", "s", contract.clone());
+    let mut declared = declared;
+    declared.time_limit_secs = Some(1800);
+    assert_eq!(declared.resolved_time_limit_secs(600), 1800);
+
+    let undeclared = alfred_core::PlanNode::new("task-1", "s", contract);
+    assert_eq!(undeclared.resolved_time_limit_secs(600), 600);
+}

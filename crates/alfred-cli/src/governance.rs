@@ -654,7 +654,11 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
         workspace_dir: ctx.run_dir.join("ws"),
         image: run.options.image.clone(),
         assignment,
-        time_limit_secs: run.options.exec_time_limit_secs,
+        // A：节点契约声明优先（planner 大参考卷按规模声明 / timed_out 自适应
+        // 放大写回 run.dagspec），未声明回退治理缺省 exec_time_limit_secs
+        // （CLI --time-limit，缺省 600——兼容既有契约）。真源
+        // PlanNode::resolved_time_limit_secs。
+        time_limit_secs: node.resolved_time_limit_secs(run.options.exec_time_limit_secs),
         port_base: run.options.port_base,
         settle_grace_seconds: run.options.settle_grace_seconds,
         ctl_enabled: run.options.ctl_enabled,
