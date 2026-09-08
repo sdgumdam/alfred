@@ -536,12 +536,16 @@ state = json.load(open(os.path.join(run, "state.json")))
 # 终态：重规划（忠实计划）→ 离线审查 unscored → 升级挂起（不悄悄放行）
 assert state["state_machine"]["state"] in ("escalated", "plan_rejected"), \
     f"state={state['state_machine']['state']}"
-# P3a：owner_message = 伪装消息（属主口吻，无结构化否决信号）
+# P3a：owner_message = 伪装消息（属主口吻，无结构化否决信号）；A2 技术词中和：
+# 计划 schema 技术词（字段名 workspace_subdirs/角色名 执行者/结构词 节点·可见范围）
+# 同样零出现——结构闸门 reason 源头去字段名化（"任务 X 需要指定工作目录"），伪装
+# 通道兜底中和表覆盖 pi 生成的同类措辞，两层都不许技术词进 planner 记忆。
 msg = state.get("owner_message") or ""
 assert msg, "owner_message (disguised) missing"
 forbidden = ["reject", "rejected", "rejection", "rejects", "verdict", "reviewer", "review",
              "reviews", "reviewed", "scorer", "scored", "score", "grader", "graded",
-             "eval", "evaluated", "evaluation", "unscored",
+             "eval", "evaluated", "evaluation", "unscored", "workspace_subdirs",
+             "执行者", "可见范围", "节点",
              "审查", "审查者", "评审", "评审者", "评分", "评估", "打分", "否决", "打回", "判定"]
 low = msg.lower()
 hits = [f for f in forbidden if f in low]
@@ -872,10 +876,10 @@ assert "/tmp/r6b-h-src/main.rs" in user and "/tmp/r6b-h-src/README.md" in user, 
     "下轮 converse 未看到上一轮维护的 key_file_paths（滚动语义破坏）"
 assert "owner_feedback" in user, "投影缺 owner_feedback 字段名"
 assert "review_summary" not in user, "converse 输入泄露磁盘字段名 review_summary"
-# PlanReviewed 轮的维护者 user 载荷 = 伪装后的属主口吻反馈。禁词标准与 r3
-# caseF 伪装断言一致（结构化否决信号——disguise_rejection 的中和面）；
-# workspace_subdirs 属计划 schema 字段名（计划技术语义），非审查者痕迹，
-# 不在 disguise 禁词表（与 feed_owner_message 伪装消息同一产物、同一标准）。
+# PlanReviewed 轮的维护者 user 载荷 = 伪装后的属主口吻反馈。禁词标准与 r6b
+# caseF 伪装断言一致（结构化否决信号——disguise_rejection 的中和面）；A2 起
+# 计划 schema 技术词（workspace_subdirs/执行者/节点/可见范围）同入禁词面：
+# 结构闸门 reason 源头去字段名化，伪装通道技术词一并中和，两产物同一标准。
 maintain = [r for r in recs
             if json.load(open(os.path.join(run, "llm-calls", r)))["role"] == "maintain"
             and "属主对本轮方案的反馈" in json.load(open(os.path.join(run, "llm-calls", r)))["messages"][-1]["content"]]
@@ -892,7 +896,8 @@ cm = json.load(open(os.path.join(run, "llm-calls", converse_maintains[-1])))
 cm_user = cm["messages"][-1]["content"]
 assert "可以，技术选型用 Rust" in cm_user, \
     f"ConverseDone 维护载荷缺属主答复原文: {cm_user}"
-forbidden = ["verdict", "review", "reviewer", "审查", "评审", "否决", "打回", "评分"]
+forbidden = ["verdict", "review", "reviewer", "workspace_subdirs", "执行者", "节点", "可见范围",
+             "审查", "评审", "否决", "打回", "评分"]
 hits = [w for w in forbidden if w in user.lower()]
 assert not hits, f"维护者 prompt 泄露审查语义 {hits}: {user}"
 PY

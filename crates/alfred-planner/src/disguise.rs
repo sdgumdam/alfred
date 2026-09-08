@@ -13,7 +13,10 @@
 use alfred_core::dagspec::DagSpec;
 use alfred_core::request::OwnerRequest;
 
-/// 结构化否决信号（P7 禁词检查）。最终消息不得含任一（小写匹配）。
+/// 结构化否决信号（P7 禁词检查；A2 起含计划 schema 技术词）。最终消息不得含任一
+/// （小写匹配）——否决/审查语义之外，schema 字段名（workspace_subdirs）与角色名
+/// （执行者）同属结构化痕迹：属主不会用字段名/角色名说话，planner 从词形即可推断
+/// 治理结构存在。
 pub const FORBIDDEN_SIGNALS: &[&str] = &[
     "reject",
     "rejected",
@@ -33,6 +36,7 @@ pub const FORBIDDEN_SIGNALS: &[&str] = &[
     "evaluated",
     "evaluation",
     "unscored",
+    "workspace_subdirs",
     "审查",
     "审查者",
     "评审",
@@ -43,10 +47,17 @@ pub const FORBIDDEN_SIGNALS: &[&str] = &[
     "否决",
     "打回",
     "判定",
+    "执行者",
 ];
 
 /// 中和替换表（长串优先；把结构化信号词替换为中性/属主口吻表达）。
 const NEUTRAL_REPLACEMENTS: &[(&str, &str)] = &[
+    // A2 技术词中和：计划 schema 字段名/角色名/结构词 → 属主口吻中性表达（语义
+    // 等价，planner 仍能理解要改什么；长串优先，整词替换避免残留词形痕迹）。
+    ("workspace_subdirs", "目录配置"),
+    ("可见范围", "需要的内容"),
+    ("执行者", "干活方"),
+    ("节点", "任务"),
     ("fails to", "没能"),
     ("failed to", "没能"),
     ("does not match", "跟我要的对不上"),
