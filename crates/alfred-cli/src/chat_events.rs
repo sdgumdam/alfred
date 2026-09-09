@@ -17,7 +17,7 @@
 //! | [`ChatEvent::PiReply`] | chat.rs `surface_planner_output`：`[pi] {答复}`（reply 直显 + conversation.json 新增 ConverseReply 轮两分支） |
 //! | [`ChatEvent::OrchestratorNotice`] | 治理状态行与转写提示——chat.rs 横幅/run_dir/恢复 run/未发现 run/新建 run/已受理/当前状态/已重载/空输入×2/需求为空/会话结束/终态呈现（完成×2/放弃/新需求引导）/挂起块头行；governance.rs 每状态进入的 `[orchestrator]` 流转状态行（`orchestrator_status_line`）、机械重跑提示（`post_apply_notices`：超时放大重跑/同契约重跑）、contract_fault 预标注 |
 //! | [`ChatEvent::EscalationPrompt`] | chat.rs `present_suspension` 挂起意见行四分支（计划审查意见/打回原因/执行审查意见/升级原因）；governance.rs 规划失败升级块、计划/执行审查宿主失败升级块 |
-//! | [`ChatEvent::Error`] | 一切错误行——chat.rs TUI 运行失败回退、run 初始化失败、state 持久化失败、操作失败、多挂起 run 消歧清单（头行+列表行，stderr）、行编辑初始化失败；reviewer verdict 解析 warn（alfred-reviewer，stderr） |
+//! | [`ChatEvent::Error`] | 一切错误行（原点位输出流由 `stream` 标记，见 [`ErrorStream`]）——chat.rs TUI 运行失败回退（stderr）、run 初始化失败、state 持久化失败、操作失败、多挂起 run 消歧清单（头行+列表行，stderr）、行编辑初始化失败（stderr）；reviewer verdict 解析 warn（alfred-reviewer，stderr） |
 //!
 //! 明确排除（非事件）：`print!` 输入提示（需求/对 pi 说/挂起拍板三处 prompt
 //! 文本）——TUI 输入区提示由 run 态派生（S2A 看板数据源 state.json），REPL
@@ -25,10 +25,12 @@
 //! 子命令，非 owner 会话面）——同一模型可表达（OrchestratorNotice），不在
 //! 接线范围。
 //!
-//! 载荷口径：正文**不含终端前缀**（`[chat]`/`[pi]`/`[orchestrator]` 是 sink
-//! 的渲染关注点——REPL sink 加前缀回 stdout 逐字节等价，TUI sink 自由着色/
-//! 分区）；例外见 [`ChatEvent::OrchestratorNotice`]（治理环通知原样透传，
-//! 前缀已在库层格式化时写入）。
+//! 载荷口径（定死，无例外）：正文**不含终端前缀**（`[chat]`/`[pi]`/
+//! `[orchestrator]` 是 sink 的渲染关注点——REPL sink 加前缀回 stdout 逐字节
+//! 等价，TUI sink 自由着色/分区）。[`ChatEvent::OrchestratorNotice`] 同口径：
+//! governance.rs 侧格式化产物自带 `[orchestrator] ` 前缀，**发送点负责剥
+//! 离**（S2 接线落地，本片定死契约）——前缀永远由 sink 渲染时统一加回，
+//! 载荷只承载纯正文。
 //!
 //! # 通道语义
 //!
@@ -41,6 +43,8 @@
 //!   退，TUI 可收尾）。缓冲消息先取尽才报 Disconnected（std mpsc 语义）。
 
 use std::sync::mpsc;
+
+use alfred_core::governance::EscalationSource;
 
 /// planner AGT 审计过程动作的种类（ground truth = chat.rs `render_audit_action`
 /// 的三个呈现分支）。
@@ -81,9 +85,14 @@ pub enum ChatEvent {
     /// `surface_planner_output` 取数）。
     PiReply(String),
     /// 治理状态行/编排器转写提示（规划中…/执行中…/机械重跑/已受理/会话结束
-    /// 等一切编排侧 owner 提示）。正文口径：chat.rs 侧点位为去前缀正文；
-    /// governance.rs 治理环通知（`post_apply_notices`）原样透传（前缀
-    /// `[orchestrator]` 已在库层格式化时写入，去前缀会搬家格式化逻辑）。
+    /// 等一切编排侧 owner 提示）。
+    ///
+    /// 载荷口径（单一口径，无例外）：**去前缀纯正文**——chat.rs 侧点位天然
+    /// 无前缀直入；governance.rs 治理环通知（`orchestrator_status_line` /
+    /// `post_apply_notices`）的格式化产物自带 `[orchestrator] ` 前缀，发送
+    /// 点负责剥离（S2 接线落地，本片定死契约）。`[orchestrator]` 前缀由
+    /// sink 渲染时统一加回——REPL sink 回 stdout 逐字节等价，TUI sink 自由
+    /// 分区/着色；载荷不再混装两种口径。
     OrchestratorNotice(String),
     /// 挂起拍板（升级包）：run 挂起（plan_rejected/escalated）等待属主
     /// 重试/放弃/改口。
@@ -92,19 +101,38 @@ pub enum ChatEvent {
     ///   `计划审查意见（打回）：…`/`执行审查意见（…）：…`）——格式化留在数据
     ///   所在地（chat.rs `present_suspension` 四分支 / governance.rs 升级块，
     ///   单一真源不搬家），事件只承载结果文本。
-    /// - `source` = 升级/打回来源标识，词表对齐 `alfred_core::governance::
-    ///   EscalationSource`（serde snake_case）：`"planning"`（规划失败升级）/
-    ///   `"plan_review"`（计划打回 + 计划审查宿主失败升级）/
-    ///   `"execution"`（执行/执行审查升级）。TUI 着色/来源标签用（S4）。
+    /// - `source` = 升级/打回来源，直接用 `alfred_core::governance::
+    ///   EscalationSource` 类型（单一真源，消第二份字符串词表）：
+    ///   `Planning`（规划失败升级）/ `PlanReview`（计划打回 + 计划审查宿主
+    ///   失败升级）/ `Execution`（执行/执行审查升级）。TUI 着色/来源标签用
+    ///   （S4）。
     EscalationPrompt {
         /// 已格式化的意见/原因正文。
         reason: String,
-        /// 来源标识（见变体文档词表）。
-        source: String,
+        /// 升级/打回来源（alfred_core 单一真源枚举，见变体文档）。
+        source: EscalationSource,
     },
-    /// 错误行（正文 = 已格式化错误文本，stderr 点位同归此变体——sink 决定
-    /// 落 stderr 还是 TUI 状态区）。
-    Error(String),
+    /// 错误行（正文 = 已格式化错误文本）。`stream` 标记原点位输出流——REPL
+    /// sink 按标记写回原流（逐字节等价），TUI sink 统一进对话流/状态区并
+    /// 可按标记着色区分。
+    Error {
+        /// 已格式化的错误文本。
+        message: String,
+        /// 原点位输出流（stdout/stderr）。
+        stream: ErrorStream,
+    },
+}
+
+/// 错误行原点位输出流（ground truth = 覆盖表 Error 行点位的 println!/
+/// eprintln! 实况）：REPL sink 按标记写回原流；TUI sink 不分流，仅作呈现
+/// 区分依据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorStream {
+    /// stdout 点位（println!）：run 初始化失败 / state 持久化失败 / 操作失败。
+    Stdout,
+    /// stderr 点位（eprintln!）：TUI 运行失败回退 / 行编辑初始化失败回退 /
+    /// 多挂起 run 消歧清单 / reviewer verdict 解析 warn。
+    Stderr,
 }
 
 /// chat 治理事件通道的命名构造入口（mpsc 封装的装配点）。
@@ -159,10 +187,12 @@ impl ChatEventReceiver {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActionKind, ChatEvent, ChatEventBus};
+    use super::{ActionKind, ChatEvent, ChatEventBus, ErrorStream};
+    use alfred_core::governance::EscalationSource;
     use std::sync::mpsc::TryRecvError;
 
-    /// 六变体逐一构造 + FIFO 收发（覆盖面烟测：全部变体可表达，按发送序取回）。
+    /// 六变体逐一构造 + FIFO 收发（覆盖面烟测：全部变体可表达——Error 双流
+    /// 标记各一条、source 用 alfred_core 枚举真源，按发送序取回）。
     #[test]
     fn send_recv_fifo_all_variants() {
         let (tx, rx) = ChatEventBus::new();
@@ -176,9 +206,16 @@ mod tests {
             ChatEvent::OrchestratorNotice("当前状态: planning".into()),
             ChatEvent::EscalationPrompt {
                 reason: "计划审查意见（打回）：需求不可验收。".into(),
-                source: "plan_review".into(),
+                source: EscalationSource::PlanReview,
             },
-            ChatEvent::Error("操作失败：容器不可用".into()),
+            ChatEvent::Error {
+                message: "操作失败：容器不可用".into(),
+                stream: ErrorStream::Stdout,
+            },
+            ChatEvent::Error {
+                message: "行编辑初始化失败，回退裸读。".into(),
+                stream: ErrorStream::Stderr,
+            },
         ];
         for event in &sent {
             assert!(tx.send(event.clone()), "接收端存活 → 入队成功");
@@ -256,7 +293,10 @@ mod tests {
         // 接收端先 Drop：send 返回 false（对齐 emit_process_line 吞错语义）。
         let (tx, rx) = ChatEventBus::new();
         drop(rx);
-        assert!(!tx.send(ChatEvent::Error("TUI 已退".into())));
+        assert!(!tx.send(ChatEvent::Error {
+            message: "TUI 已退".into(),
+            stream: ErrorStream::Stderr,
+        }));
 
         // 发送端全 Drop：缓冲消息先取尽，再 Disconnected。
         let (tx, rx) = ChatEventBus::new();

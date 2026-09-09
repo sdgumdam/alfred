@@ -8,20 +8,24 @@
 //!
 //! - **终端生命周期**：`ratatui::try_init` / `try_restore` 单一真源（raw mode
 //!   + 备用屏 + panic hook 兜底恢复终端——panic 冒泡前先恢复，属主终端不留
-//!   坏状态）。正常/错误路径都先恢复再返回；初始化失败由 cmd_chat 降级回
-//!   REPL（见 chat.rs 降级门）。
+//!   坏状态）。正常/错误路径都先恢复再返回——含 try_init 半途失败（raw
+//!   mode 已开、后续步骤 Err，库无自恢复，Err 分支幂等补恢复）；初始化
+//!   失败由 cmd_chat 降级回 REPL（见 chat.rs 降级门）。
 //! - **事件循环**：crossterm 同步 `poll(timeout)+read`（按键/resize 事件
 //!   驱动；draw 为 ratatui 双缓冲差分，无变化帧零输出）。方案原文写
 //!   EventStream——那是异步 API，工作区无 tokio/futures，为骨架引入异步
 //!   运行时不合算；同步 poll 等价达成按键/resize 语义，S2 治理事件经
 //!   std 通道在同一 poll 超时窗口汇聚，范式不变。resize 事件无需特判：
 //!   下一轮 draw 的 `Terminal::autoresize` 按新尺寸重排。
-//! - **多行输入自实现**（不引 tui-textarea：需求面只有字符/退格/回车提交/
-//!   ↑↓历史/Ctrl-J 换行，百行内可控且光标语义完全自明）。光标 = (行, char
-//!   列) 坐标——列按 char 计（中文安全，字节换算集中 [`char_to_byte`]）；
-//!   折行 CJK 宽度感知（unicode-width：ratatui/rustyline 传递依赖共 0.2.x
-//!   单副本，零新增编译重量），渲染与光标定位共用 [`wrap_segments`] 单一
-//!   真源。
+//! - **多行输入自实现**（不引 tui-textarea：需求面只有字符/Tab 缩进/退格/
+//!   回车提交/↑↓历史/Ctrl-J 换行，百行内可控且光标语义完全自明）。Tab
+//!   插入 '\t'——数据层保真（对齐 REPL `sanitize_raw_line` 保留 \t：粘贴
+//!   含缩进文本不失真），显示层在渲染边界定宽展开（[`expand_tabs`]：
+//!   ratatui cell 不接受控制字符）。光标 = (行, char 列) 坐标——列按
+//!   char 计（中文安全，字节换算集中 [`char_to_byte`]）；折行 CJK 宽度感知
+//!   （unicode-width：ratatui/rustyline 传递依赖共 0.2.x 单副本，零新增
+//!   编译重量），渲染与光标定位共用 [`wrap_segments`] 单一真源（'\t' 的
+//!   折行/光标/展开宽同源 [`TAB_WIDTH`]）。
 //! - **退出语义对齐 REPL**：Ctrl-D 空缓冲退出 / Ctrl-C 恒退出（rustyline
 //!   时代 Eof/Interrupted → 会话结束，同语义；raw mode 下 Ctrl-C 不产生
 //!   SIGINT，作为按键处理）；Ctrl-D 非空按行编辑惯例删光标处字符。空提交
@@ -50,6 +54,12 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 /// 状态条底色（S4 治理态着色前的骨架底色）。
 const STATUS_BG: Color = Color::DarkGray;
 
+/// Tab 显示宽：'\t' 渲染为固定 4 列空格缩进。不对齐 8 列终端 tab stop——
+/// 软折行显示行无绝对列基准，定宽可预期；编辑器/历史/提交数据层恒保真
+/// '\t'，仅显示层展开。折行（[`wrap_segments`]）、光标（`cursor_segment_pos`）、
+/// 展开（[`expand_tabs`]）共用此单一真源。
+const TAB_WIDTH: usize = 4;
+
 /// TUI 降级门（cmd_chat 入口分流判定）：交互双 tty 且 TERM 有效 → TUI；
 /// 否则（管道/重定向/dumb 终端/TERM 缺失）降级既有 REPL 路径。TERM 判定拆
 /// 纯函数 [`term_enables_tui`]（可测）。
@@ -69,10 +79,20 @@ fn term_enables_tui(term: Option<&str>) -> bool {
 }
 
 /// TUI 主入口：初始化（raw mode + 备用屏 + panic hook）→ 事件循环 → 无论
-/// 正常/错误路径先恢复终端再返回（恢复失败不掩盖主结果）。正常退出打一行
-/// 会话结束（与 REPL 尾行文案对齐）。
+/// 正常/错误路径（含初始化半途失败）先恢复终端再返回（恢复失败不掩盖主结
+/// 果）。正常退出打一行会话结束（与 REPL 尾行文案对齐）。
 pub fn run() -> Result<()> {
-    let mut terminal = ratatui::try_init().context("TUI 终端初始化失败")?;
+    let mut terminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            // try_init 半途失败无自恢复（enable_raw_mode 已开、后续步骤 Err
+            // 直接返回，raw mode 泄漏）。幂等补恢复：未开 raw mode 时
+            // disable_raw_mode 是 no-op（crossterm 按 saved original mode
+            // 判定），已开则还原；恢复失败不掩盖原错误。
+            let _ = ratatui::try_restore();
+            return Err(err).context("TUI 终端初始化失败");
+        }
+    };
     let mut app = TuiApp::new();
     let result = event_loop(&mut terminal, &mut app);
     let _ = ratatui::try_restore();
@@ -117,8 +137,10 @@ impl TuiApp {
     /// 键 → 状态转移。raw mode 下 Ctrl-C/Ctrl-D 以按键到达（无 SIGINT）：
     /// Ctrl-C 恒退出、Ctrl-D 空缓冲退出（对齐 REPL 会话结束语义）；Enter
     /// 恒为提交（治理消息边界，S1 仅回显左列）；Ctrl-J 换行（LF 键序在 raw
-    /// mode 下即 Ctrl-J，与 Enter 的 CR 区分）；其余可见字符进编辑器。
-    /// 只处理按下/自动重复（Windows 终端按下与释放都发事件）。
+    /// mode 下即 Ctrl-J，与 Enter 的 CR 区分）；Tab 插入 '\t'（数据层保真，
+    /// 对齐 REPL sanitize_raw_line 保留 \t——粘贴缩进不失真；显示层展开见
+    /// [`expand_tabs`]）；其余可见字符进编辑器。只处理按下/自动重复
+    /// （Windows 终端按下与释放都发事件）。
     fn handle_key(&mut self, key: KeyEvent) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
@@ -146,6 +168,7 @@ impl TuiApp {
             KeyCode::Right => self.input.right(),
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
+            KeyCode::Tab => self.input.insert_char('\t'),
             KeyCode::Char(c)
                 if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
@@ -371,10 +394,35 @@ fn char_to_byte(s: &str, col: usize) -> usize {
     s.char_indices().nth(col).map(|(i, _)| i).unwrap_or(s.len())
 }
 
+/// 字符显示宽（单一真源）：'\t' = [`TAB_WIDTH`]（定宽缩进，见 const 文档）；
+/// 其余按 unicode-width，控制字符 0（编辑器只可能进 '\t'，防御兜底）。
+fn display_width(c: char) -> usize {
+    if c == '\t' {
+        TAB_WIDTH
+    } else {
+        c.width().unwrap_or(0)
+    }
+}
+
+/// 渲染边界展开：段文本 '\t' → [`TAB_WIDTH`] 空格。ratatui cell 不接受控制
+/// 字符——零宽 '\t' 会附着进前一 cell 的 symbol 原样写给终端（终端按 tab
+/// stop 跳列，整帧错位），纯 '\t' 行更因行宽 0 整行不渲染。展开只发生在
+/// 段文本进入 ratatui 的最后一步（输入区/左列两个渲染边界共用）；编辑器/
+/// 历史/提交数据层恒保真 '\t'。
+fn expand_tabs(s: &str) -> String {
+    if s.contains('\t') {
+        s.replace('\t', &" ".repeat(TAB_WIDTH))
+    } else {
+        s.to_string()
+    }
+}
+
 /// 软折行（CJK 宽度感知）：一条逻辑行按显示宽 `width` 折成显示段序列，每段
-/// (段首 char 偏移, 段文本)。渲染与光标定位共用这一单一真源。宽度 0（防御：
-/// 极小终端边框内宽为 0）不折行单段返回；单字符宽 > 总宽（极小终端放 CJK）
-/// 不可再分——独占一段。
+/// (段首 char 偏移, 段文本)。段文本保真原文（含 '\t'——光标定位按原 char
+/// 计，展开是渲染边界 [`expand_tabs`] 的事）；字符显示宽走 [`display_width`]
+/// 单一真源（'\t' = [`TAB_WIDTH`]）。宽度 0（防御：极小终端边框内宽为 0）
+/// 不折行单段返回；单字符宽 > 总宽（极小终端放 CJK/Tab）不可再分——独占
+/// 一段。
 fn wrap_segments(text: &str, width: usize) -> Vec<(usize, String)> {
     if width == 0 {
         return vec![(0, text.to_string())];
@@ -382,7 +430,7 @@ fn wrap_segments(text: &str, width: usize) -> Vec<(usize, String)> {
     let mut segs = Vec::new();
     let (mut seg, mut start, mut w) = (String::new(), 0usize, 0usize);
     for (ci, ch) in text.chars().enumerate() {
-        let cw = ch.width().unwrap_or(0);
+        let cw = display_width(ch);
         if !seg.is_empty() && w + cw > width {
             segs.push((start, std::mem::take(&mut seg)));
             start = ci;
@@ -402,7 +450,7 @@ fn cursor_segment_pos(segs: &[(usize, String)], col: usize) -> (usize, usize) {
         let len = seg.chars().count();
         if col < start + len || ri + 1 == segs.len() {
             let off = col.saturating_sub(*start).min(len);
-            let w: usize = seg.chars().take(off).map(|c| c.width().unwrap_or(0)).sum();
+            let w: usize = seg.chars().take(off).map(display_width).sum();
             return (ri, w);
         }
     }
@@ -426,7 +474,7 @@ fn input_display(editor: &InputEditor, width: usize) -> InputDisplay {
             let (ri, w) = cursor_segment_pos(&segs, editor.col);
             cursor = (rows.len() + ri, w);
         }
-        rows.extend(segs.into_iter().map(|(_, s)| s));
+        rows.extend(segs.into_iter().map(|(_, s)| expand_tabs(&s)));
     }
     InputDisplay { rows, cursor }
 }
@@ -437,7 +485,7 @@ fn conversation_rows(messages: &[String], width: usize, height: usize) -> Vec<St
     let mut rows = Vec::new();
     for msg in messages {
         for line in msg.split('\n') {
-            rows.extend(wrap_segments(line, width).into_iter().map(|(_, s)| s));
+            rows.extend(wrap_segments(line, width).into_iter().map(|(_, s)| expand_tabs(&s)));
         }
     }
     let start = rows.len().saturating_sub(height);
@@ -729,6 +777,57 @@ mod tests {
         assert_eq!(app3.input.text(), "a");
         app3.handle_key(ctrl('c')); // Ctrl-C 恒退出
         assert!(app3.exit);
+    }
+
+    /// Tab 保留（S1 审查修复）：Tab 键插入 '\t'——数据层保真（对齐 REPL
+    /// `sanitize_raw_line` 保留 \t，粘贴含缩进文本不失真），char 列推进；
+    /// 显示层渲染边界定宽展开为可见缩进（折行/光标/展开共用 TAB_WIDTH 单一
+    /// 真源），帧内无 '\t' 控制字符。
+    #[test]
+    fn tab_kept_in_data_expanded_for_display() {
+        // 键层 → 编辑器：'\t' 入缓冲，后续字符接续其后（char 列推进）。
+        let mut app = TuiApp::new();
+        for c in "ab".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.input.text(), "ab\tc");
+        assert_eq!((app.input.row, app.input.col), (0, 4));
+
+        // 折行/光标真源：'\t' 计 TAB_WIDTH 显示宽，光标 x 跨过展开宽；
+        // 极窄行 tab 宽 > 行宽独占一段（同"单字符宽 > 总宽"惯例）。
+        let segs = wrap_segments("ab\tc", 10);
+        assert_eq!(segs, vec![(0, "ab\tc".to_string())]);
+        assert_eq!(cursor_segment_pos(&segs, 3), (0, 2 + TAB_WIDTH));
+        assert_eq!(
+            wrap_segments("a\tb", 2),
+            vec![
+                (0, "a".to_string()),
+                (1, "\t".to_string()),
+                (2, "b".to_string())
+            ]
+        );
+
+        // 输入区显示：段文本展开为空格，光标 x 与渲染同源（行尾 = 2+4+1）。
+        let d = input_display(&app.input, 10);
+        assert_eq!(d.rows, vec!["ab    c".to_string()]);
+        assert_eq!(d.cursor, (0, 7));
+
+        // 提交：消息数据保真 '\t'，左列渲染展开缩进。
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.messages, vec!["ab\tc".to_string()]);
+        assert_eq!(
+            conversation_rows(&app.messages, 20, 5),
+            vec!["ab    c".to_string()]
+        );
+
+        // 整帧黑盒：回显含可见缩进，帧内无 '\t'（cell 只见空格）。
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let text = frame_text(&terminal);
+        assert!(text.contains("ab    c"), "回显应含可见缩进，实际帧：\n{text}");
+        assert!(!text.contains('\t'), "帧内不应有 '\\t' 控制字符");
     }
 
     // ── 显示布局 ──
