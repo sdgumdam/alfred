@@ -9,3 +9,4 @@
 
 pub mod governance;
 pub mod governance_intent;
+pub mod chat_events;
