@@ -176,8 +176,9 @@ s4_exec_hard_error() {
   export ALFRED_OFFLINE_PLAN_FILE="$R/fix/plan-hard-error.json"
   unset ALFRED_OFFLINE 2>/dev/null || true
   run_run "$R/run" "$R/fix/request.json"
+  # M3 起执行侧新增节点轨迹审计：node_started（每轮节点执行直写）。
   expect_audit "$R/run" s4 \
-    "governance_started state_entered planning_done maintain_done state_entered plan_review_passed state_entered execution_hard_error_escalated state_entered governance_paused"
+    "governance_started state_entered planning_done maintain_done state_entered plan_review_passed state_entered node_started execution_hard_error_escalated state_entered governance_paused"
   expect_state "$R/run" "escalated" "execution"
   unset ALFRED_CONFIG ALFRED_REVIEWER_MODEL ALFRED_PLANNER_OFFLINE ALFRED_OFFLINE_PLAN_FILE
   canon "$R/run" s4_exec_hard_error
@@ -195,13 +196,16 @@ s5_exec_review_cycle() {
   export ALFRED_OFFLINE_PLAN_FILE="$R/fix/plan-faithful.json"
   export ALFRED_EXEC_REVIEW_OFFLINE=1
   unset ALFRED_OFFLINE 2>/dev/null || true
-  run_run "$R/run" "$R/fix/request.json"
+  # M3 起执行侧新增节点轨迹审计：node_started/node_completed（节点级）+
+  # execution_succeeded（全图完成门，HEAD 形态不变）。
   expect_audit "$R/run" s5 \
-    "governance_started state_entered planning_done maintain_done state_entered plan_review_passed state_entered execution_succeeded state_entered exec_review_error_escalated state_entered governance_paused"
+    "governance_started state_entered planning_done maintain_done state_entered plan_review_passed state_entered node_started node_completed execution_succeeded state_entered exec_review_error_escalated state_entered governance_paused"
   expect_state "$R/run" "escalated" "execution"
   run_feed "$R/run" retry "" 1
+  # retry 重入 Executing 时全图已完成 → execution_graph_rerun 清空重推
+  # （HEAD 单节点"重入执行即重跑"的图级推广，exec-2 产物照旧）。
   expect_audit "$R/run" s5-after-retry \
-    "governance_started state_entered planning_done maintain_done state_entered plan_review_passed state_entered execution_succeeded state_entered exec_review_error_escalated state_entered governance_paused feed_owner_message state_entered execution_succeeded state_entered exec_review_error_escalated state_entered governance_paused"
+    "governance_started state_entered planning_done maintain_done state_entered plan_review_passed state_entered node_started node_completed execution_succeeded state_entered exec_review_error_escalated state_entered governance_paused feed_owner_message state_entered execution_graph_rerun node_started node_completed execution_succeeded state_entered exec_review_error_escalated state_entered governance_paused"
   expect_state "$R/run" "escalated" "execution"
   expect_field "$R/run" "execution_count" "2"
   run_feed "$R/run" abandon "" 2

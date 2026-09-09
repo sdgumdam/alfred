@@ -76,6 +76,8 @@ pub enum GovernanceEvent {
     ExecutionSucceeded,
     /// 执行机械失败（driver error/timeout）+ 重跑预算未耗尽 → 留在 Executing。
     ExecutionFailedRetry,
+    /// 节点完成但全图未竟（M3 多节点）→ 留在 Executing 推进下一节点。
+    ExecutionNodeCompleted,
     /// 执行机械失败 + 预算耗尽 → 升级。
     ExecutionFailedEscalate,
     /// 执行审查 C（推进 → Completed）。
@@ -203,6 +205,9 @@ fn transition(
         (PlanRejected, OwnerAbandon) => Abandoned,
         (Executing, ExecutionSucceeded) => ExecReviewing,
         (Executing, ExecutionFailedRetry) => Executing,
+        // M3：节点完成但全图未竟 → 自环推进下一节点（ExecutionFailedRetry
+        // 同款自环范式）。
+        (Executing, ExecutionNodeCompleted) => Executing,
         (Executing, ExecutionFailedEscalate) => Escalated,
         (ExecReviewing, ExecReviewPassed) => Completed,
         (ExecReviewing, ExecReviewMechanicalRetry) => Executing,
@@ -339,6 +344,10 @@ pub struct GovernanceRun {
     /// 执行尝试绝对计数（含属主重跑；exec 子目录按此编号，避免跨周期碰撞）。
     #[serde(default)]
     pub execution_count: u32,
+    /// 已完成节点 id 集（M3 多节点拓扑序推进；生命周期 = 当前计划执行周期，
+    /// PlanProduced 清零）。崩溃恢复后从已完成节点续跑，不从头重跑。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_nodes: Vec<String>,
     /// 当前计划（converse 产出；重规划时被替换）。
     pub dagspec: Option<DagSpec>,
     /// 会话文档（维护者已回退待重做——schema 保留，当前为空文档；converse 每轮照喂）。
@@ -374,6 +383,7 @@ impl GovernanceRun {
             attempts_used: 0,
             mechanical_budget: 2,
             execution_count: 0,
+            completed_nodes: Vec::new(),
             dagspec: None,
             session_doc: SessionDoc::new(),
             plan_verdicts: Vec::new(),
@@ -409,6 +419,11 @@ impl GovernanceRun {
         // 四条重规划路径；Escalated+retry（重入执行/重审计划）在 decide 侧重置 attempts。
         if self.state() == GovernanceState::Planning {
             self.attempts_used = 0;
+        }
+        // M3：新计划落定 → 节点完成集清零（completed_nodes 生命周期 = 当前
+        // 计划执行周期；replan 复用节点 id 时不误标已完成）。
+        if event == GovernanceEvent::PlanProduced {
+            self.completed_nodes.clear();
         }
         self.updated_at = now_rfc3339();
         Ok(())

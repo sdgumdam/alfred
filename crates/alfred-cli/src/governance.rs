@@ -8,8 +8,9 @@
 //!
 //! 确定性：状态转移全部经 `GovernanceRun.apply()`（alfred-core 状态机），
 //! 每次转移落 audit.jsonl + persist state.json（P3 崩溃恢复显式化）；机械失败
-//! 重跑预算 N=2（§3.3）；审查本身出错（unscored / driver error）→ 升级属主
-//! （§六继承项，不悄悄放行）。单节点骨架显式拒绝多节点 DAG（P2，不静默截断）。
+//! 重跑预算 N=2（§3.3，M3 起 per-node）；审查本身出错（unscored / driver error）
+//! → 升级属主（§六继承项，不悄悄放行）。M3 起多节点 DAG 拓扑序调度：Executing
+//! 自环逐节点推进（completed_nodes 持久断点续跑），全图完成才进 ExecReviewing。
 use std::path::{Path, PathBuf};
 
 use crate::governance_intent::{commit_intent, ConverseMaintain, Effects, StepIntent, VerdictKind};
@@ -620,25 +621,39 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
 
 /// 执行成功/失败路由（机械重跑/硬错误升级）全在函数内处理；R6d 起执行容器只出
 /// 产物、执行审查输入全在磁盘——成功 outcome 无进程内消费方，不再返回。
+///
+/// M3 多节点拓扑序调度：Executing 态自环逐节点推进——每轮取依赖序中首个
+/// 未完成节点（[`pending_node`] 单一真源，前置满足性由拓扑序保证）执行；
+/// 节点成功 → `completed_nodes` 持久 + 自环 [`GovernanceEvent::ExecutionNodeCompleted`]
+/// 推进下一节点；**全图完成 → `ExecutionSucceeded` → ExecReviewing**（C 转移
+/// 语义 = 全图完成）。所有节点共享同一 run/ws（挂载面不变——下游节点天然
+/// 看到上游产物）。断点恢复：`completed_nodes` 落 state.json，崩溃后从已完成
+/// 节点续跑；机械重跑预算 per-node（节点完成即重置 attempts_used）。
 fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
     let dagspec = run
         .dagspec
         .clone()
         .context("governance state Executing without dagspec")?;
-    // P2 修复：单节点骨架显式拒绝多节点 DAG——不静默截断（无静默出口）。
-    // 正常流程在计划提交（converse validate_dagspec）即拦截；此处是旧 run 目录
-    // 已有历史多节点计划的防御纵深（宁可显式报错，不悄悄只跑第一个节点）。
-    if dagspec.nodes.len() != 1 {
-        bail!(
-            "dagspec has {} nodes; 多节点 DAG 本骨架不支持（单节点验证范围）",
-            dagspec.nodes.len()
-        );
+    if dagspec.nodes.is_empty() {
+        bail!("dagspec has no nodes");
     }
-    let node = dagspec
-        .nodes
-        .first()
-        .context("dagspec has no nodes")?
-        .clone();
+    let node = match pending_node(&dagspec, &run.completed_nodes)? {
+        Some(node) => node,
+        None => {
+            // Executing 态全图已完成 = 图级重跑周期（ExecReviewMechanicalRetry
+            // 回跳 / 属主 retry 自执行审查升级重入）——清空完成集从头推进
+            // （HEAD 单节点"重入执行即重跑"语义的图级推广）。
+            audit(
+                &ctx.run_dir,
+                "execution_graph_rerun",
+                &serde_json::json!({ "completed_nodes": run.completed_nodes.len() }),
+            )?;
+            run.completed_nodes.clear();
+            pending_node(&dagspec, &run.completed_nodes)?.context("dagspec has no nodes")?
+        }
+    };
+    // 本轮尝试号（per-node 机械重试计数 attempts_used + 1；节点完成时归零）。
+    let attempt = run.attempts_used + 1;
     let assignment = alfred_core::TaskAssignment {
         task_id: node.id.clone(),
         handler: "run_inspect_eval".to_string(),
@@ -647,10 +662,19 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
     };
     run.execution_count += 1;
     let exec_dir = ctx.run_dir.join(format!("exec-{}", run.execution_count));
+    // M3：节点执行轨迹——node_started 直写（容器长跑前落盘，中途崩溃审计
+    // 可见"开始了没完成"）；node_completed / execution_succeeded 经 effects
+    // 通道在 commit 时落（决策纯范式）。
+    audit(
+        &ctx.run_dir,
+        "node_started",
+        &serde_json::json!({ "node_id": node.id, "attempt": attempt }),
+    )?;
     let opts = RunOptions {
         run_dir: exec_dir.clone(),
         // R6e：执行产物落 run 级单一持久 ws（`<run>/ws`，git 基线），exec-N 只做
-        // 记录（driver.py/compose/state.json）不挂产物。
+        // 记录（driver.py/compose/state.json）不挂产物。M3：全部节点共享此
+        // ws——下游节点天然看到上游产物（挂载面不变）。
         workspace_dir: ctx.run_dir.join("ws"),
         image: run.options.image.clone(),
         assignment,
@@ -669,20 +693,38 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
     };
     match execute_run(&opts, &ctx.executor_model, &run.request) {
         Ok(outcome) => {
+            // M3 per-node 预算：节点完成 → 机械重跑预算重置（下一节点全新
+            // 预算；exec 审查侧机械重跑沿用该计数，见 exec_review_step）。
+            run.attempts_used = 0;
+            run.completed_nodes.push(node.id.clone());
             // v3 分通道收集：单条事件主审计（pre_apply 段）。
             let mut effects = Effects::default();
             effects.audit(
-                "execution_succeeded",
+                "node_completed",
                 serde_json::json!({
-                    "task_id": node.id,
+                    "node_id": node.id,
+                    "attempt": attempt,
                     "eval_status": outcome.eval_status,
                     "artifact_changes": outcome.artifact.as_ref().map(|a| a.changes.len()),
                 }),
             );
-            let intent = StepIntent::Proceed {
-                event: GovernanceEvent::ExecutionSucceeded,
-                effects,
+            // 全图完成门：依赖序推进无待执行节点 → ExecutionSucceeded（→
+            // ExecReviewing；HEAD execution_succeeded 审计形态不变，task_id =
+            // 完成全图的节点）。
+            let event = if pending_node(&dagspec, &run.completed_nodes)?.is_none() {
+                effects.audit(
+                    "execution_succeeded",
+                    serde_json::json!({
+                        "task_id": node.id,
+                        "eval_status": outcome.eval_status,
+                        "artifact_changes": outcome.artifact.as_ref().map(|a| a.changes.len()),
+                    }),
+                );
+                GovernanceEvent::ExecutionSucceeded
+            } else {
+                GovernanceEvent::ExecutionNodeCompleted
             };
+            let intent = StepIntent::Proceed { event, effects };
             commit_intent(run, ctx, intent)?;
             Ok(())
         }
@@ -694,6 +736,8 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
                 match route_mechanical_failure(
                     &status,
                     &dagspec,
+                    // M3：放大/重跑落点 = 当前失败节点（多节点图非首节点）。
+                    &node.id,
                     run.options.exec_time_limit_secs,
                     run.attempts_used,
                     run.mechanical_budget,
@@ -716,6 +760,7 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
                             effects.dagspec = Some(dagspec);
                         }
                         let mut data = serde_json::json!({
+                            "node_id": node.id,
                             "attempt": attempt,
                             "budget": run.mechanical_budget,
                             "error": format!("{e:#}"),
@@ -726,12 +771,14 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
                                 data["time_limit_adjusted"] =
                                     serde_json::json!({ "from": from, "to": to });
                                 format!(
-                                    "[orchestrator] 执行超时（timed_out），自适应放大时间上限重跑（{attempt}/{}，time_limit {from}s→{to}s）：{e}",
+                                    "[orchestrator] 节点 {} 执行超时（timed_out），自适应放大时间上限重跑（{attempt}/{}，time_limit {from}s→{to}s）：{e}",
+                                    node.id,
                                     run.mechanical_budget
                                 )
                             }
                             None => format!(
-                                "[orchestrator] 执行机械失败，按同一契约重跑（{attempt}/{}）：{e}",
+                                "[orchestrator] 节点 {} 执行机械失败，按同一契约重跑（{attempt}/{}）：{e}",
+                                node.id,
                                 run.mechanical_budget
                             ),
                         };
@@ -751,6 +798,7 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
                         effects.audit(
                             "mechanical_budget_exhausted_escalated",
                             serde_json::json!({
+                                "node_id": node.id,
                                 "error": format!("{e:#}"),
                                 "failure_status": status,
                                 "time_limit_secs": final_time_limit_secs,
@@ -767,7 +815,10 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
                 let mut effects = Effects::default();
                 effects.audit(
                     "execution_hard_error_escalated",
-                    serde_json::json!({ "error": format!("{e:#}") }),
+                    serde_json::json!({
+                        "node_id": node.id,
+                        "error": format!("{e:#}"),
+                    }),
                 );
                 StepIntent::Proceed {
                     event: GovernanceEvent::ExecutionFailedEscalate,
@@ -778,6 +829,19 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
             Ok(())
         }
     }
+}
+
+/// M3：依赖序待执行节点选择（[`alfred_core::DagSpec::next_pending_node`] 单一
+/// 真源；坏图随 M1 校验显式 Err 穿出，治理侧不重复报错路径）。返回 owned
+/// 节点（TaskAssignment 消费）；`None` = 全图已完成。
+fn pending_node(
+    dagspec: &alfred_core::DagSpec,
+    completed: &[String],
+) -> Result<Option<alfred_core::PlanNode>> {
+    dagspec
+        .next_pending_node(completed)
+        .map_err(|e| anyhow::anyhow!(e))
+        .map(|node| node.cloned())
 }
 
 /// ExecReviewing：执行审查改调宿主 pi reviewer（ws 全量自由读 + 对话记录）→ §3.3 路由。
@@ -1032,21 +1096,24 @@ enum MechanicalFailureRouting {
 
 /// 机械失败重跑决策（纯函数，execution_step 消费）。
 ///
-/// timed_out：预算硬死线是根因——同死线重跑必再超，节点时间上限自适应放大
-/// （×2，cap [`EXEC_TIME_LIMIT_AMPLIFY_CAP_SECS`]）写回 dagspec 后重跑；
+/// timed_out：预算硬死线是根因——同死线重跑必再超，**当前失败节点**
+/// （`failing_node_id`，M3 多节点图非首节点）的时间上限自适应放大（×2，
+/// cap [`EXEC_TIME_LIMIT_AMPLIFY_CAP_SECS`]）写回 dagspec 后重跑；
 /// error/crashed：与时间预算无关，同契约原样重跑。预算耗尽（attempts_used ≥
 /// mechanical_budget，镜像 [`GovernanceRun::mechanical_exhausted`]）→ 升级，
 /// 带最终预算。
 fn route_mechanical_failure(
     failure_status: &str,
     dagspec: &alfred_core::DagSpec,
+    failing_node_id: &str,
     exec_time_limit_secs: u32,
     attempts_used: u32,
     mechanical_budget: u32,
 ) -> MechanicalFailureRouting {
     let current = dagspec
         .nodes
-        .first()
+        .iter()
+        .find(|n| n.id == failing_node_id)
         .map(|n| n.resolved_time_limit_secs(exec_time_limit_secs))
         .unwrap_or(exec_time_limit_secs);
     if attempts_used >= mechanical_budget {
@@ -1059,12 +1126,14 @@ fn route_mechanical_failure(
     if failure_status == "timed_out" {
         let to = (current.saturating_mul(2)).min(EXEC_TIME_LIMIT_AMPLIFY_CAP_SECS);
         if to > current {
-            let mut dagspec = dagspec.clone();
-            if let Some(node) = dagspec.nodes.first_mut() {
+            let mut amplified = dagspec.clone();
+            // 放大写回失败节点（找到才落 amplified——与 time_limit_adjusted
+            // 轨迹一致，不出现"声明调整了却没写进"的失配）。
+            if let Some(node) = amplified.nodes.iter_mut().find(|n| n.id == failing_node_id) {
                 node.time_limit_secs = Some(to);
+                amplified_dagspec = Some(amplified);
+                time_limit_adjusted = Some((current, to));
             }
-            amplified_dagspec = Some(dagspec);
-            time_limit_adjusted = Some((current, to));
         }
     }
     MechanicalFailureRouting::Retry {
@@ -1325,7 +1394,7 @@ mod tests {
         // C：timed_out ×2 放大（cap 3600）——600→1200、2400→3600（4800 截到
         // cap）、声明 1800→3600；dagspec 节点字段被写回（放大落点）。
         let dag = single_node_dagspec(None);
-        let r = route_mechanical_failure("timed_out", &dag, 600, 0, 2);
+        let r = route_mechanical_failure("timed_out", &dag, "task-1", 600, 0, 2);
         match &r {
             MechanicalFailureRouting::Retry {
                 attempt,
@@ -1343,7 +1412,7 @@ mod tests {
         }
 
         let dag = single_node_dagspec(Some(2400));
-        let r = route_mechanical_failure("timed_out", &dag, 600, 1, 2);
+        let r = route_mechanical_failure("timed_out", &dag, "task-1", 600, 1, 2);
         match &r {
             MechanicalFailureRouting::Retry {
                 time_limit_adjusted, ..
@@ -1352,7 +1421,7 @@ mod tests {
         }
 
         let dag = single_node_dagspec(Some(1800));
-        let r = route_mechanical_failure("timed_out", &dag, 600, 0, 2);
+        let r = route_mechanical_failure("timed_out", &dag, "task-1", 600, 0, 2);
         match &r {
             MechanicalFailureRouting::Retry {
                 time_limit_adjusted, ..
@@ -1362,7 +1431,7 @@ mod tests {
 
         // 已到 cap：无法再放大 → 同契约原样重跑（无放大轨迹）。
         let dag = single_node_dagspec(Some(3600));
-        let r = route_mechanical_failure("timed_out", &dag, 600, 0, 2);
+        let r = route_mechanical_failure("timed_out", &dag, "task-1", 600, 0, 2);
         match &r {
             MechanicalFailureRouting::Retry {
                 amplified_dagspec,
@@ -1381,7 +1450,7 @@ mod tests {
         // C：error/crashed 与时间预算无关 → 同契约重跑（无放大、无 dagspec 写回）。
         for status in ["error", "crashed"] {
             let dag = single_node_dagspec(None);
-            let r = route_mechanical_failure(status, &dag, 600, 0, 2);
+            let r = route_mechanical_failure(status, &dag, "task-1", 600, 0, 2);
             match &r {
                 MechanicalFailureRouting::Retry {
                     amplified_dagspec,
@@ -1400,7 +1469,7 @@ mod tests {
     fn exhausted_escalation_carries_final_budget() {
         // C：放大后仍耗尽 → 升级带最终预算（含历次放大；未放大 = 治理缺省）。
         let dag = single_node_dagspec(Some(2400));
-        let r = route_mechanical_failure("timed_out", &dag, 600, 2, 2);
+        let r = route_mechanical_failure("timed_out", &dag, "task-1", 600, 2, 2);
         assert_eq!(
             r,
             MechanicalFailureRouting::Exhausted {
@@ -1409,12 +1478,134 @@ mod tests {
         );
 
         let dag = single_node_dagspec(None);
-        let r = route_mechanical_failure("timed_out", &dag, 600, 2, 2);
+        let r = route_mechanical_failure("timed_out", &dag, "task-1", 600, 2, 2);
         assert_eq!(
             r,
             MechanicalFailureRouting::Exhausted {
                 final_time_limit_secs: 600
             }
         );
+    }
+
+    // ---------- M3 多节点：拓扑序调度 / 断点续跑 / 单节点等价 ----------
+
+    fn dag_node(id: &str) -> PlanNode {
+        PlanNode::new(
+            id,
+            "s",
+            Contract {
+                prompt: "p".into(),
+                acceptance_criteria: "a".into(),
+                reviewer_models: vec![],
+            },
+        )
+    }
+
+    fn dag_edge(from: &str, to: &str) -> alfred_core::Edge {
+        alfred_core::Edge {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    #[test]
+    fn multi_node_advances_in_topological_order_and_resumes() {
+        // M3：2 节点顺序执行——依赖序推进（b 声明在前但依赖 a → 先 a）；
+        // 断点恢复（completed=[a] → 从 b 续，不重跑 a）；全图完成门（[a,b]
+        // → None → ExecutionSucceeded 路径）。
+        let mut dag = DagSpec::new("req-1", vec![dag_node("b"), dag_node("a")]);
+        dag.edges = vec![dag_edge("a", "b")];
+        assert_eq!(pending_node(&dag, &[]).unwrap().unwrap().id, "a");
+        // 断点恢复：首节点已持久完成 → 直接取第二节点。
+        assert_eq!(
+            pending_node(&dag, &["a".to_string()]).unwrap().unwrap().id,
+            "b"
+        );
+        assert!(pending_node(&dag, &["a".to_string(), "b".to_string()])
+            .unwrap()
+            .is_none());
+
+        // 无 edges 的多节点（孤立节点合法）：按声明序推进。
+        let dag = DagSpec::new("req-1", vec![dag_node("x"), dag_node("y")]);
+        assert_eq!(pending_node(&dag, &[]).unwrap().unwrap().id, "x");
+        assert_eq!(
+            pending_node(&dag, &["x".to_string()]).unwrap().unwrap().id,
+            "y"
+        );
+        assert!(pending_node(&dag, &["y".to_string(), "x".to_string()])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn single_node_advancement_matches_head() {
+        // M3：单节点 dagspec 推进行为与 HEAD 等价——空完成集 → 唯一节点；
+        // 完成 → 全图完成门即开（一轮执行即 ExecutionSucceeded，无自环轮）。
+        let dag = single_node_dagspec(None);
+        assert_eq!(pending_node(&dag, &[]).unwrap().unwrap().id, "task-1");
+        assert!(pending_node(&dag, &["task-1".to_string()])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cyclic_dagspec_rejected_via_m1_single_truth() {
+        // M3：环拒绝走 M1 `topological_order` 单一真源（治理侧不重复报错
+        // 路径）——execution_step 入口经 pending_node 显式 Err 穿出，不静默
+        // 截断。
+        let mut dag = DagSpec::new("req-1", vec![dag_node("a"), dag_node("b")]);
+        dag.edges = vec![dag_edge("a", "b"), dag_edge("b", "a")];
+        let err = pending_node(&dag, &[]).unwrap_err();
+        assert!(err.to_string().contains("cycle"), "err = {err:#}");
+
+        // 重复节点 id：同 id 节点无法区分（id 键控完成记账），M1 校验拒绝。
+        let dag = DagSpec::new("req-1", vec![dag_node("dup"), dag_node("dup")]);
+        let err = pending_node(&dag, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate node id 'dup'"),
+            "err = {err:#}"
+        );
+    }
+
+    #[test]
+    fn timeout_retry_amplifies_failing_node_not_first() {
+        // M3：多节点图 timed_out 放大写回**当前失败节点**（非首节点）——
+        // 声明序 [a, b]、b 失败：b 放大 600→1200，a 不动。
+        let mut dag = DagSpec::new("req-1", vec![dag_node("a"), dag_node("b")]);
+        dag.edges = vec![dag_edge("a", "b")];
+        let time_limit = |dag: &DagSpec, id: &str| {
+            dag.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .time_limit_secs
+        };
+        let r = route_mechanical_failure("timed_out", &dag, "b", 600, 0, 2);
+        match &r {
+            MechanicalFailureRouting::Retry {
+                amplified_dagspec,
+                time_limit_adjusted,
+                ..
+            } => {
+                assert_eq!(*time_limit_adjusted, Some((600, 1200)));
+                let amplified = amplified_dagspec.as_ref().unwrap();
+                assert_eq!(time_limit(amplified, "a"), None);
+                assert_eq!(time_limit(amplified, "b"), Some(1200));
+            }
+            other => panic!("expected Retry, got {other:?}"),
+        }
+
+        // 失败的是首节点 a：只放大 a，b 不动。
+        let r = route_mechanical_failure("timed_out", &dag, "a", 600, 0, 2);
+        match &r {
+            MechanicalFailureRouting::Retry {
+                amplified_dagspec, ..
+            } => {
+                let amplified = amplified_dagspec.as_ref().unwrap();
+                assert_eq!(time_limit(amplified, "a"), Some(1200));
+                assert_eq!(time_limit(amplified, "b"), None);
+            }
+            other => panic!("expected Retry, got {other:?}"),
+        }
     }
 }

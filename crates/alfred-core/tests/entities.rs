@@ -609,3 +609,126 @@ fn builder_build_carries_edges_and_orders_nodes() {
         serde_json::from_str(&serde_json::to_string(&dag).unwrap()).unwrap();
     assert_eq!(back, dag);
 }
+
+// ---------- M3 多节点：执行推进 + 治理环节点状态（数据层/状态机契约） ----------
+
+#[test]
+fn dagspec_topological_order_rejects_duplicate_node_ids() {
+    // M3：同 id 节点多于一个——id 键控的执行推进/完成记账（next_pending_node /
+    // GovernanceRun.completed_nodes）无法区分，结构坏图显式拒绝（builder
+    // add_node 已拒，此处兜底离线注入路径）。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("dup"), dag_node("dup")],
+        edges: vec![],
+    };
+    let err = dag.topological_order().unwrap_err();
+    assert!(err.contains("duplicate node id 'dup'"), "err = {err}");
+}
+
+#[test]
+fn dagspec_next_pending_node_selects_first_uncompleted_in_dependency_order() {
+    // M3：依赖序首个未完成节点——b 声明在前但依赖 a → 先取 a；completed
+    // 推进后取 b；全图完成 → None（全图完成门）。环图随 M1 校验显式 Err。
+    let mut dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("b"), dag_node("a")],
+        edges: vec![dag_edge("a", "b")],
+    };
+    assert_eq!(dag.next_pending_node(&[]).unwrap().unwrap().id, "a");
+    assert_eq!(
+        dag.next_pending_node(&["a".to_string()])
+            .unwrap()
+            .unwrap()
+            .id,
+        "b"
+    );
+    assert!(dag
+        .next_pending_node(&["a".to_string(), "b".to_string()])
+        .unwrap()
+        .is_none());
+
+    // 环图：next_pending_node 直接透传 M1 topological_order 的 Err。
+    dag.edges = vec![dag_edge("a", "b"), dag_edge("b", "a")];
+    assert!(dag.next_pending_node(&[]).unwrap_err().contains("cycle"));
+}
+
+#[test]
+fn governance_executing_node_completed_self_loop() {
+    // M3：节点完成但全图未竟 → Executing 自环（ExecutionFailedRetry 同款
+    // 范式）；其他状态收到该事件 = 非法转移显式报错。
+    use alfred_core::{GovernanceEvent, GovernanceState};
+
+    let mut run = sample_governance_run();
+    run.apply(GovernanceEvent::PlanProduced).unwrap();
+    run.apply(GovernanceEvent::PlanReviewPassed).unwrap();
+    assert_eq!(run.state(), GovernanceState::Executing);
+    run.apply(GovernanceEvent::ExecutionNodeCompleted).unwrap();
+    assert_eq!(run.state(), GovernanceState::Executing);
+    run.apply(GovernanceEvent::ExecutionNodeCompleted).unwrap();
+    assert_eq!(run.state(), GovernanceState::Executing);
+    // 全图完成 → ExecutionSucceeded → ExecReviewing（C 转移语义 = 全图完成）。
+    run.apply(GovernanceEvent::ExecutionSucceeded).unwrap();
+    assert_eq!(run.state(), GovernanceState::ExecReviewing);
+
+    // 非法：PlanReviewing 态收到节点完成事件。
+    let mut run = sample_governance_run();
+    run.apply(GovernanceEvent::PlanProduced).unwrap();
+    assert!(run.apply(GovernanceEvent::ExecutionNodeCompleted).is_err());
+}
+
+#[test]
+fn governance_plan_produced_clears_completed_nodes() {
+    // M3：completed_nodes 生命周期 = 当前计划执行周期——PlanProduced 清零
+    // （replan 复用节点 id 时不误标已完成）。
+    use alfred_core::{GovernanceEvent, GovernanceState};
+    let mut run = sample_governance_run();
+    run.apply(GovernanceEvent::PlanProduced).unwrap();
+    run.apply(GovernanceEvent::PlanReviewPassed).unwrap();
+    run.completed_nodes = vec!["a".into(), "b".into()];
+    // 重规划（合法路径）：执行升级 → Escalated → OwnerRevise → Planning →
+    // PlanProduced。
+    run.apply(GovernanceEvent::ExecutionFailedEscalate).unwrap();
+    assert_eq!(run.state(), GovernanceState::Escalated);
+    run.apply(GovernanceEvent::OwnerRevise).unwrap();
+    run.apply(GovernanceEvent::PlanProduced).unwrap();
+    assert!(run.completed_nodes.is_empty());
+
+    // 自环推进不清完成集（断点恢复真源）。
+    let mut run = sample_governance_run();
+    run.apply(GovernanceEvent::PlanProduced).unwrap();
+    run.apply(GovernanceEvent::PlanReviewPassed).unwrap();
+    run.completed_nodes = vec!["a".into()];
+    run.apply(GovernanceEvent::ExecutionNodeCompleted).unwrap();
+    assert_eq!(run.completed_nodes, vec!["a".to_string()]);
+}
+
+#[test]
+fn governance_run_completed_nodes_state_json_compat() {
+    // M3：completed_nodes 落 state.json（断点恢复真源）；旧 state.json（M3
+    // 之前无该字段）原样可读（serde default 空 vec）；空 vec 序列化不落字段
+    // （与 edges/time_limit_secs 同范式——旧断言面逐字节不变）。
+    let mut run = sample_governance_run();
+    run.completed_nodes = vec!["a".into(), "b".into()];
+    let text = serde_json::to_string(&run).unwrap();
+    assert!(text.contains(r#""completed_nodes":["a","b"]"#), "{text}");
+    let back: alfred_core::GovernanceRun = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.completed_nodes, vec!["a".to_string(), "b".to_string()]);
+
+    // 空 vec：不落字段。
+    run.completed_nodes.clear();
+    let text = serde_json::to_string(&run).unwrap();
+    assert!(!text.contains("completed_nodes"), "{text}");
+
+    // 旧 state.json（无 completed_nodes 字段）→ 空 vec。
+    let mut v: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&back).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("completed_nodes");
+    let legacy: alfred_core::GovernanceRun = serde_json::from_value(v).unwrap();
+    assert!(legacy.completed_nodes.is_empty());
+}
+
+/// 治理环 run 实体测试夹具（状态机从 Planning 起步）。
+fn sample_governance_run() -> alfred_core::GovernanceRun {
+    alfred_core::GovernanceRun::new("run-m3", sample_request(), Default::default())
+}

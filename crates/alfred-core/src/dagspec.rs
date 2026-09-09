@@ -119,6 +119,7 @@ impl DagSpec {
     /// `from` 必出现在 `to` 之前；同时就绪的节点取声明序最前者（稳定序）。
     ///
     /// 显式 Err（不静默容忍坏图）：
+    /// - 重复节点 id：同 id 节点多于一个（id 键控的执行记账无法区分）；
     /// - 悬空边：`from`/`to` 引用了 `nodes` 中不存在的节点 id；
     /// - 重复边：同一 `(from, to)` 出现多次；
     /// - 环（含自环）：报出环路径，如 `a -> b -> a`。
@@ -131,6 +132,18 @@ impl DagSpec {
             .enumerate()
             .map(|(i, node)| (node.id.as_str(), i))
             .collect();
+        // 重复节点 id：id 键控的执行推进/完成记账（M3 `next_pending_node` /
+        // GovernanceRun.completed_nodes）无法区分同 id 节点——结构坏图显式
+        // 拒绝（builder add_node 已拒，此处兜底离线注入/旧 run 路径）。
+        if id_index.len() != self.nodes.len() {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let dup = self
+                .nodes
+                .iter()
+                .find(|n| !seen.insert(n.id.as_str()))
+                .expect("id_index shorter than nodes implies a duplicate id");
+            return Err(format!("dagspec: duplicate node id '{}'", dup.id));
+        }
         for edge in &self.edges {
             for endpoint in [&edge.from, &edge.to] {
                 if !id_index.contains_key(endpoint.as_str()) {
@@ -217,5 +230,20 @@ impl DagSpec {
             cycle.join(" -> "),
             cycle[0]
         ))
+    }
+
+    /// M3：依赖执行序中首个未完成节点（执行推进单一真源）。
+    ///
+    /// `completed` = 已完成节点 id 集；`Ok(None)` = 全图已完成。拓扑序保证
+    /// 所选节点的前置全部已完成——任一条边的 `from` 先于 `to`，若有前置
+    /// 未完成，它排得更早、才是"首个未完成"——调用方无需再查前置满足性。
+    pub fn next_pending_node(&self, completed: &[String]) -> Result<Option<&PlanNode>, String> {
+        let order = self.topological_order()?;
+        let by_id: std::collections::HashMap<&str, &PlanNode> =
+            self.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        Ok(order
+            .iter()
+            .map(|id| by_id[id.as_str()])
+            .find(|n| !completed.contains(&n.id)))
     }
 }
