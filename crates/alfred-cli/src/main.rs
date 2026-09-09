@@ -41,6 +41,7 @@ use alfred_core::request::OwnerRequest;
 use anyhow::{bail, Context, Result};
 
 mod chat;
+mod chat_tui;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

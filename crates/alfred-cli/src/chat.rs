@@ -60,7 +60,11 @@ use alfred_core::request::OwnerRequest;
 use alfred_core::util::short_id;
 use anyhow::{bail, Context, Result};
 
-/// `alfred chat [--run-dir <dir>]`：owner 持续会话 REPL。
+/// `alfred chat [--run-dir <dir>]`：owner 持续会话入口（TUI 方案 S1 起分流）。
+///
+/// 入口分流：交互双 tty 且 TERM 有效 → TUI 呈现层（`chat_tui`，S1 骨架）；
+/// 否则（管道/重定向/脚本）走本函数既有 REPL——非 tty 管道行为逐字节不变
+/// （e2e 硬底线）。
 ///
 /// 入口定位（P3 发现规则）：显式 --run-dir 优先（有 state.json 即恢复，否则作为
 /// 新 run 落点）；未指定则扫描默认基目录取 updated_at 最新的 run（任意态，同构
@@ -80,6 +84,17 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
             other => bail!("alfred chat: 未知参数 {other:?}（--run-dir <dir>；--help 查看用法）"),
         }
         i += 1;
+    }
+
+    // TUI 降级门（方案 `.plans/施工方案-TUI界面.md`）：交互双 tty 且 TERM 有效
+    // → TUI 呈现层（S1 骨架，见 chat_tui.rs）；否则（管道/重定向/dumb 终端）
+    // 降级下方既有 REPL 路径——非 tty 管道行为逐字节不变，e2e 硬底线。TUI
+    // 初始化/运行失败（极罕见）打错误回退 REPL，保持入口恒可用。
+    if crate::chat_tui::tui_supported() {
+        match crate::chat_tui::run() {
+            Ok(()) => return Ok(()),
+            Err(e) => eprintln!("[chat] TUI 运行失败（{e:#}），回退 REPL。"),
+        }
     }
 
     let (mut run_dir, mut run) = locate_run(run_dir_flag.as_deref())?;
