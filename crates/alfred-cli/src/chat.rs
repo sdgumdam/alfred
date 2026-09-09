@@ -34,11 +34,16 @@
 //!   M4-a 语义轮次（ConverseReply 单一真源），按轮次快照检测本轮新增。
 //!
 //! 终端前缀各司其职（无第三套）：`[orchestrator]` 编排器流转/转写、`[pi]` 规划器
-//! 语音、`[driver]` CLI driver 状态行（run/feed/status 保留不动）、`[chat]` 本壳
-//! 提示音。
+//! 语音（含 `[pi] ⋯` 过程动作行——converse 执行期间后台 tail planner AGT 审计
+//! `planner/agt/audit/audit.jsonl` 实时打探查/读取/拦截行，动作真源=审计、此处
+//! 仅呈现层投影）、`[driver]` CLI driver 状态行（run/feed/status 保留不动）、
+//! `[chat]` 本壳提示音。
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use rustyline::error::ReadlineError;
 use rustyline::history::MemHistory;
@@ -242,7 +247,13 @@ fn feed_and_present(
     };
     let turns_before = conversation_turn_count(run_dir);
     let mut r = run.take().expect("feed state has run");
-    match feed_owner_message(&mut r, &ctx, message, decision) {
+    // 过程呈现（工单：规划过程透明）：feed（Planning 续聊 / 挂起拍板重规划）
+    // 内部续跑 converse——tail 窗口同 drive_loop；Abandon 等无 converse 的决策
+    // 零输出、stop 即退。
+    let tail = PlannerAuditTail::spawn(run_dir);
+    let fed = feed_owner_message(&mut r, &ctx, message, decision);
+    tail.stop();
+    match fed {
         Ok(outcome) => {
             surface_planner_output(run_dir, &outcome.reply, turns_before);
             println!("[chat] 当前状态: {}", state_label(outcome.state));
@@ -258,7 +269,12 @@ fn feed_and_present(
 fn drive_loop(run: &mut GovernanceRun, run_dir: &Path) -> Result<()> {
     let ctx = build_governance_context(run_dir)?;
     let turns_before = conversation_turn_count(run_dir);
-    let reply = run_governance_loop(run, &ctx)?;
+    // 过程呈现：converse（及维护者，同写 planner AGT 审计）执行期间 tail 审计打
+    // 动作行；loop 返回（含 Err）先停 tail 再呈现——过程行先于答复/状态行打完。
+    let tail = PlannerAuditTail::spawn(run_dir);
+    let result = run_governance_loop(run, &ctx);
+    tail.stop();
+    let reply = result?;
     if let Err(e) = persist_governance_run(run_dir, run) {
         println!("[chat] state 持久化失败：{e:#}");
     }
@@ -518,6 +534,215 @@ fn first_n_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// 过程动作行截断上限（chars——与 title 截断同范式，中文安全；命令/路径均适用）。
+const ACTION_TRUNC_CHARS: usize = 80;
+/// 审计 tail 轮询间隔（ms）：终端实时感与空转开销的平衡点。
+const TAIL_POLL_MS: u64 = 200;
+
+/// planner AGT 审计过程呈现（规划过程透明）：converse 调用前 [`Self::spawn`]
+/// 后台线程 tail `<run>/planner/agt/audit/audit.jsonl`（路径经
+/// `planner_audit_path` 单一真源），新增决策行实时打 `[pi] ⋯` 动作行；converse
+/// 返回后 [`Self::stop`] join——过程行先于 `[pi]` 答复打完，过程→答复连贯。
+///
+/// - **动作真源 = AGT 审计**（pi 子进程实时追加）：allow bash → `探查:`、
+///   allow read → `读取:`、deny → `探查（被治理拦截）:`（owner 面向全可见——
+///   AGT deny reason 对 planner 中性化是 planner 侧约束，不约束 owner 呈现）；
+///   其余（write/edit 产出写）不呈现——过程行只呈现探查动作。
+/// - **跨轮续写同文件**（audit-baseline 持久基线机制同源事实）：tail 从打开
+///   时刻的文件末尾增量读，历史轮次行不重放；文件截断（len<offset）回退从 0
+///   读（tail -F 语义，防偏移越界漏行）。
+/// - **节流**：同一渲染行（decision+tool+目标）本 tail 会话内重复不重打。
+/// - **离线/AGT 关闭**：audit 文件不出现 → 线程空轮询，stop 即退零输出（e2e
+///   离线路径行为不变）。
+/// - **退出安全**：线程只做非阻塞元数据/增量读 + 短睡眠，stop 置位后 ≤1 轮询
+///   周期（末轮再 drain 一次，兜住停止前最后窗口落盘的行）退出，join 无恐慌
+///   路径；打印走 `writeln!` 吞错（不 `println!`——写失败 panic 会杀后台线程）。
+///   spawn 失败（线程资源耗尽）→ 无过程行呈现，converse 照常。
+struct PlannerAuditTail {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PlannerAuditTail {
+    fn spawn(run_dir: &Path) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::Builder::new()
+            .name("planner-audit-tail".to_string())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                let path = alfred_planner::host::planner_audit_path(run_dir);
+                move || tail_planner_audit(&path, &stop)
+            })
+            .ok();
+        Self { stop, handle }
+    }
+
+    /// converse 返回后调用（所有路径——含 Err）：置位 + join。
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// tail 主体：轮询步进（[`AuditTailState::poll`]）→ 打印；stop 置位后末轮再
+/// poll 一次（兜住停止前最后窗口落盘的行）退出。语义全在 poll（可测），线程
+/// 壳只有步进+打印。
+fn tail_planner_audit(path: &Path, stop: &AtomicBool) {
+    let mut state = AuditTailState::new(path.to_path_buf());
+    loop {
+        for line in state.poll() {
+            emit_process_line(&line);
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(TAIL_POLL_MS));
+    }
+}
+
+/// 审计 tail 轮询状态机（单步推进语义可测）：持有文件偏移/半行缓冲/已打印行
+/// 集，[`Self::poll`] 一步 = 等创建 → 首开定位末尾 → 增量读新行 → 渲染节流，
+/// 返回本步应打印的动作行（顺序）；无新内容 → 空。
+struct AuditTailState {
+    path: PathBuf,
+    offset: u64,
+    /// tail 启动时文件已存在（多轮续写）：首开定位到打开时刻末尾——历史轮次行
+    /// 不重放。启动时无文件（首轮）：文件在本会话中出现——从 0 读，写进来的
+    /// 全是本轮新行（pi 启动慢于首个轮询时，首行已在文件里也不能当历史跳过）。
+    existed_at_start: bool,
+    /// 已完成首开定位（false = 文件还没出现，继续等创建）。
+    opened: bool,
+    /// 半行缓冲（并发写半行不误渲，残缺尾行下轮续读）。
+    pending: Vec<u8>,
+    /// 节流：本 tail 会话内已打印的渲染行（同 command 重复不重打）。
+    printed: std::collections::HashSet<String>,
+}
+
+impl AuditTailState {
+    fn new(path: PathBuf) -> Self {
+        let existed_at_start = std::fs::metadata(&path)
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        Self {
+            path,
+            offset: 0,
+            existed_at_start,
+            opened: false,
+            pending: Vec::new(),
+            printed: std::collections::HashSet::new(),
+        }
+    }
+
+    /// 轮询一步。任何文件系统错误（文件消失等）按“无新内容”处理，状态保留
+    /// 下轮重试——不崩不跳。
+    fn poll(&mut self) -> Vec<String> {
+        let Ok(meta) = std::fs::metadata(&self.path) else {
+            return Vec::new();
+        };
+        if !meta.is_file() {
+            return Vec::new();
+        }
+        let len = meta.len();
+        if !self.opened {
+            // 首开定位：见 `existed_at_start` 字段注释（首轮从 0 / 续写从末尾）。
+            self.offset = if self.existed_at_start { len } else { 0 };
+            self.opened = true;
+        } else if len < self.offset {
+            // 截断/重置：偏移回退重读（tail -F 语义，防偏移越界漏行）。
+            self.offset = 0;
+            self.pending.clear();
+        }
+        if len <= self.offset {
+            return Vec::new();
+        }
+        self.read_delta()
+    }
+
+    /// 读 `[offset, EOF)` 增量进 pending，剥完整行渲染节流；任何读失败停在
+    /// 原位（下轮重试）。
+    fn read_delta(&mut self) -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        if f.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() {
+            return Vec::new();
+        }
+        self.offset += buf.len() as u64;
+        self.pending.extend_from_slice(&buf);
+        let mut out = Vec::new();
+        while let Some(nl) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..nl]).into_owned();
+            self.pending.drain(..=nl);
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(text) = render_audit_action(line) {
+                if self.printed.insert(text.clone()) {
+                    out.push(text);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 过程行打终端：`writeln!` 吞错（坏管道不杀线程）；行缓冲 stdout 遇 \n 自动
+/// flush，管道路径同样及时落日志（e2e 日志可断言）。
+fn emit_process_line(text: &str) {
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{text}");
+    let _ = out.flush();
+}
+
+/// AGT 审计行 → 过程动作行（纯函数：tail 线程与测试共用单一真源）。
+///
+/// 宽进：多余字段忽略；非法 JSON / 未知 decision / 无呈现目标 → None（不呈现
+/// 不崩——审计是 pi 子进程写的，坏行不能杀呈现）。
+fn render_audit_action(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let decision = v.get("decision").and_then(|d| d.as_str())?;
+    let tool = v.get("tool_name").and_then(|t| t.as_str()).unwrap_or("");
+    let command = v
+        .get("command")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let path = v
+        .get("path")
+        .and_then(|p| p.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let action = match (decision, tool) {
+        ("allow", "bash") => format!("探查: {}", truncate_action(command?)),
+        ("allow", "read") => format!("读取: {}", truncate_action(path?)),
+        // deny 全可见（任意工具——拦截即治理边界信号）；command 缺失回退 path。
+        ("deny", _) => {
+            format!("探查（被治理拦截）: {}", truncate_action(command.or(path)?))
+        }
+        _ => return None,
+    };
+    Some(format!("[pi] ⋯ {action}"))
+}
+
+/// 动作目标截断：空白规整（多行命令压平单行——过程行一行一动作）+ 超限
+/// [`ACTION_TRUNC_CHARS`] 字截断带省略号（chars 中文安全，同 [`first_n_chars`]）。
+fn truncate_action(s: &str) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > ACTION_TRUNC_CHARS {
+        format!("{}…", first_n_chars(&flat, ACTION_TRUNC_CHARS))
+    } else {
+        flat
+    }
+}
+
 /// 行输入器：交互双 tty → rustyline 行编辑（↑↓ 历史、←→ 移动；进程内会话级
 /// 历史——需求收集/对话/拍板三态共享同一实例，历史贯通；不持久化文件）；否则
 /// （管道/重定向喂入）保持裸字节读（非 UTF-8 容错，见 sanitize_raw_line）——
@@ -626,7 +851,9 @@ fn sanitize_raw_line(raw: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_raw_line;
+    use super::{
+        render_audit_action, sanitize_raw_line, truncate_action, AuditTailState, PlannerAuditTail,
+    };
 
     /// 干净 UTF-8 输入恒等：lossy 对合法输入不改内容，只剥行尾（调用点均
     /// trim()，语义逐字节不变）。
@@ -643,7 +870,10 @@ mod tests {
     /// 非 UTF-8 字节不崩：→ U+FFFD 替身（坏行照常进治理流——可见，不静默丢）。
     #[test]
     fn invalid_bytes_become_replacement() {
-        assert_eq!(sanitize_raw_line(b"test\xff\xe6\x96\xb0\n"), "test\u{FFFD}新");
+        assert_eq!(
+            sanitize_raw_line(b"test\xff\xe6\x96\xb0\n"),
+            "test\u{FFFD}新"
+        );
     }
 
     /// 方向键等 CSI 转义序列整段剥除，不进消息体。
@@ -660,6 +890,227 @@ mod tests {
         assert_eq!(sanitize_raw_line(b"a\x07b\x00c\n"), "abc");
         assert_eq!(sanitize_raw_line(b"a\tb\n"), "a\tb");
         assert_eq!(sanitize_raw_line("\x1b[新需求".as_bytes()), "新需求");
+    }
+
+    // ── planner AGT 审计过程行渲染（动作真源 audit.jsonl → [pi] ⋯ 呈现投影） ──
+
+    /// allow 两形态：bash → 探查（command）、read → 读取（path）；真实审计行
+    /// 字段子集宽进（多余字段忽略）。
+    #[test]
+    fn audit_action_allow_probe_and_read() {
+        let bash = r#"{"ts":"2026-09-06T20:18:32.690Z","tool_name":"bash","tool_call_id":"call_d43ee88cb0944ef2bf4fa2c3","command":"omp --help","decision":"allow","rule":null,"reason":"default_action=allow"}"#;
+        assert_eq!(
+            render_audit_action(bash).as_deref(),
+            Some("[pi] ⋯ 探查: omp --help")
+        );
+        let read = r#"{"ts":"2026-09-06T20:18:33.000Z","tool_name":"read","path":"/tmp/ws/marker.txt","decision":"allow"}"#;
+        assert_eq!(
+            render_audit_action(read).as_deref(),
+            Some("[pi] ⋯ 读取: /tmp/ws/marker.txt")
+        );
+    }
+
+    /// deny owner 全可见（任意工具）；无 command 的 deny 回退 path 呈现。
+    #[test]
+    fn audit_action_deny_owner_visible() {
+        let deny_bash = r#"{"tool_name":"bash","command":"ls ~/.omp/runs","decision":"deny","rule":"run-dir-guard"}"#;
+        assert_eq!(
+            render_audit_action(deny_bash).as_deref(),
+            Some("[pi] ⋯ 探查（被治理拦截）: ls ~/.omp/runs")
+        );
+        let deny_read = r#"{"tool_name":"read","path":"/run/conversation.json","decision":"deny"}"#;
+        assert_eq!(
+            render_audit_action(deny_read).as_deref(),
+            Some("[pi] ⋯ 探查（被治理拦截）: /run/conversation.json")
+        );
+    }
+
+    /// 80 字截断带省略号（chars 中文安全）；多行命令压平单行（一行一动作）。
+    #[test]
+    fn audit_action_truncate_and_flatten() {
+        let line = format!(
+            r#"{{"tool_name":"bash","command":"{}","decision":"allow"}}"#,
+            "x".repeat(100)
+        );
+        let rendered = render_audit_action(&line).expect("long command renders");
+        let prefix = "[pi] ⋯ 探查: ".chars().count();
+        assert_eq!(rendered.chars().count(), prefix + 80 + 1, "80 字 + 省略号");
+        assert!(rendered.ends_with('…'));
+
+        // JSON \n 转义解析为真换行 → 压平；多空格规整。
+        let multiline = r#"{"tool_name":"bash","command":"echo a\nls   -la","decision":"allow"}"#;
+        assert_eq!(
+            render_audit_action(multiline).as_deref(),
+            Some("[pi] ⋯ 探查: echo a ls -la")
+        );
+
+        let cn = format!(
+            r#"{{"tool_name":"read","path":"{}","decision":"allow"}}"#,
+            "超".repeat(100)
+        );
+        let rendered = render_audit_action(&cn).expect("long path renders");
+        assert_eq!(
+            rendered.chars().count(),
+            "[pi] ⋯ 读取: ".chars().count() + 80 + 1,
+            "中文按 chars 截断不 panic"
+        );
+    }
+
+    /// 非呈现面静默跳过（None 不崩）：write/edit 产出写、未知 decision、无目标、
+    /// 坏 JSON——审计是 pi 子进程写的，坏行不能杀呈现。
+    #[test]
+    fn audit_action_skips_non_probe_lines() {
+        let write =
+            r#"{"tool_name":"write","path":"/run/planner/outputs/reply.txt","decision":"allow"}"#;
+        assert_eq!(render_audit_action(write), None);
+        assert_eq!(
+            render_audit_action(r#"{"tool_name":"bash","decision":"maybe"}"#),
+            None
+        );
+        // bash 无 command / read 无 path → 无呈现目标。
+        assert_eq!(
+            render_audit_action(r#"{"tool_name":"bash","decision":"allow"}"#),
+            None
+        );
+        assert_eq!(
+            render_audit_action(r#"{"tool_name":"read","decision":"allow"}"#),
+            None
+        );
+        assert_eq!(render_audit_action("not-json"), None);
+        assert_eq!(render_audit_action(""), None);
+    }
+
+    /// 空白目标（空 command/path）不呈现空行动作。
+    #[test]
+    fn audit_action_skips_empty_targets() {
+        assert_eq!(
+            render_audit_action(r#"{"tool_name":"bash","command":"   ","decision":"allow"}"#),
+            None
+        );
+        assert_eq!(truncate_action("  \n  "), "");
+    }
+
+    // ── 审计 tail 状态机（真实文件系统，断言面 = poll 返回的动作行序列） ──
+
+    /// 增量语义：文件未建零输出 → 历史轮次行不重放 → 本轮新增按序渲染 → 同
+    /// command 节流 → 半行不误渲补齐后渲出 → 截断回退重读。
+    #[test]
+    fn audit_tail_state_polls_incremental_lines() {
+        let dir = std::env::temp_dir().join(format!("alfred-chat-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = dir.join("audit.jsonl");
+
+        // 文件未创建（离线 / AGT 尚未落盘）→ 空轮询零输出。
+        let mut st = AuditTailState::new(audit.clone());
+        assert_eq!(st.poll(), Vec::<String>::new());
+
+        // 首轮竞态（真跑实证：pi 启动慢于首个轮询，文件带着首行出现）：启动时
+        // 无文件 → 会话中出现即从 0 读，已在文件里的行也照常渲出（不当历史跳过）。
+        std::fs::write(
+            &audit,
+            concat!(
+                r#"{"tool_name":"bash","command":"ls -la .","decision":"allow"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(st.poll(), vec!["[pi] ⋯ 探查: ls -la .".to_string()]);
+
+        // 多轮语义：tail 启动时文件已存在（上一轮 converse 产物）→ 历史不重放。
+        let mut st = AuditTailState::new(audit.clone());
+        assert_eq!(st.poll(), Vec::<String>::new());
+
+        // 本轮新增：探查/读取/拦截按序渲染。
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit)
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"tool_name":"bash","command":"ls src","decision":"allow"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"tool_name":"read","path":"/ws/Cargo.toml","decision":"allow"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"tool_name":"bash","command":"cat ~/.omp/runs","decision":"deny"}}"#
+        )
+        .unwrap();
+        drop(f);
+        assert_eq!(
+            st.poll(),
+            vec![
+                "[pi] ⋯ 探查: ls src".to_string(),
+                "[pi] ⋯ 读取: /ws/Cargo.toml".to_string(),
+                "[pi] ⋯ 探查（被治理拦截）: cat ~/.omp/runs".to_string(),
+            ]
+        );
+
+        // 节流：同 command 重复不重打；不同命令照常。
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit)
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"tool_name":"bash","command":"ls src","decision":"allow"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"tool_name":"bash","command":"ls tests","decision":"allow"}}"#
+        )
+        .unwrap();
+        drop(f);
+        assert_eq!(st.poll(), vec!["[pi] ⋯ 探查: ls tests".to_string()]);
+
+        // 半行（无 \n）不误渲；补齐后渲出。
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit)
+            .unwrap();
+        write!(f, r#"{{"tool_name":"read","path":"/ws/half"#).unwrap();
+        drop(f);
+        assert_eq!(st.poll(), Vec::<String>::new());
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit)
+            .unwrap();
+        writeln!(f, r#".txt","decision":"allow"}}"#).unwrap();
+        drop(f);
+        assert_eq!(st.poll(), vec!["[pi] ⋯ 读取: /ws/half.txt".to_string()]);
+
+        // 截断重置：文件缩回 < offset → 回退从 0 重读（新行照常渲出）。
+        std::fs::write(
+            &audit,
+            concat!(
+                r#"{"tool_name":"read","path":"/fresh/x.txt","decision":"allow"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(st.poll(), vec!["[pi] ⋯ 读取: /fresh/x.txt".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 线程壳退出安全：无 audit 文件（离线路径）spawn→stop 干净 join，不残留
+    /// 不 panic；spawn 失败（资源耗尽 → handle=None）stop 同样安全。
+    #[test]
+    fn planner_audit_tail_stop_joins_cleanly() {
+        let dir =
+            std::env::temp_dir().join(format!("alfred-chat-tail-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let run_dir = dir.join("run");
+        std::fs::create_dir_all(run_dir.join("planner/agt/audit")).unwrap();
+        PlannerAuditTail::spawn(&run_dir).stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
