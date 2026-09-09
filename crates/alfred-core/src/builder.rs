@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{Contract, SandboxProfile};
-use crate::dagspec::{DagSpec, PlanNode};
+use crate::dagspec::{DagSpec, Edge, PlanNode};
 
 /// 建图指令（LLM 输出或离线注入的原子操作）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,7 +34,9 @@ pub enum BuildInstruction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         time_limit_secs: Option<u32>,
     },
-    /// 添加一条依赖边（from 依赖 to 之前的节点——语义：from 在 to 之后执行）。
+    /// 添加一条依赖边（from → to：from 是 to 的前置，from 完成后 to 才可
+    /// 执行；方向与 `DagSpec::topological_order` 的依赖序一致——from 排在
+    /// to 之前）。
     AddEdge {
         from: String,
         to: String,
@@ -55,7 +57,7 @@ pub enum BuildInstruction {
 pub struct GraphBuilder {
     request_id: Option<String>,
     nodes: Vec<PlanNode>,
-    edges: Vec<(String, String)>,
+    edges: Vec<Edge>,
     start: Vec<String>,
     committed: bool,
 }
@@ -165,16 +167,19 @@ impl GraphBuilder {
         if !self.nodes.iter().any(|n| n.id == to) {
             return Err(format!("builder: add_edge to unknown node '{to}'"));
         }
-        if self.edges.iter().any(|(f, t)| f == &from && t == &to) {
+        if self.edges.iter().any(|e| e.from == from && e.to == to) {
             return Err(format!("builder: duplicate edge '{from} -> {to}'"));
         }
         // 无环检查：加入 (from -> to) 后不得成环。
         let mut test = self.edges.clone();
-        test.push((from.clone(), to.clone()));
+        test.push(Edge {
+            from: from.clone(),
+            to: to.clone(),
+        });
         if has_cycle(&test) {
             return Err(format!("builder: edge '{from} -> {to}' would create a cycle"));
         }
-        self.edges.push((from, to));
+        self.edges.push(Edge { from, to });
         Ok(())
     }
 
@@ -208,7 +213,7 @@ impl GraphBuilder {
         Ok(())
     }
 
-    /// 冻结草稿 → DagSpec（节点按依赖拓扑序排列）。
+    /// 冻结草稿 → DagSpec（节点按依赖拓扑序排列；边原样随图携带）。
     pub fn build(self) -> Result<DagSpec, String> {
         if !self.committed {
             return Err("builder: build before commit".into());
@@ -217,65 +222,38 @@ impl GraphBuilder {
             .request_id
             .clone()
             .ok_or_else(|| "builder: build without request_id".to_string())?;
-        let ordered = topological_order(&self.nodes, &self.edges)?;
-        Ok(DagSpec {
+        let mut dag = DagSpec {
             request_id,
-            nodes: ordered,
-        })
+            nodes: self.nodes,
+            edges: self.edges,
+        };
+        // finalize 校验点（单一真源）：拓扑 + 环/悬空/重复边检测全走
+        // DagSpec::topological_order，并按依赖序重排节点（首节点必无前置）。
+        let order = dag.topological_order()?;
+        let mut by_id: std::collections::HashMap<String, PlanNode> = dag
+            .nodes
+            .drain(..)
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        dag.nodes = order
+            .into_iter()
+            .map(|id| {
+                by_id
+                    .remove(&id)
+                    .expect("topological order covers every node")
+            })
+            .collect();
+        Ok(dag)
     }
-}
-
-/// 拓扑排序（Kahn）：有环返回 Err；无环返回依赖序（from 在 to 之前）。
-fn topological_order(
-    nodes: &[PlanNode],
-    edges: &[(String, String)],
-) -> Result<Vec<PlanNode>, String> {
-    if edges.is_empty() {
-        return Ok(nodes.to_vec());
-    }
-    let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-    let mut indegree: std::collections::HashMap<&str, usize> =
-        ids.iter().map(|id| (*id, 0usize)).collect();
-    let mut adj: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for (f, t) in edges {
-        *indegree.get_mut(t.as_str()).unwrap() += 1;
-        adj.entry(f.as_str()).or_default().push(t.as_str());
-    }
-    let mut queue: Vec<&str> = indegree
-        .iter()
-        .filter(|(_, d)| **d == 0)
-        .map(|(id, _)| *id)
-        .collect();
-    queue.sort_unstable();
-    let mut order: Vec<&str> = Vec::new();
-    while let Some(id) = queue.pop() {
-        order.push(id);
-        if let Some(nexts) = adj.get(id) {
-            for n in nexts {
-                let d = indegree.get_mut(n).unwrap();
-                *d -= 1;
-                if *d == 0 {
-                    queue.push(n);
-                }
-            }
-        }
-    }
-    if order.len() != nodes.len() {
-        return Err("builder: cycle detected in DAG".into());
-    }
-    let by_id: std::collections::HashMap<&str, &PlanNode> =
-        nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    Ok(order
-        .into_iter()
-        .filter_map(|id| by_id.get(id).map(|n| (*n).clone()))
-        .collect())
 }
 
 /// 有向图是否有环（DFS 三色标记）。
-fn has_cycle(edges: &[(String, String)]) -> bool {
+fn has_cycle(edges: &[Edge]) -> bool {
     let mut adj: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for (f, t) in edges {
-        adj.entry(f.as_str()).or_default().push(t.as_str());
+    for edge in edges {
+        adj.entry(edge.from.as_str())
+            .or_default()
+            .push(edge.to.as_str());
     }
     fn visit<'a>(
         node: &'a str,

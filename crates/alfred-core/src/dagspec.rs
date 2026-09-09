@@ -56,17 +56,40 @@ impl PlanNode {
 }
 
 
+/// 依赖边（M1 多节点）：`from` → `to`——`from` 是 `to` 的前置，
+/// `from` 完成后 `to` 才可执行。
+///
+/// 两端为节点 id 引用，必须存在于 `DagSpec.nodes`（悬空边在
+/// `topological_order` 显式拒绝）；方向语义与 `topological_order` 的
+/// 依赖序一致（from 在 to 之前）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Edge {
+    /// 前置节点 id（先执行、被依赖的一方）。
+    pub from: String,
+    /// 后继节点 id（依赖 from 产物的一方）。
+    pub to: String,
+}
+
 /// 计划：属主需求 → 任务节点的 DAG 拆解。
 ///
-/// R2 只承载审查输入；拓扑边在 R3 规划器填充。节点按依赖序排列，
+/// M1 起承载显式依赖边（`edges`）；拓扑序/环检测的单一真源是
+/// [`DagSpec::topological_order`]。节点按依赖序排列，孤立节点合法，
 /// 审查判"拆解是否忠实于 OwnerRequest"。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DagSpec {
     /// 被拆解的需求 id（对应 OwnerRequest.id）。
     pub request_id: String,
-    /// 节点列表（R2 为有序列表）。
+    /// 节点列表（按依赖拓扑序排列）。
     pub nodes: Vec<PlanNode>,
+    /// 依赖边（from → to）。空 = 单节点计划/无显式依赖（M1 前的既有形态）。
+    ///
+    /// 旧契约兼容（红线）：无 `edges` 字段的既有 dagspec.json 反序列化为
+    /// 空 vec；空 vec 序列化不落字段——与 `PlanNode::time_limit_secs` 的
+    /// None 不落同一范式，旧断言面逐字节不变。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<Edge>,
 }
 
 impl DagSpec {
@@ -74,6 +97,7 @@ impl DagSpec {
         Self {
             request_id: request_id.into(),
             nodes,
+            edges: Vec::new(),
         }
     }
 }
@@ -89,5 +113,109 @@ impl DagSpec {
             Some(node) => serde_json::to_string_pretty(&node.contract),
             None => Ok("{}".to_string()),
         }
+    }
+
+    /// 拓扑排序（Kahn，单一真源）：返回节点 id 的依赖执行序——任一条边的
+    /// `from` 必出现在 `to` 之前；同时就绪的节点取声明序最前者（稳定序）。
+    ///
+    /// 显式 Err（不静默容忍坏图）：
+    /// - 悬空边：`from`/`to` 引用了 `nodes` 中不存在的节点 id；
+    /// - 重复边：同一 `(from, to)` 出现多次；
+    /// - 环（含自环）：报出环路径，如 `a -> b -> a`。
+    ///
+    /// 孤立节点（无入边无出边）合法，照常出现在序里。
+    pub fn topological_order(&self) -> Result<Vec<String>, String> {
+        let id_index: std::collections::HashMap<&str, usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (node.id.as_str(), i))
+            .collect();
+        for edge in &self.edges {
+            for endpoint in [&edge.from, &edge.to] {
+                if !id_index.contains_key(endpoint.as_str()) {
+                    return Err(format!(
+                        "dagspec: edge '{} -> {}' references unknown node '{}'",
+                        edge.from, edge.to, endpoint
+                    ));
+                }
+            }
+        }
+        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+        for edge in &self.edges {
+            if !seen.insert((edge.from.as_str(), edge.to.as_str())) {
+                return Err(format!(
+                    "dagspec: duplicate edge '{} -> {}'",
+                    edge.from, edge.to
+                ));
+            }
+        }
+        // Kahn：入度归零即就绪；就绪集按声明序取最小（稳定拓扑序）。
+        let n = self.nodes.len();
+        let mut indegree = vec![0usize; n];
+        let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for edge in &self.edges {
+            let from = id_index[edge.from.as_str()];
+            let to = id_index[edge.to.as_str()];
+            indegree[to] += 1;
+            successors[from].push(to);
+        }
+        let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = (0..n)
+            .filter(|&i| indegree[i] == 0)
+            .map(std::cmp::Reverse)
+            .collect();
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        while let Some(std::cmp::Reverse(i)) = ready.pop() {
+            order.push(i);
+            for &to in &successors[i] {
+                indegree[to] -= 1;
+                if indegree[to] == 0 {
+                    ready.push(std::cmp::Reverse(to));
+                }
+            }
+        }
+        if order.len() == n {
+            return Ok(order
+                .into_iter()
+                .map(|i| self.nodes[i].id.clone())
+                .collect());
+        }
+        // 有环：剩余节点沿“剩余前驱”回溯必回到自身（每个剩余节点必有
+        // 剩余前驱，否则早被就绪弹出），回溯环反转即边方向的真实路径。
+        let mut emitted = vec![false; n];
+        for &i in &order {
+            emitted[i] = true;
+        }
+        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for edge in &self.edges {
+            predecessors[id_index[edge.to.as_str()]].push(id_index[edge.from.as_str()]);
+        }
+        let start = (0..n)
+            .find(|&i| !emitted[i])
+            .expect("stalled Kahn implies unemitted nodes");
+        let mut path: Vec<usize> = Vec::new();
+        let mut position: Vec<Option<usize>> = vec![None; n];
+        let mut current = start;
+        let cycle_head = loop {
+            if let Some(head) = position[current] {
+                break head;
+            }
+            position[current] = Some(path.len());
+            path.push(current);
+            current = *predecessors[current]
+                .iter()
+                .find(|&&pred| !emitted[pred])
+                .expect("remaining node has a remaining predecessor");
+        };
+        let cycle: Vec<&str> = path[cycle_head..]
+            .iter()
+            .rev()
+            .map(|&i| self.nodes[i].id.as_str())
+            .collect();
+        Err(format!(
+            "dagspec: cycle detected: {} -> {}",
+            cycle.join(" -> "),
+            cycle[0]
+        ))
     }
 }

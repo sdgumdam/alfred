@@ -344,3 +344,268 @@ fn plan_node_resolved_time_limit_prefers_declaration() {
     let undeclared = alfred_core::PlanNode::new("task-1", "s", contract);
     assert_eq!(undeclared.resolved_time_limit_secs(600), 600);
 }
+
+// ---------- M1 多节点：DagSpec edges + 拓扑排序（数据层） ----------
+
+fn dag_node(id: &str) -> alfred_core::PlanNode {
+    alfred_core::PlanNode::new(
+        id,
+        "s",
+        Contract {
+            prompt: "p".into(),
+            acceptance_criteria: "a".into(),
+            reviewer_models: vec![],
+        },
+    )
+}
+
+fn dag_edge(from: &str, to: &str) -> alfred_core::Edge {
+    alfred_core::Edge {
+        from: from.into(),
+        to: to.into(),
+    }
+}
+
+#[test]
+fn dagspec_edges_round_trip_and_omitted_when_empty() {
+    // M1：edges 有值往返序列化；空 vec 不落字段（与 time_limit_secs 的
+    // None 不落同一范式——旧契约断言面逐字节不变）。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a"), dag_node("b")],
+        edges: vec![dag_edge("a", "b")],
+    };
+    let text = serde_json::to_string(&dag).unwrap();
+    assert!(
+        text.contains(r#""edges":[{"from":"a","to":"b"}]"#),
+        "{text}"
+    );
+    let back: alfred_core::DagSpec = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, dag);
+
+    // 空 edges（DagSpec::new 通道）：序列化不落 edges 字段。
+    let empty = alfred_core::DagSpec::new("req-1", vec![dag_node("a")]);
+    let text = serde_json::to_string(&empty).unwrap();
+    assert!(!text.contains("edges"), "{text}");
+    let back: alfred_core::DagSpec = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, empty);
+    assert!(back.edges.is_empty());
+}
+
+#[test]
+fn dagspec_old_json_without_edges_still_parses() {
+    // 旧契约兼容（红线）：M1 之前的 dagspec.json（无 edges 字段）原样可读，
+    // edges 反序列化为空；再序列化也不落 edges（读旧写旧逐字节兼容）。
+    let json = r#"{
+        "request_id": "req-1",
+        "nodes": [{
+            "id": "task-1",
+            "summary": "s",
+            "contract": {"prompt": "p", "acceptance_criteria": "a", "reviewer_models": []},
+            "sandbox": {"volumes": [], "runtime": null, "packages": [], "network": false}
+        }]
+    }"#;
+    let dag: alfred_core::DagSpec = serde_json::from_str(json).unwrap();
+    assert_eq!(dag.nodes.len(), 1);
+    assert!(dag.edges.is_empty());
+    let text = serde_json::to_string(&dag).unwrap();
+    assert!(!text.contains("edges"), "{text}");
+}
+
+#[test]
+fn dagspec_topological_order_diamond() {
+    // 菱形依赖 a→b、a→c、b→d、c→d：a 最先、d 最后；b/c 同时就绪取声明序
+    // 最前（稳定拓扑序）→ [a, b, c, d]。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a"), dag_node("b"), dag_node("c"), dag_node("d")],
+        edges: vec![
+            dag_edge("a", "b"),
+            dag_edge("a", "c"),
+            dag_edge("b", "d"),
+            dag_edge("c", "d"),
+        ],
+    };
+    assert_eq!(dag.topological_order().unwrap(), vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn dagspec_topological_order_isolated_node_stays_in_order() {
+    // 孤立节点（无入边无出边）合法，照常出现在序里。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a"), dag_node("b"), dag_node("island")],
+        edges: vec![dag_edge("a", "b")],
+    };
+    assert_eq!(dag.topological_order().unwrap(), vec!["a", "b", "island"]);
+}
+
+#[test]
+fn dagspec_topological_order_rejects_cycle_with_path() {
+    // 环拒绝：a→b→c→a；Err 显式报出环路径（前驱回溯提取、反转成边方向）。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a"), dag_node("b"), dag_node("c")],
+        edges: vec![dag_edge("a", "b"), dag_edge("b", "c"), dag_edge("c", "a")],
+    };
+    let err = dag.topological_order().unwrap_err();
+    assert!(err.contains("cycle"), "err = {err}");
+    assert!(err.contains("b -> c -> a -> b"), "err = {err}");
+
+    // 自环也是环：a→a。
+    let self_loop = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a")],
+        edges: vec![dag_edge("a", "a")],
+    };
+    let err = self_loop.topological_order().unwrap_err();
+    assert!(err.contains("cycle"), "err = {err}");
+    assert!(err.contains("a -> a"), "err = {err}");
+}
+
+#[test]
+fn dagspec_topological_order_rejects_dangling_and_duplicate_edges() {
+    // 悬空边：to 端引用不存在节点。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a")],
+        edges: vec![dag_edge("a", "ghost")],
+    };
+    let err = dag.topological_order().unwrap_err();
+    assert!(err.contains("unknown node 'ghost'"), "err = {err}");
+
+    // 悬空边：from 端引用不存在节点。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a")],
+        edges: vec![dag_edge("ghost", "a")],
+    };
+    let err = dag.topological_order().unwrap_err();
+    assert!(err.contains("unknown node 'ghost'"), "err = {err}");
+
+    // 重复边：同一 (from, to) 两次。
+    let dag = alfred_core::DagSpec {
+        request_id: "req-1".into(),
+        nodes: vec![dag_node("a"), dag_node("b")],
+        edges: vec![dag_edge("a", "b"), dag_edge("a", "b")],
+    };
+    let err = dag.topological_order().unwrap_err();
+    assert!(err.contains("duplicate edge 'a -> b'"), "err = {err}");
+}
+
+#[test]
+fn builder_add_edge_rejects_unknown_duplicate_and_cyclic() {
+    // M1：add_edge 指令校验——两端节点必须已存在、不许重复、不得成环
+    //（错误指到具体指令）。
+    use alfred_core::{BuildInstruction, GraphBuilder};
+
+    fn apply_all(insts: &str) -> Result<(), String> {
+        let insts: Vec<BuildInstruction> = serde_json::from_str(insts).unwrap();
+        let mut builder = GraphBuilder::new();
+        for inst in insts {
+            builder.apply(inst)?;
+        }
+        Ok(())
+    }
+
+    // from 端节点不存在。
+    let err = apply_all(
+        r#"[
+        {"op":"begin","request_id":"req-1"},
+        {"op":"add_node","id":"a","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_edge","from":"ghost","to":"a"}
+    ]"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown node 'ghost'"), "err = {err}");
+
+    // to 端节点不存在。
+    let err = apply_all(
+        r#"[
+        {"op":"begin","request_id":"req-1"},
+        {"op":"add_node","id":"a","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_edge","from":"a","to":"ghost"}
+    ]"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("unknown node 'ghost'"), "err = {err}");
+
+    // 重复边：a→b 两次。
+    let err = apply_all(
+        r#"[
+        {"op":"begin","request_id":"req-1"},
+        {"op":"add_node","id":"a","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_node","id":"b","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_edge","from":"a","to":"b"},
+        {"op":"add_edge","from":"a","to":"b"}
+    ]"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("duplicate edge 'a -> b'"), "err = {err}");
+
+    // 成环：a→b 再 b→a。
+    let err = apply_all(
+        r#"[
+        {"op":"begin","request_id":"req-1"},
+        {"op":"add_node","id":"a","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_node","id":"b","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_edge","from":"a","to":"b"},
+        {"op":"add_edge","from":"b","to":"a"}
+    ]"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("would create a cycle"), "err = {err}");
+}
+
+#[test]
+fn builder_build_carries_edges_and_orders_nodes() {
+    // M1：build() 把边原样落进 DagSpec.edges，节点按依赖拓扑序重排
+    //（finalize 校验点 = DagSpec::topological_order 单一真源）。
+    use alfred_core::{BuildInstruction, GraphBuilder};
+
+    let insts = r#"[
+        {"op":"begin","request_id":"req-1"},
+        {"op":"add_node","id":"d","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_node","id":"c","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_node","id":"b","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_node","id":"a","summary":"s",
+         "contract":{"prompt":"p","acceptance_criteria":"a"}},
+        {"op":"add_edge","from":"a","to":"b"},
+        {"op":"add_edge","from":"a","to":"c"},
+        {"op":"add_edge","from":"b","to":"d"},
+        {"op":"add_edge","from":"c","to":"d"},
+        {"op":"commit"}
+    ]"#;
+    let insts: Vec<BuildInstruction> = serde_json::from_str(insts).unwrap();
+    let mut builder = GraphBuilder::new();
+    for inst in insts {
+        builder.apply(inst).unwrap();
+    }
+    let dag = builder.build().unwrap();
+    // 节点重排成依赖序：a 最先、d 最后；b/c 同级取声明序（c 声明在 b 前）。
+    let ids: Vec<&str> = dag.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ids, vec!["a", "c", "b", "d"]);
+    // 边原样携带（落盘契约）。
+    assert_eq!(
+        dag.edges,
+        vec![
+            dag_edge("a", "b"),
+            dag_edge("a", "c"),
+            dag_edge("b", "d"),
+            dag_edge("c", "d"),
+        ]
+    );
+    // 序列化往返。
+    let back: alfred_core::DagSpec =
+        serde_json::from_str(&serde_json::to_string(&dag).unwrap()).unwrap();
+    assert_eq!(back, dag);
+}

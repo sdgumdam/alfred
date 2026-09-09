@@ -24,7 +24,7 @@ pub use conversation::{
     append_to_disk, load_conversation, save_conversation, ConversationLog, ConversationRole,
     ConversationSource, ConversationTurn, CONVERSATION_FILE,
 };
-pub use dagspec::{DagSpec, PlanNode};
+pub use dagspec::{DagSpec, Edge, PlanNode};
 pub use governance::{
     route, GovernanceEvent, GovernanceOptions, GovernanceRun, GovernanceState,
     GovernanceStateMachine, OwnerDecision, RoutingDecision, TransitionError,
