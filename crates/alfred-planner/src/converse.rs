@@ -14,7 +14,7 @@
 //!   outputs/reply.txt），宿主按产出文件分派两分支 → GraphBuilder → DagSpec 或
 //!   答复；每次调用落盘 llm-calls/（P9 证据）。
 //! - 离线（`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1`）：确定性直通，
-//!   两分支由注入文件二选一——`ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json>` → 建图指令分支；
+//!   两分支由注入文件二选一——`ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json | 建图指令序列>` → 建图指令分支；
 //!   `ALFRED_OFFLINE_REPLY_FILE=<reply.txt>` → 答复分支；仍把 would-be 请求
 //!   落盘 llm-calls/（e2e 从记录断言会话文档/伪装消息）。
 
@@ -70,6 +70,9 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 规则：
 - 建图指令 JSON 与自然语言答复只能二选一，不要混合；产建图指令时只输出 JSON 数组，不要任何多余文字。
 - begin 必须最先，commit 必须最后，且至少一个节点。
+- 节点粒度 = 一个可独立验收的工作单元（有自己的任务描述与验收标准）。需求包含多个不同验收物或多阶段产物（如先整理数据、再基于数据写报告），或后一部分必须以前一部分的产物为基础时，拆成多节点；单一交付物内部的步骤不要拆（如"写一个 hello.txt"是一个节点，不要拆成"起草内容"+"写入文件"两个节点）。
+- 多节点之间的依赖用 add_edge 声明：from 是 to 的前置，from 完成后 to 才开工。add_edge 的 from/to 必须引用已 add_node 声明的节点 id；不允许成环（a 依赖 b、b 又依赖 a）、不允许重复声明同一依赖；相互没有依赖的节点不连线。
+- 后继节点的任务描述按"前置产物已就绪"来写（如"基于 task-1 产出的 notes.md 写报告"），不要重复前置节点要做的工作。
 - 每个节点的 contract.prompt 与 acceptance_criteria 必须非空。
 - 每个节点必须声明非空 workspace_subdirs（sandbox.workspace_subdirs，工作区子目录列表，如 ["src"]）：声明的是该节点可见/可写的工作区范围（节点只能看到这些子目录），这是强制约束；空/缺省声明 = 计划不合格。挂载语义：首个子目录挂为该节点工作区根 /workspace，其余子目录挂为 /workspace/<子目录>。
 - workspace_subdirs 必须声明具体子目录名：按任务产物位置声明（如任务写 src/ 下则声明 ["src"]）；禁止声明 "."（工作区根，挂载语义下根由系统接管，声明子目录必须是具体相对目录）；禁止声明与挂载根同名的目录名（如 "workspace"，避免嵌套歧义）；任务描述（contract.prompt）里"根目录"措辞应与声明的子目录一致（首个子目录即该节点工作区根 /workspace）。
@@ -342,32 +345,61 @@ fn large_volume_prompt_hint(total_bytes: u64) -> String {
     )
 }
 
-/// 校验 DagSpec 与请求对齐（request_id 匹配、节点非空、单节点骨架范围）。
+/// 校验 DagSpec 与请求对齐（request_id 匹配、节点非空、依赖图完整）。
+///
+/// M2 多节点放开：不再限制单节点——依赖图完整性（悬空边/重复边/环）走
+/// [`DagSpec::topological_order`] 单一真源检出。错误消息中性化（照
+/// disguise.rs 范式）：不携带内部实体名与英文诊断词形——消息会进
+/// planning_error_escalated 审计面，经属主转述给规划器也不泄漏治理词形。
 fn validate_dagspec(dagspec: &DagSpec, request: &OwnerRequest) -> Result<()> {
     if dagspec.request_id != request.id {
         bail!(
-            "dagspec request_id '{}' != request.id '{}'",
+            "计划所属的需求 id（{}）与当前需求（{}）不一致",
             dagspec.request_id,
             request.id
         );
     }
     if dagspec.nodes.is_empty() {
-        bail!("dagspec has no nodes");
+        bail!("计划里没有任何任务");
     }
-    // P2 修复：单节点骨架显式拒绝多节点 DAG（清单骨架范围：单节点验证；静默
-    // 截断违反"无静默出口"）。在计划提交即报结构错误，执行侧不再截断。
-    if dagspec.nodes.len() > 1 {
-        bail!(
-            "dagspec has {} nodes; 多节点 DAG 本骨架不支持（单节点验证范围）",
-            dagspec.nodes.len()
-        );
+    if let Err(e) = dagspec.topological_order() {
+        bail!("{}", neutralize_graph_error(&e));
     }
     Ok(())
 }
 
+/// 依赖图诊断（`topological_order` 错误文案）→ 中性措辞。
+///
+/// 错误文案前缀/句式是 alfred-core M1 契约（entities.rs 逐条断言），按稳定
+/// 前缀分类转写：去内部实体名（dagspec）与英文诊断词形，保留节点 id/路径
+/// 细节（属主可读、可转述给规划器定位问题）。未识别的原文透传——宁可保持
+/// 原样也不吞掉诊断信息（无静默出口）。
+fn neutralize_graph_error(err: &str) -> String {
+    let detail = err.strip_prefix("dagspec: ").unwrap_or(err);
+    if let Some(path) = detail.strip_prefix("cycle detected: ") {
+        return format!("计划里有些任务的先后关系成了环：{path}");
+    }
+    if let Some(edge) = detail.strip_prefix("duplicate edge ") {
+        return format!("计划里同样的依赖 {edge} 声明了两次");
+    }
+    if let Some(rest) = detail.strip_prefix("edge ") {
+        // "<from> -> <to>' references unknown node '<node>'"
+        if let Some((pair, node)) = rest.split_once("' references unknown node '") {
+            return format!(
+                "计划里的依赖 {} 指向了不存在的任务 {}",
+                pair.trim_matches('\''),
+                node.trim_end_matches('\'')
+            );
+        }
+    }
+    err.to_string()
+}
+
 /// 离线确定性直通（`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1`）：§2.4 两分支由注入文件二选一。
 ///
-/// - `ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json>` → 建图指令分支（validate → DagSpec）。
+/// - `ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json | instructions.json>` → 建图
+///   指令分支（validate → DagSpec）。DagSpec JSON（对象）直通；建图指令序列
+///   （数组，与宿主 pi 产出同构）走 `instructions_to_dagspec` 同一条解析路径。
 /// - `ALFRED_OFFLINE_REPLY_FILE=<reply.txt>` → 答复分支（纯文本）。
 /// 两者同时/都不设 → 显式报错（不静默）。返回 (outcome, response 文本)，
 /// response 供 llm-calls 记录（与宿主 pi 路径同构）。
@@ -379,8 +411,7 @@ fn converse_offline(request: &OwnerRequest) -> Result<(ConverseOutcome, String)>
             "ALFRED_OFFLINE_PLAN_FILE 与 ALFRED_OFFLINE_REPLY_FILE 同时设置（二选一）"
         ),
         (Some(path), None) => {
-            let plan = read_offline_plan(&path)?;
-            validate_dagspec(&plan, request)?;
+            let plan = read_offline_plan(&path, request)?;
             let resp = serde_json::to_string_pretty(&plan).context("serialize offline plan")?;
             Ok((
                 ConverseOutcome::Instructions {
@@ -406,16 +437,28 @@ fn converse_offline(request: &OwnerRequest) -> Result<(ConverseOutcome, String)>
             ))
         }
         (None, None) => bail!(
-            "ALFRED_OFFLINE/ALFRED_PLANNER_OFFLINE=1 requires ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json> or ALFRED_OFFLINE_REPLY_FILE=<reply.txt>"
+            "ALFRED_OFFLINE/ALFRED_PLANNER_OFFLINE=1 requires ALFRED_OFFLINE_PLAN_FILE=<DagSpec.json|instructions.json> or ALFRED_OFFLINE_REPLY_FILE=<reply.txt>"
         ),
     }
 }
 
-/// 离线模式读注入的计划文件（DagSpec JSON）。
-fn read_offline_plan(path: &str) -> Result<DagSpec> {
+/// 离线模式读注入的计划文件：DagSpec JSON（对象）或建图指令序列（数组）。
+///
+/// 数组形态与宿主 pi 产出的 instructions.json 同构，走同一条解析路径
+/// （`instructions_to_dagspec` 单一真源——含 validate 与大参考卷兜底，与
+/// 真跑路径完全同构）；对象形态是既有注入契约（终态 DagSpec 直通 +
+/// validate）。两种形态都显式校验（无静默出口）。
+fn read_offline_plan(path: &str, request: &OwnerRequest) -> Result<DagSpec> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("read offline plan {}", path))?;
-    serde_json::from_str(&text).with_context(|| format!("parse offline plan {}", path))
+    if text.trim_start().starts_with('[') {
+        return instructions_to_dagspec(&text, request)
+            .with_context(|| format!("parse offline plan {}", path));
+    }
+    let plan: DagSpec =
+        serde_json::from_str(&text).with_context(|| format!("parse offline plan {}", path))?;
+    validate_dagspec(&plan, request)?;
+    Ok(plan)
 }
 
 /// 剥 markdown 代码围栏 / 只取首个平衡 JSON 数组。
@@ -446,6 +489,8 @@ pub fn strip_fences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alfred_core::contract::Contract;
+    use alfred_core::dagspec::{Edge, PlanNode};
 
     /// 测试参考材料目录：一次性建、drop 时整目录清理（含 >5MB 大文件）。
     struct RefFixture(PathBuf);
@@ -587,5 +632,218 @@ mod tests {
         let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
         assert_eq!(dag.nodes[0].time_limit_secs, Some(2400));
         assert!(dag.nodes[0].contract.prompt.contains(LARGE_VOLUME_HINT_MARKER));
+    }
+
+    // ---------- M2 多节点：validate 放开 + 依赖图校验（错误中性化） ----------
+
+    /// 最小合法节点（契约非空 + 声明工作区子目录）。
+    fn mn_node(id: &str) -> PlanNode {
+        PlanNode::new(
+            id,
+            format!("{id} 摘要"),
+            Contract {
+                prompt: format!("做 {id}"),
+                acceptance_criteria: format!("{id} 完成"),
+                reviewer_models: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn multinode_instructions_edges_and_topological_order() {
+        // M2：多节点指令（add_node×2 + add_edge）放行；故意先声明后继再声明
+        // 前置——dagspec 按依赖拓扑序重排（前置在前），边原样随图。
+        let text = r#"[
+{"op":"begin","request_id":"req-1"},
+{"op":"add_node","id":"task-2","summary":"后继：基于前置产物写报告",
+"contract":{"prompt":"基于 task-1 产出的 notes.md 写报告","acceptance_criteria":"报告覆盖要点"},
+"sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["src"]}},
+{"op":"add_node","id":"task-1","summary":"前置：整理要点",
+"contract":{"prompt":"整理要点写入 notes.md","acceptance_criteria":"notes.md 存在"},
+"sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["src"]}},
+{"op":"add_edge","from":"task-1","to":"task-2"},
+{"op":"commit"}]"#;
+        let dag = instructions_to_dagspec(text, &owner_request()).unwrap();
+        assert_eq!(
+            dag.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec!["task-1", "task-2"],
+            "节点应按依赖拓扑序排列（前置在前，即使后声明）"
+        );
+        assert_eq!(
+            dag.edges,
+            vec![Edge {
+                from: "task-1".into(),
+                to: "task-2".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn offline_plan_file_accepts_both_forms_multinode() {
+        // 离线注入两形态（M2）：对象 = 终态 DagSpec 直通放行；数组 = 建图指令
+        // 序列走 instructions_to_dagspec 同一条解析路径。
+        let dir = std::env::temp_dir().join(format!("alfred-offline-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dag = DagSpec {
+            request_id: "req-1".into(),
+            nodes: vec![mn_node("task-1"), mn_node("task-2")],
+            edges: vec![Edge {
+                from: "task-1".into(),
+                to: "task-2".into(),
+            }],
+        };
+        let obj = dir.join("plan-object.json");
+        std::fs::write(&obj, serde_json::to_string(&dag).unwrap()).unwrap();
+        assert_eq!(
+            read_offline_plan(obj.to_str().unwrap(), &owner_request()).unwrap(),
+            dag,
+            "对象形态：多节点 DagSpec 应直通放行（validate 不再限单节点）"
+        );
+
+        let inst = dir.join("instructions.json");
+        std::fs::write(
+            &inst,
+            r#"[{"op":"begin","request_id":"req-1"},
+{"op":"add_node","id":"task-1","summary":"前置","contract":{"prompt":"p","acceptance_criteria":"a"},"sandbox":{"workspace_subdirs":["src"]}},
+{"op":"add_node","id":"task-2","summary":"后继","contract":{"prompt":"p","acceptance_criteria":"a"},"sandbox":{"workspace_subdirs":["src"]}},
+{"op":"add_edge","from":"task-1","to":"task-2"},
+{"op":"commit"}]"#,
+        )
+        .unwrap();
+        let got = read_offline_plan(inst.to_str().unwrap(), &owner_request()).unwrap();
+        assert_eq!(got.nodes.len(), 2);
+        assert_eq!(
+            got.edges,
+            vec![Edge {
+                from: "task-1".into(),
+                to: "task-2".into()
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_graph_errors_are_neutral() {
+        // M2：依赖图校验错误中性化（照 disguise.rs 范式）——不携带内部实体名
+        // 与英文诊断词形（经属主转述也不泄漏治理词形），保留节点 id 定位细节。
+        let cases: Vec<(&str, DagSpec, &[&str])> = vec![
+            (
+                "环",
+                DagSpec {
+                    request_id: "req-1".into(),
+                    nodes: vec![mn_node("task-1"), mn_node("task-2")],
+                    edges: vec![
+                        Edge {
+                            from: "task-1".into(),
+                            to: "task-2".into(),
+                        },
+                        Edge {
+                            from: "task-2".into(),
+                            to: "task-1".into(),
+                        },
+                    ],
+                },
+                &["先后关系成了环", "task-1", "task-2"],
+            ),
+            (
+                "悬空边",
+                DagSpec {
+                    request_id: "req-1".into(),
+                    nodes: vec![mn_node("task-1")],
+                    edges: vec![Edge {
+                        from: "task-1".into(),
+                        to: "ghost".into(),
+                    }],
+                },
+                &["指向了不存在的任务", "ghost"],
+            ),
+            (
+                "重复边",
+                DagSpec {
+                    request_id: "req-1".into(),
+                    nodes: vec![mn_node("task-1"), mn_node("task-2")],
+                    edges: vec![
+                        Edge {
+                            from: "task-1".into(),
+                            to: "task-2".into(),
+                        },
+                        Edge {
+                            from: "task-1".into(),
+                            to: "task-2".into(),
+                        },
+                    ],
+                },
+                &["声明了两次", "task-1 -> task-2"],
+            ),
+        ];
+        for (name, dag, expected) in &cases {
+            let err = validate_dagspec(dag, &owner_request())
+                .unwrap_err()
+                .to_string();
+            for word in *expected {
+                assert!(err.contains(word), "{name}: err = {err}");
+            }
+            for tech in [
+                "dagspec",
+                "cycle",
+                "unknown node",
+                "duplicate edge",
+                "references",
+            ] {
+                assert!(!err.contains(tech), "{name}: err 含技术词 {tech}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn validate_alignment_errors_are_neutral() {
+        // 对齐错误同样中性化：不携带内部实体名（dagspec/request.id 词形）。
+        let wrong_id = DagSpec {
+            request_id: "req-other".into(),
+            nodes: vec![mn_node("task-1")],
+            edges: vec![],
+        };
+        let err = validate_dagspec(&wrong_id, &owner_request())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("req-other") && err.contains("req-1"),
+            "err = {err}"
+        );
+        assert!(!err.contains("dagspec"), "err = {err}");
+
+        let empty = DagSpec {
+            request_id: "req-1".into(),
+            nodes: vec![],
+            edges: vec![],
+        };
+        let err = validate_dagspec(&empty, &owner_request())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("没有任何任务"), "err = {err}");
+    }
+
+    #[test]
+    fn converse_prompt_teaches_multinode_dependency() {
+        // M2 prompt 契约：教 add_edge 依赖声明 + 节点粒度（何时拆/何时不拆）。
+        // 防回归锚点（离线 e2e 绕过 prompt，真跑契约只能靠这里防守）。
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("add_edge"),
+            "缺 add_edge 教学"
+        );
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("from 完成后 to 才开工"),
+            "缺依赖方向语义教学"
+        );
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("可独立验收的工作单元"),
+            "缺节点粒度教学"
+        );
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("单一交付物内部的步骤不要拆"),
+            "缺何时不拆的粒度指导"
+        );
     }
 }

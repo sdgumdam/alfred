@@ -22,6 +22,8 @@
 #
 # Tier 1 用例：
 #   caseA 离线 converse（driver run → 计划 → mockllm 审查 unscored → 升级挂起）
+#   caseA2 多节点离线 converse（M2：指令序列注入 add_node×2 + add_edge →
+#         validate 放行 → dagspec 落盘断言 nodes/edges/拓扑序 → 审查 unscored 升级）
 #   caseB feed revise 属主补充（维护者已回退——session_doc 保持空文档语义）
 #   caseC P1-2 Reply 多轮续入（规划器答复 → state=Planning → driver feed revise
 #         续入属主答复 → 重规划 → 升级挂起）
@@ -163,6 +165,76 @@ state = json.load(open(os.path.join(run, "state.json")))
 assert state["state_machine"]["state"] == "escalated", f"state={state['state_machine']['state']}"
 PY
   echo "PASS(caseA): 离线 converse 产物（dagspec/llm-calls/conversation.json）+ 审查出错升级"
+
+  # ---- Case A2：多节点离线 converse（M2：指令序列注入 → validate 放行 →
+  # dagspec 断言 nodes/edges/拓扑序 → 审查 unscored → 升级挂起）----
+  # 注入文件用建图指令序列（与宿主 pi 产出的 instructions.json 同构，走
+  # instructions_to_dagspec 同一条解析路径）；故意先声明后继 task-2 再声明
+  # 前置 task-1，断言 dagspec 落盘按拓扑序重排（前置在前）。
+  CASE_A2="$R6B_RUNS/run-r6b-offline-multinode"
+  rm -rf "$CASE_A2"
+  mkdir -p "$CASE_A2"
+  cat > "$CASE_A2/request.json" <<'JSON'
+{
+  "id": "req-r6b-mn",
+  "title": "notes then report",
+  "description": "First create notes.md summarizing the key points as bullet items. Then, based on notes.md, create report.md covering the same points as full sentences.",
+  "acceptance_criteria": "notes.md exists with bullet items; report.md exists and covers the same points as full sentences",
+  "created_at": "2026-09-09T00:00:00Z"
+}
+JSON
+  cat > "$CASE_A2/instructions.json" <<'JSON'
+[
+  {"op":"begin","request_id":"req-r6b-mn"},
+  {"op":"add_node","id":"task-2","summary":"write report.md from notes.md",
+   "contract":{"prompt":"Based on the notes.md produced by the prerequisite task, create report.md in the workspace covering the same points as full sentences.","acceptance_criteria":"report.md exists and covers the same points as full sentences"},
+   "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["src"]}},
+  {"op":"add_node","id":"task-1","summary":"write notes.md bullet points",
+   "contract":{"prompt":"Create notes.md in the workspace summarizing the key points as bullet items.","acceptance_criteria":"notes.md exists and contains bullet items"},
+   "sandbox":{"volumes":[],"runtime":null,"packages":[],"network":false,"workspace_subdirs":["src"]}},
+  {"op":"add_edge","from":"task-1","to":"task-2"},
+  {"op":"commit"}
+]
+JSON
+  echo "[r6b] caseA2: driver run（离线多节点指令注入 → validate 放行 → 审查 unscored → escalated） ..."
+  ALFRED_OFFLINE=1 ALFRED_OFFLINE_PLAN_FILE="$CASE_A2/instructions.json" \
+  cargo run --quiet -p alfred-cli --bin alfred -- run \
+    --request "$CASE_A2/request.json" \
+    --run-dir "$CASE_A2" \
+    --time-limit 60 \
+    --review-time-limit 60 \
+    --planner-time-limit 60
+
+  python3 - "$CASE_A2" <<'PY' || { echo "FAIL(caseA2): 多节点 dagspec 断言" >&2; exit 1; }
+import json, os, sys
+run = sys.argv[1]
+# dagspec 落盘（多节点放行：两节点 + 依赖边原样随图）
+assert os.path.exists(os.path.join(run, "dagspec.json")), "dagspec.json missing"
+dag = json.load(open(os.path.join(run, "dagspec.json")))
+assert dag["request_id"] == "req-r6b-mn", f"request_id={dag['request_id']}"
+ids = [n["id"] for n in dag["nodes"]]
+assert ids == ["task-1", "task-2"], \
+    f"nodes={ids}（应按拓扑序重排：前置 task-1 在前，即使声明在后）"
+assert dag["edges"] == [{"from": "task-1", "to": "task-2"}], f"edges={dag['edges']}"
+# 拓扑序性质：每条边 from 先于 to
+pos = {nid: i for i, nid in enumerate(ids)}
+for e in dag["edges"]:
+    assert pos[e["from"]] < pos[e["to"]], f"非拓扑序: {e}"
+# llm-calls 记录：离线 converse（指令注入同样落审计）
+recs = sorted(os.listdir(os.path.join(run, "llm-calls")))
+rec = json.load(open(os.path.join(run, "llm-calls", recs[0])))
+assert rec["role"] == "converse" and rec["offline"] is True, \
+    f"role={rec['role']} offline={rec['offline']}"
+# planning_done 审计：node_count=2 + 双节点摘要
+events = [json.loads(l) for l in open(os.path.join(run, "audit.jsonl"))]
+done = [e for e in events if e["event"] == "planning_done"]
+assert done and done[0]["data"]["node_count"] == 2, f"planning_done={done}"
+# 审查 unscored → 升级挂起（执行面多节点属后续里程碑，计划不停在执行前）
+state = json.load(open(os.path.join(run, "state.json")))
+assert state["state_machine"]["state"] == "escalated", \
+    f"state={state['state_machine']['state']}"
+PY
+  echo "PASS(caseA2): 多节点指令注入 → dagspec nodes/edges/拓扑序 + 审查出错升级挂起"
 
   # ---- Case B：feed revise 属主补充（维护者已重做：ConverseDone 滚动维护——
   # 重规划轮 converse 落定后维护者更新 session_doc；离线经

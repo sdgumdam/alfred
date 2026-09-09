@@ -99,7 +99,7 @@ env 覆盖：
 | `ALFRED_CONFIG` | config.yml 路径覆盖 |
 | `ALFRED_INSPECT` | inspect CLI 路径覆盖 |
 | `ALFRED_IMAGE` | 沙箱镜像覆盖（缺省 `alfred-executor:latest`） |
-| `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE=<dag.json>` | 规划器离线确定性直通（e2e 用） |
+| `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE=<dag.json\|instructions.json>` | 规划器离线确定性直通（e2e 用；DagSpec 或建图指令序列，指令走与真跑同一条解析路径） |
 | `ALFRED_AGT_DIR=<dir>` | AGT 策略目录覆盖（含 `agt-policy.ts` + `policy.json`；未设 = 内置默认策略 `docker/agt/<role>/`） |
 | `ALFRED_AGT_DISABLE=1` | 显式关闭 AGT 拦写层（opt-out，压过 `ALFRED_AGT_DIR`） |
 

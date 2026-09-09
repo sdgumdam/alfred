@@ -123,7 +123,7 @@ Environment overrides:
 | `ALFRED_CONFIG` | config.yml path override |
 | `ALFRED_INSPECT` | inspect CLI path override |
 | `ALFRED_IMAGE` | sandbox image override (default `alfred-executor:latest`) |
-| `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE=<dag.json>` | planner offline deterministic bypass (used by e2e) |
+| `ALFRED_OFFLINE=1` + `ALFRED_OFFLINE_PLAN_FILE=<dag.json\|instructions.json>` | planner offline deterministic bypass (used by e2e; accepts a finished DagSpec or a build-instruction array — the latter goes through the same parse path as a real run) |
 | `ALFRED_AGT_DIR=<dir>` | AGT policy dir override (holding `agt-policy.ts` + `policy.json`; unset = built-in default `docker/agt/<role>/`) |
 | `ALFRED_AGT_DISABLE=1` | explicitly turn the AGT write-interception layer off (opt-out; beats `ALFRED_AGT_DIR`) |
 
