@@ -196,6 +196,7 @@ s5_exec_review_cycle() {
   export ALFRED_OFFLINE_PLAN_FILE="$R/fix/plan-faithful.json"
   export ALFRED_EXEC_REVIEW_OFFLINE=1
   unset ALFRED_OFFLINE 2>/dev/null || true
+  run_run "$R/run" "$R/fix/request.json"
   # M3 起执行侧新增节点轨迹审计：node_started/node_completed（节点级）+
   # execution_succeeded（全图完成门，HEAD 形态不变）。
   expect_audit "$R/run" s5 \

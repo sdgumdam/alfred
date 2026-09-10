@@ -14,8 +14,8 @@ pub mod verdict;
 
 pub use exec_review::{default_exec_review_dir, execute_exec_review, ExecReviewOptions, ExecReviewOutcome};
 pub use host::{
-    run_exec_review_on_host, run_plan_review_on_host, ReviewerHostOptions,
-    PLAN_REVIEW_SYSTEM_PROMPT, EXEC_REVIEW_SYSTEM_PROMPT,
+    exec_review_inputs, run_exec_review_on_host, run_plan_review_on_host,
+    ReviewerHostOptions, PLAN_REVIEW_SYSTEM_PROMPT, EXEC_REVIEW_SYSTEM_PROMPT,
 };
 pub use plan_review::{execute_plan_review, PlanReviewOptions, PlanReviewOutcome};
 pub use verdict::{

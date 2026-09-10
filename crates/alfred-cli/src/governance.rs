@@ -873,12 +873,11 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
             .dagspec
             .clone()
             .context("governance state ExecReviewing without dagspec")?;
-        let node = dagspec
-            .nodes
-            .first()
-            .context("dagspec has no nodes (exec review)")?
-            .clone();
-        let contract = node.contract;
+        // M4：执行审查输入 = 全图契约——单节点 = 首节点契约（既有形态），多节点
+        // = 全节点契约拼接（execute_exec_review / exec_review_inputs 构建
+        // dagspec.json 输入：每节点 prompt/验收标准 + sandbox.workspace_subdirs
+        // 产物归属 + edges 依赖序），reviewer 一次看全图判"全图执行忠实度"。
+        // 旧形态 nodes.first() 对全 ws 判产物 = 多节点漏审下游节点。
         let conversation = load_conversation(&ctx.run_dir)
             .map_err(anyhow::Error::msg)
             .ok()
@@ -897,8 +896,7 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
             &opts,
             &ctx.reviewer_model,
             &run.request,
-            &contract,
-            &node.sandbox.workspace_subdirs,
+            &dagspec,
             conversation.as_ref(),
         )?;
         (

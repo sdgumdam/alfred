@@ -82,16 +82,22 @@ pub fn default_exec_review_dir() -> PathBuf {
     base.join(short_id("execreview"))
 }
 
-/// 执行审查宿主驱动：request + 契约全字段 + 对话记录 + ws 全量 → ExecVerdict。
+/// 执行审查宿主驱动：request + 全图契约 + 对话记录 + ws 全量 → ExecVerdict。
 ///
+/// M4 多节点：`dagspec` 是审查主输入的真源——单节点 = 首节点契约（既有
+/// 形态，`contract.json` + `sandbox.json` 输入字节不变）；多节点 = 全节点
+/// 契约拼接（`dagspec.json`：每节点 prompt/验收标准 + `sandbox.
+/// workspace_subdirs` 产物归属 + `edges` 依赖序，见 [`exec_review_inputs`]），
+/// reviewer 一次看全图判"全图执行忠实度"——verdict 语义不变（C/I/P +
+/// failure_class，一个结论管全图）。reviewer 全可见原则不变：宿主 pi 自由读
+/// run 目录（ws 全量 / 对话记录 / verdict 历史）。
 /// 失败路径显式 `bail!`（不悄悄放行）：宿主 pi 失败 → `fail_exec_review` 落盘后
 /// 上报；verdict 解析失败 → unscored 兜底（调用方据此升级属主）。
 pub fn execute_exec_review(
     opts: &ExecReviewOptions,
     model: &ExecutorModel,
     request: &OwnerRequest,
-    contract: &Contract,
-    workspace_subdirs: &[String],
+    dagspec: &alfred_core::dagspec::DagSpec,
     conversation: Option<&alfred_core::conversation::ConversationLog>,
 ) -> Result<ExecReviewOutcome> {
     let started_at = now_rfc3339();
@@ -102,24 +108,45 @@ pub fn execute_exec_review(
     let run_dir = &opts.host.run_dir;
 
     std::fs::create_dir_all(run_dir).with_context(|| format!("create exec review dir {}", run_dir.display()))?;
-    append_audit(run_dir, "exec_review_started", &serde_json::json!({ "run_id": run_id, "request_id": request.id }))?;
+    append_audit(
+        run_dir,
+        "exec_review_started",
+        &serde_json::json!({ "run_id": run_id, "request_id": request.id, "node_count": dagspec.nodes.len() }),
+    )?;
 
-    // 输入落盘（P9 证据）：request + 契约全字段
+    // 空 dagspec 显式拒绝（治理环同款文案；审查输入无契约可写）。
+    if dagspec.nodes.is_empty() {
+        bail!("dagspec has no nodes (exec review)");
+    }
+    // state.json 契约字段（schema 兼容）：单节点 = 该节点契约；多节点 = 首节点
+    // 契约占位——多节点审查主输入是全图（inputs/dagspec.json），首节点契约
+    // 只满足 StateFile.contract 字段形态，不代表审查范围。
+    let contract = &dagspec.nodes[0].contract;
+
+    // 输入落盘（P9 证据）：request + 审查主输入。单节点 = 首节点契约（既有
+    // contract.json）；多节点 = 全图 DagSpec（M4：按首节点契约判全 ws =
+    // 漏审下游节点，inputs/ 里的拼接形态见 exec_review_inputs）。
     std::fs::write(
         run_dir.join("request.json"),
         serde_json::to_string_pretty(request).context("serialize OwnerRequest")?,
     )?;
-    std::fs::write(
-        run_dir.join("contract.json"),
-        serde_json::to_string_pretty(contract).context("serialize Contract")?,
-    )?;
+    if dagspec.nodes.len() > 1 {
+        std::fs::write(
+            run_dir.join("dagspec.json"),
+            serde_json::to_string_pretty(dagspec).context("serialize DagSpec")?,
+        )?;
+    } else {
+        std::fs::write(
+            run_dir.join("contract.json"),
+            serde_json::to_string_pretty(contract).context("serialize Contract")?,
+        )?;
+    }
 
     let out = match run_exec_review_on_host(
         &opts.host,
         model,
         request,
-        contract,
-        workspace_subdirs,
+        dagspec,
         conversation,
         &opts.ws_dir,
     ) {
