@@ -1975,4 +1975,67 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+
+    #[test]
+    fn timed_out_amplification_reaches_next_attempt_render_input() {
+        // G2 回归锁（放大值透传链）：timed_out 机械重跑的放大值必须一路传到
+        // 下一轮 execute_run 的渲染输入——放大只落 dagspec 一处（run.dagspec
+        // 单一真源），execution_step 取 node.resolved_time_limit_secs 渲染
+        // driver.py。链路：route_mechanical_failure 放大 →
+        // execution_failure_intent（effects.dagspec 通道）→ commit_intent flush
+        //（dagspec.json 落盘 + run.dagspec 注入）→ 下一轮 pending_node →
+        // resolved_time_limit_secs = 放大值（跨进程 reload 同值）。真跑渲染
+        // 断言（exec-N/driver.py 渲染放大后的 TIME_LIMIT）由 e2e r3 case2 覆盖。
+        let (mut run, ctx, dir) = run_in_executing("g2-amplify");
+        let dag = run.dagspec.clone().unwrap(); // task-1 未声明 → 治理缺省 600
+        let node = dag.nodes[0].clone();
+
+        // exec-1 timed_out 失败的路由（execute_run Err 分支同构——真源
+        // execution_failure_intent，非重抄）。
+        let err = anyhow::anyhow!("container driver timed out after 600s");
+        let intent =
+            execution_failure_intent(&mut run, &dag, &node, Some("timed_out"), &err, false);
+        commit_intent(&mut run, &ctx, intent).unwrap();
+
+        // 写回双落点：dagspec.json 磁盘 + run.dagspec 进程内均为放大值。
+        let on_disk: DagSpec =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("dagspec.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk.nodes[0].time_limit_secs,
+            Some(1200),
+            "dagspec.json 落盘放大值"
+        );
+        assert_eq!(
+            run.dagspec.as_ref().unwrap().nodes[0].time_limit_secs,
+            Some(1200),
+            "run.dagspec 注入放大值"
+        );
+
+        // 下一轮 execution_step 的渲染输入（pending_node → resolved，即
+        // RunOptions.time_limit_secs 的唯一来源）= 放大值，不回落治理缺省 600。
+        let next = pending_node(run.dagspec.as_ref().unwrap(), &run.completed_nodes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.resolved_time_limit_secs(run.options.exec_time_limit_secs),
+            1200,
+            "下轮渲染输入必须取放大值（单一真源 run.dagspec）"
+        );
+        // 跨进程面：persist → reload 后渲染输入同值（TUI/chat resume 路径）。
+        let reloaded = load_governance_run(&dir).unwrap();
+        let next = pending_node(
+            reloaded.dagspec.as_ref().unwrap(),
+            &reloaded.completed_nodes,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            next.resolved_time_limit_secs(reloaded.options.exec_time_limit_secs),
+            1200,
+            "reload 后渲染输入同值"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
