@@ -73,6 +73,7 @@ pub(crate) const CONVERSE_SYSTEM_PROMPT: &str = r#"你是治理系统的规划�
 - 节点粒度 = 一个可独立验收的工作单元（有自己的任务描述与验收标准）。需求包含多个不同验收物或多阶段产物（如先整理数据、再基于数据写报告），或后一部分必须以前一部分的产物为基础时，拆成多节点；单一交付物内部的步骤不要拆（如"写一个 hello.txt"是一个节点，不要拆成"起草内容"+"写入文件"两个节点）。
 - 多节点之间的依赖用 add_edge 声明：from 是 to 的前置，from 完成后 to 才开工。add_edge 的 from/to 必须引用已 add_node 声明的节点 id；不允许成环（a 依赖 b、b 又依赖 a）、不允许重复声明同一依赖；相互没有依赖的节点不连线。
 - 后继节点的任务描述按"前置产物已就绪"来写（如"基于 task-1 产出的 notes.md 写报告"），不要重复前置节点要做的工作。
+- 跨节点产物传递必须与工作区子目录声明一致：后继节点要读前置节点的产物时，前置产物落点所在的子目录必须也在后继节点的 workspace_subdirs 中声明（或将交接产物约定写进双方共同声明的子目录）；契约中声称可读的每个前置产物路径，都必须落在自己声明的工作区子目录范围内——前置产物所在子目录未声明，该产物就不在后继的工作区内，"基于前置产物"的契约前提落空。反例（勿再犯）：task-1 声明 ["inventory"] 产出 inventory.md，task-2 契约称"task-1 产出的 inventory.md 已就绪"却只声明 ["summary"]——inventory 子目录不在 task-2 声明内，inventory.md 对 task-2 不可见；正解：task-2 声明 ["summary","inventory"]，按挂载语义在 /workspace/inventory/ 下读到 inventory.md（或双方约定交接产物写进共同声明的子目录）。
 - 每个节点的 contract.prompt 与 acceptance_criteria 必须非空。
 - 每个节点必须声明非空 workspace_subdirs（sandbox.workspace_subdirs，工作区子目录列表，如 ["src"]）：声明的是该节点可见/可写的工作区范围（节点只能看到这些子目录），这是强制约束；空/缺省声明 = 计划不合格。挂载语义：首个子目录挂为该节点工作区根 /workspace，其余子目录挂为 /workspace/<子目录>。
 - workspace_subdirs 必须声明具体子目录名：按任务产物位置声明（如任务写 src/ 下则声明 ["src"]）；禁止声明 "."（工作区根，挂载语义下根由系统接管，声明子目录必须是具体相对目录）；禁止声明与挂载根同名的目录名（如 "workspace"，避免嵌套歧义）；任务描述（contract.prompt）里"根目录"措辞应与声明的子目录一致（首个子目录即该节点工作区根 /workspace）。
@@ -1130,6 +1131,42 @@ mod tests {
         assert!(
             CONVERSE_SYSTEM_PROMPT.contains("单一交付物内部的步骤不要拆"),
             "缺何时不拆的粒度指导"
+        );
+    }
+
+    #[test]
+    fn converse_prompt_teaches_crossnode_artifact_visibility() {
+        // M2 补强 prompt 契约（真跑实证缺口）：跨节点产物传递与工作区子目录
+        // 声明一致——task-2 契约称 inventory.md 就绪、workspace_subdirs 只声明
+        // ["summary"]，前置产物落点子树未声明 → 挂载不可见，计划审查挂载一致
+        // 性打回。离线 e2e 绕过 prompt，真跑契约只能靠这里防守（锚点断言）。
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("跨节点产物传递必须与工作区子目录声明一致"),
+            "缺跨节点产物传递与声明一致的总则教学"
+        );
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains(
+                "前置产物落点所在的子目录必须也在后继节点的 workspace_subdirs 中声明"
+            ),
+            "缺后继声明覆盖前置产物落点子树的教学"
+        );
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("双方共同声明的子目录"),
+            "缺交接产物写进共同声明子目录的约定教学"
+        );
+        assert!(
+            CONVERSE_SYSTEM_PROMPT
+                .contains("声称可读的每个前置产物路径，都必须落在自己声明的工作区子目录范围内"),
+            "缺契约可读路径必须落在声明范围内的自检教学"
+        );
+        // 反例锚点：真跑事故形态（契约声称就绪 vs 声明未覆盖）+ 正解（声明覆盖）。
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("inventory.md 对 task-2 不可见"),
+            "缺反例锚点：前置产物落点子目录未声明 → 对后继不可见"
+        );
+        assert!(
+            CONVERSE_SYSTEM_PROMPT.contains("[\"summary\",\"inventory\"]"),
+            "缺正解锚点：后继声明覆盖前置产物所在子目录"
         );
     }
 }
