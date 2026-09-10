@@ -38,27 +38,136 @@
 //! `planner/agt/audit/audit.jsonl` 实时打探查/读取/拦截行，动作真源=审计、此处
 //! 仅呈现层投影）、`[driver]` CLI driver 状态行（run/feed/status 保留不动）、
 //! `[chat]` 本壳提示音。
+//!
+//! # S2a 输出双发（TUI 汇合，覆盖对照表见 chat_events.rs）
+//!
+//! 本壳全部 owner 可见输出点位经 [`SessionSink`]：REPL 路径（管道/降级）只打印
+//! ——与原 println!/eprintln! 逐字节等价（e2e chat.sh 硬底线）；TUI 路径打印
+//! 保留（进程 stdout/stderr 已被 chat_tui 重定向进捕获管道，不毁界面）+
+//! [`ChatEvent`] 双发（载荷=去前缀正文，契约见 chat_events.rs）。会话主体
+//! [`chat_session`] 由 REPL（stdin 行）与 TUI 治理 worker（通道行，
+//! [`run_tui_session`]）共用——输入抽象 [`OwnerInput`]，语义单一真源不重写。
+//! governance.rs 侧 `[orchestrator]` 点位本切片不动（M3/S2b 另行接线），其
+//! stdout 由 chat_tui 捕获管道整串透传（TODO S2b 剥离）。
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use rustyline::error::ReadlineError;
 use rustyline::history::MemHistory;
 use rustyline::{Config, Editor};
 
+use alfred_cli::chat_events::{ActionKind, ChatEvent, ChatEventSender, ErrorStream};
 use alfred_cli::governance::{
     build_governance_context, default_governance_base, default_governance_dir, feed_owner_message,
     init_governance_run, load_governance_run, persist_governance_run, run_governance_loop,
     state_label,
 };
 use alfred_core::conversation::{load_conversation, ConversationRole, ConversationSource};
-use alfred_core::governance::{GovernanceOptions, GovernanceRun, GovernanceState, OwnerDecision};
+use alfred_core::governance::{
+    EscalationSource, GovernanceOptions, GovernanceRun, GovernanceState, OwnerDecision,
+};
 use alfred_core::request::OwnerRequest;
 use alfred_core::util::short_id;
 use anyhow::{bail, Context, Result};
+
+/// 会话输出 sink（S2a 双发接线，覆盖对照表的 chat.rs 侧点位）。
+///
+/// REPL（events=None）：只打印——与原点位逐字节等价（格式化在调用点完成后整体
+/// 交给 sink，sink 只做 `[chat] `/`[pi] ` 前缀拼接；e2e 管道路径硬底线）。TUI
+/// （events=Some）：打印保留（TUI 模式进程 stdout/stderr 已被 chat_tui 重定向进
+/// 捕获管道，不毁界面）+ ChatEvent 双发，载荷=去前缀正文（契约：前缀是 sink 的
+/// 渲染关注点）。`send` 吞错（接收端 Drop → false，TUI 先退不杀会话线程）。
+struct SessionSink {
+    events: Option<ChatEventSender>,
+}
+
+impl SessionSink {
+    /// REPL sink：无事件端（打印即全部）。
+    fn repl() -> Self {
+        Self { events: None }
+    }
+
+    /// TUI sink：打印 + 事件双发。
+    fn tui(events: ChatEventSender) -> Self {
+        Self { events: Some(events) }
+    }
+
+    /// `[chat] {body}` 状态/转写行 → [`ChatEvent::OrchestratorNotice`]（纯正文）。
+    fn notice(&self, body: String) {
+        println!("[chat] {body}");
+        if let Some(tx) = &self.events {
+            tx.send(ChatEvent::OrchestratorNotice(body));
+        }
+    }
+
+    /// `[pi] {body}` 答复/计划摘要 → [`ChatEvent::PiReply`]。
+    fn pi_reply(&self, body: String) {
+        println!("[pi] {body}");
+        if let Some(tx) = &self.events {
+            tx.send(ChatEvent::PiReply(body));
+        }
+    }
+
+    /// 挂起意见/升级原因（present_suspension 四分支，格式化留在数据所在地）→
+    /// [`ChatEvent::EscalationPrompt`]。
+    fn escalation(&self, reason: String, source: EscalationSource) {
+        println!("[chat] {reason}");
+        if let Some(tx) = &self.events {
+            tx.send(ChatEvent::EscalationPrompt { reason, source });
+        }
+    }
+
+    /// stdout 错误点位（run 初始化/state 持久化/操作失败）→
+    /// [`ChatEvent::Error`]（stream=Stdout）。
+    fn error_stdout(&self, body: String) {
+        println!("[chat] {body}");
+        if let Some(tx) = &self.events {
+            tx.send(ChatEvent::Error {
+                message: body,
+                stream: ErrorStream::Stdout,
+            });
+        }
+    }
+
+    /// stderr 错误点位（多挂起消歧清单）→ [`ChatEvent::Error`]（stream=Stderr）。
+    fn error_stderr(&self, body: String) {
+        eprintln!("[chat] {body}");
+        if let Some(tx) = &self.events {
+            tx.send(ChatEvent::Error {
+                message: body,
+                stream: ErrorStream::Stderr,
+            });
+        }
+    }
+}
+
+/// 属主输入源抽象：REPL（stdin/rustyline 行）与 TUI 治理 worker（通道行）同一
+/// read_line 语义（EOF/中断 → None 会话结束），会话主体 [`chat_session`] 泛型
+/// 复用不重写。
+trait OwnerInput {
+    fn read_line(&mut self, prompt: &str) -> Result<Option<String>>;
+}
+
+/// TUI 治理 worker 输入源：TUI submit → 通道行。prompt 不经通道（TUI 输入区
+/// 提示由 run 态派生，见 chat_events.rs 排除项）；发送端 Drop（TUI 退出）→
+/// None（EOF 语义，对齐 REPL Ctrl-D）。
+struct ChannelInput {
+    rx: mpsc::Receiver<String>,
+}
+
+impl OwnerInput for ChannelInput {
+    fn read_line(&mut self, _prompt: &str) -> Result<Option<String>> {
+        match self.rx.recv() {
+            Ok(line) => Ok(Some(line)),
+            Err(_) => Ok(None),
+        }
+    }
+}
 
 /// `alfred chat [--run-dir <dir>]`：owner 持续会话入口（TUI 方案 S1 起分流）。
 ///
@@ -87,34 +196,84 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
     }
 
     // TUI 降级门（方案 `.plans/施工方案-TUI界面.md`）：交互双 tty 且 TERM 有效
-    // → TUI 呈现层（S1 骨架，见 chat_tui.rs）；否则（管道/重定向/dumb 终端）
-    // 降级下方既有 REPL 路径——非 tty 管道行为逐字节不变，e2e 硬底线。TUI
-    // 初始化/运行失败（极罕见）打错误回退 REPL，保持入口恒可用。
+    // → TUI 呈现层（S2a 汇合：治理 worker 线程跑 chat_session，事件/看板喂
+    // chat_tui 事件循环，见 chat_tui.rs）；否则（管道/重定向/dumb 终端）降级
+    // 下方既有 REPL 路径——非 tty 管道行为逐字节不变，e2e 硬底线。TUI 初始
+    // 化/运行失败（极罕见）打错误回退 REPL，保持入口恒可用。
     if crate::chat_tui::tui_supported() {
-        match crate::chat_tui::run() {
+        match crate::chat_tui::run(run_dir_flag.as_deref()) {
             Ok(()) => return Ok(()),
+            // 覆盖表 Error/Stderr 点位，但此处 TUI 已退（事件端无存）且即将
+            // 进入 REPL——直打 stderr 与 REPL sink 行为逐字节一致，双发无对象。
             Err(e) => eprintln!("[chat] TUI 运行失败（{e:#}），回退 REPL。"),
         }
     }
 
-    let (mut run_dir, mut run) = locate_run(run_dir_flag.as_deref())?;
+    chat_session_repl(run_dir_flag.as_deref())
+}
+
+/// REPL 路径（管道/降级）：stdin 逐行进、stdout 直打出（逐字节不变）。
+fn chat_session_repl(run_dir_flag: Option<&Path>) -> Result<()> {
+    let sink = SessionSink::repl();
+    chat_session(&sink, run_dir_flag, None, || ChatInput::new(&sink))
+}
+
+/// TUI 治理 worker 入口（chat_tui 起线程调用，主线程跑 TUI 事件循环）：通道
+/// 输入 + 事件 sink 跑同一会话主体 [`chat_session`]。Err（定位失败/reload 失败
+/// 等 REPL 会冒泡退出的错误）转 [`ChatEvent::Error`] 事件呈现后 worker 退出
+/// ——TUI 侧输入通道断开即知会话不可续。
+pub(crate) fn run_tui_session(
+    run_dir_flag: Option<PathBuf>,
+    input: mpsc::Receiver<String>,
+    events: ChatEventSender,
+    run_dir_out: Arc<Mutex<Option<PathBuf>>>,
+) {
+    let sink = SessionSink::tui(events);
+    let watch = run_dir_out;
+    if let Err(e) = chat_session(&sink, run_dir_flag.as_deref(), Some(&watch), || ChannelInput {
+        rx: input,
+    }) {
+        // REPL 由 main 的 Result 打印（"Error: …"）；TUI 经 Error 事件呈现。
+        sink.error_stderr(format!("{e:#}"));
+    }
+}
+
+/// 会话主体（REPL 与 TUI 治理 worker 共用）：定位 run → 横幅 → 断点恢复 →
+/// 状态循环。`input` 抽象属主输入源（stdin 行 / 通道行）；`sink` 承接全部
+/// owner 可见输出（REPL 直打 / TUI 双发）；`run_dir_watch`（TUI 传入）同步
+/// 当前 run 目录给看板轮询（dashboard snapshot 数据源），REPL 传 None。
+/// `make_input` 在断点恢复后原位构造输入器（REPL 行编辑初始化的 eprintln
+/// 保持原时序——逐字节底线）。
+fn chat_session<I: OwnerInput>(
+    sink: &SessionSink,
+    run_dir_flag: Option<&Path>,
+    run_dir_watch: Option<&Arc<Mutex<Option<PathBuf>>>>,
+    make_input: impl FnOnce() -> I,
+) -> Result<()> {
+    let publish_run_dir = |dir: &Path| {
+        if let Some(w) = run_dir_watch {
+            *w.lock() = Some(dir.to_path_buf());
+        }
+    };
+    let (mut run_dir, mut run) = locate_run(run_dir_flag, sink)?;
+    publish_run_dir(&run_dir);
 
     // REPL 横幅常显 run_dir（P3：owner 永远知道自己在哪个 run 上说话）；其余
     // 元数据极简——恢复态一行（run_id + state），需求不复述（升级包/终态呈现时
     // 仍可见）。
     match &run {
         Some(r) => {
-            println!("[chat] ── alfred chat（owner 持续会话；Ctrl-D 退出）──");
-            println!("[chat] run_dir: {}", run_dir.display());
-            println!(
-                "[chat] 恢复 run {}（state={}）",
+            sink.notice("── alfred chat（owner 持续会话；Ctrl-D 退出）──".into());
+            sink.notice(format!("run_dir: {}", run_dir.display()));
+            sink.notice(format!(
+                "恢复 run {}（state={}）",
                 r.run_id,
                 state_label(r.state())
-            );
+            ));
         }
         None => {
-            println!("[chat] ── alfred chat（owner 持续会话；Ctrl-D 退出）──");
-            println!("[chat] 未发现进行中的治理 run——请直接说需求。");
+            sink.notice("── alfred chat（owner 持续会话；Ctrl-D 退出）──".into());
+            sink.notice("未发现进行中的治理 run——请直接说需求。".into());
         }
     }
 
@@ -126,14 +285,14 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                 | GovernanceState::Executing
                 | GovernanceState::ExecReviewing
         ) {
-            match drive_loop(run.as_mut().expect("run"), &run_dir) {
+            match drive_loop(run.as_mut().expect("run"), &run_dir, sink) {
                 Ok(()) => {}
-                Err(e) => reload_after_error(&mut run, &run_dir, &e)?,
+                Err(e) => reload_after_error(&mut run, &run_dir, &e, sink)?,
             }
         }
     }
 
-    let mut input = ChatInput::new();
+    let mut input = make_input();
     // 终态呈现一次性标记（进入循环后第一次遇到终态时呈现结果，随后是需求收集态）。
     let mut fresh_terminal = false;
     loop {
@@ -148,27 +307,27 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                 // 同构：drive_loop 推进到挂起/终态；审查失败走治理降级（escalated
                 // 挂起拍板），不再"outcome 不落盘无法续跑"死锁。
                 let mut r = run.take().expect("intermediate state has run");
-                match drive_loop(&mut r, &run_dir) {
+                match drive_loop(&mut r, &run_dir, sink) {
                     Ok(()) => run = Some(r),
-                    Err(e) => reload_after_error(&mut run, &run_dir, &e)?,
+                    Err(e) => reload_after_error(&mut run, &run_dir, &e, sink)?,
                 }
             }
             Some(GovernanceState::PlanReviewing) | Some(GovernanceState::Executing) => {
                 let mut r = run.take().expect("intermediate state has run");
-                match drive_loop(&mut r, &run_dir) {
+                match drive_loop(&mut r, &run_dir, sink) {
                     Ok(()) => run = Some(r),
-                    Err(e) => reload_after_error(&mut run, &run_dir, &e)?,
+                    Err(e) => reload_after_error(&mut run, &run_dir, &e, sink)?,
                 }
             }
             // ── 需求收集态：无 run，或终态后的新需求 ──
             None | Some(GovernanceState::Completed) | Some(GovernanceState::Abandoned) => {
                 if let Some(r) = run.as_ref() {
                     if !fresh_terminal {
-                        present_terminal_result(r, &run_dir);
+                        present_terminal_result(r, &run_dir, sink);
                         fresh_terminal = true;
                     }
                 }
-                let Some(requirement) = collect_requirement(&mut input)? else {
+                let Some(requirement) = collect_requirement(&mut input, sink)? else {
                     break;
                 };
                 // 确定性转写（title 按 chars() 截断 ≤40，中文安全）；验收标准
@@ -179,19 +338,22 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                     requirement.clone(),
                     requirement,
                 );
-                let new_dir = next_new_run_dir(run_dir_flag.as_deref());
+                let new_dir = next_new_run_dir(run_dir_flag);
                 // 转写呈现极简：一行"已受理"（id/criteria 不再四行块铺陈）。
-                println!("[chat] 新建 run: {}", new_dir.display());
-                println!("[chat] 已受理：{}", request.title);
+                sink.notice(format!("新建 run: {}", new_dir.display()));
+                sink.notice(format!("已受理：{}", request.title));
                 let mut r =
                     match init_governance_run(&new_dir, request, GovernanceOptions::default()) {
                         Ok(r) => r,
                         Err(e) => {
-                            println!("[chat] run 初始化失败：{e:#}");
+                            sink.error_stdout(format!("run 初始化失败：{e:#}"));
                             continue;
                         }
                     };
-                match drive_loop(&mut r, &new_dir) {
+                // init 落盘 state.json 即发布——首段 drive 期间看板/顶栏就能
+                // 实时跟上（不必等 drive 返回；后续 Ok/reload 同目录不重发）。
+                publish_run_dir(&new_dir);
+                match drive_loop(&mut r, &new_dir, sink) {
                     Ok(()) => {
                         run_dir = new_dir;
                         run = Some(r);
@@ -200,7 +362,7 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                     Err(e) => {
                         // 尽力从 state.json 恢复；无 state.json（初始化即败）→ 回需求
                         // 收集态，残缺 run 目录留在磁盘可审计。
-                        reload_after_error(&mut run, &new_dir, &e).ok();
+                        reload_after_error(&mut run, &new_dir, &e, sink).ok();
                         if run.is_some() {
                             run_dir = new_dir;
                             fresh_terminal = false;
@@ -216,18 +378,18 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                 };
                 let line = line.trim();
                 if line.is_empty() {
-                    println!("[chat] 空输入已忽略。");
+                    sink.notice("空输入已忽略。".into());
                     continue;
                 }
                 // P1-2：对话态同样暴露放弃出口（P2a 转移表支持）；其余（含"重试"——
                 // Planning 无重跑语义）一律 Revise + 整行续入对话。
                 let (decision, message) = parse_planning_decision(line);
-                feed_and_present(&mut run, &run_dir, decision, &message)?;
+                feed_and_present(&mut run, &run_dir, decision, &message, sink)?;
             }
             // ── 挂起态：升级包呈现 + 确定性决策解析 ──
             Some(GovernanceState::PlanRejected) | Some(GovernanceState::Escalated) => {
                 let r = run.as_ref().expect("suspended state has run");
-                present_suspension(r, &run_dir);
+                present_suspension(r, &run_dir, sink);
                 let Some(line) =
                     input.read_line("[chat] 回复：重试 / 放弃 / 或直接说修改意见：")?
                 else {
@@ -235,15 +397,15 @@ pub fn cmd_chat(args: &[String]) -> Result<()> {
                 };
                 let line = line.trim();
                 if line.is_empty() {
-                    println!("[chat] 空输入已忽略。");
+                    sink.notice("空输入已忽略。".into());
                     continue;
                 }
                 let (decision, message) = parse_suspended_decision(line);
-                feed_and_present(&mut run, &run_dir, decision, &message)?;
+                feed_and_present(&mut run, &run_dir, decision, &message, sink)?;
             }
         }
     }
-    println!("[chat] 会话结束。");
+    sink.notice("会话结束。".into());
     Ok(())
 }
 
@@ -255,45 +417,46 @@ fn feed_and_present(
     run_dir: &Path,
     decision: OwnerDecision,
     message: &str,
+    sink: &SessionSink,
 ) -> Result<()> {
     let ctx = match build_governance_context(run_dir) {
         Ok(ctx) => ctx,
-        Err(e) => return reload_after_error(run, run_dir, &e),
+        Err(e) => return reload_after_error(run, run_dir, &e, sink),
     };
     let turns_before = conversation_turn_count(run_dir);
     let mut r = run.take().expect("feed state has run");
     // 过程呈现（工单：规划过程透明）：feed（Planning 续聊 / 挂起拍板重规划）
     // 内部续跑 converse——tail 窗口同 drive_loop；Abandon 等无 converse 的决策
     // 零输出、stop 即退。
-    let tail = PlannerAuditTail::spawn(run_dir);
+    let tail = PlannerAuditTail::spawn(run_dir, sink.events.clone());
     let fed = feed_owner_message(&mut r, &ctx, message, decision);
     tail.stop();
     match fed {
         Ok(outcome) => {
-            surface_planner_output(run_dir, &outcome.reply, turns_before);
-            println!("[chat] 当前状态: {}", state_label(outcome.state));
+            surface_planner_output(run_dir, &outcome.reply, turns_before, sink);
+            sink.notice(format!("当前状态: {}", state_label(outcome.state)));
             *run = Some(r);
         }
-        Err(e) => reload_after_error(run, run_dir, &e)?,
+        Err(e) => reload_after_error(run, run_dir, &e, sink)?,
     }
     Ok(())
 }
 
 /// 推进治理环到下一个挂起/终态/Reply 停驻（创建后首推与断点续跑共用）：
 /// loop 返回后 persist（P3 崩溃恢复显式化）+ planner 产出呈现。
-fn drive_loop(run: &mut GovernanceRun, run_dir: &Path) -> Result<()> {
+fn drive_loop(run: &mut GovernanceRun, run_dir: &Path, sink: &SessionSink) -> Result<()> {
     let ctx = build_governance_context(run_dir)?;
     let turns_before = conversation_turn_count(run_dir);
     // 过程呈现：converse（及维护者，同写 planner AGT 审计）执行期间 tail 审计打
     // 动作行；loop 返回（含 Err）先停 tail 再呈现——过程行先于答复/状态行打完。
-    let tail = PlannerAuditTail::spawn(run_dir);
+    let tail = PlannerAuditTail::spawn(run_dir, sink.events.clone());
     let result = run_governance_loop(run, &ctx);
     tail.stop();
     let reply = result?;
     if let Err(e) = persist_governance_run(run_dir, run) {
-        println!("[chat] state 持久化失败：{e:#}");
+        sink.error_stdout(format!("state 持久化失败：{e:#}"));
     }
-    surface_planner_output(run_dir, &reply, turns_before);
+    surface_planner_output(run_dir, &reply, turns_before, sink);
     Ok(())
 }
 
@@ -304,25 +467,29 @@ fn reload_after_error(
     run: &mut Option<GovernanceRun>,
     run_dir: &Path,
     e: &anyhow::Error,
+    sink: &SessionSink,
 ) -> Result<()> {
-    println!("[chat] 操作失败：{e:#}");
+    sink.error_stdout(format!("操作失败：{e:#}"));
     let fresh = load_governance_run(run_dir).with_context(|| {
         format!(
             "alfred chat: run 状态重载失败（{}）——会话无法继续",
             run_dir.join("state.json").display()
         )
     })?;
-    println!(
-        "[chat] 已从 state.json 重载（state={}），会话继续（可重试/放弃/改口）。",
+    sink.notice(format!(
+        "已从 state.json 重载（state={}），会话继续（可重试/放弃/改口）。",
         state_label(fresh.state())
-    );
+    ));
     *run = Some(fresh);
     Ok(())
 }
 
 /// 入口 run 定位（P3 发现规则）。返回 (run_dir, run)——run 为 None 表示全新会话
 /// （首个需求收集后建 run）。
-fn locate_run(explicit: Option<&Path>) -> Result<(PathBuf, Option<GovernanceRun>)> {
+fn locate_run(
+    explicit: Option<&Path>,
+    sink: &SessionSink,
+) -> Result<(PathBuf, Option<GovernanceRun>)> {
     if let Some(dir) = explicit {
         if dir.join("state.json").is_file() {
             let run = load_governance_run(dir)
@@ -368,15 +535,12 @@ fn locate_run(explicit: Option<&Path>) -> Result<(PathBuf, Option<GovernanceRun>
         }
     }
     if suspended.len() > 1 {
-        eprintln!(
-            "[chat] 发现 {} 个挂起 run（plan_rejected/escalated），需 --run-dir 指定要续的：",
+        sink.error_stderr(format!(
+            "发现 {} 个挂起 run（plan_rejected/escalated），需 --run-dir 指定要续的：",
             suspended.len()
-        );
+        ));
         for (dir, state, ts) in &suspended {
-            eprintln!(
-                "[chat]   {}（state={state}, updated_at={ts}）",
-                dir.display()
-            );
+            sink.error_stderr(format!("  {}（state={state}, updated_at={ts}）", dir.display()));
         }
         bail!("alfred chat: 多个挂起 run 并存，请用 --run-dir 消歧");
     }
@@ -408,14 +572,14 @@ fn parse_planning_decision(line: &str) -> (OwnerDecision, String) {
 
 /// 需求收集（单轮直提）：一行=需求（空行重问）。不追问验收标准——默认=需求
 /// 原文（pi 对话中需要澄清自然会问，Reply 分支）。EOF → None（会话结束）。
-fn collect_requirement(input: &mut ChatInput) -> Result<Option<String>> {
+fn collect_requirement<I: OwnerInput>(input: &mut I, sink: &SessionSink) -> Result<Option<String>> {
     loop {
         let Some(line) = input.read_line("[chat] 需求（一行；Ctrl-D 退出）：")? else {
             return Ok(None);
         };
         let line = line.trim().to_string();
         if line.is_empty() {
-            println!("[chat] 需求为空——请直接说需求。");
+            sink.notice("需求为空——请直接说需求。".into());
             continue;
         }
         return Ok(Some(line));
@@ -440,66 +604,86 @@ fn next_new_run_dir(explicit: Option<&Path>) -> PathBuf {
 /// 升级事件。属主全可见用原始 verdict（禁词净化是 planner 侧投影，不适用此处）。
 /// 砍掉 run_dir/需求复述/计划节点/attempts 等元数据行（run_dir 横幅已有；attempts
 /// 等细节在 audit.jsonl/state.json 可查）。
-fn present_suspension(run: &GovernanceRun, run_dir: &Path) {
-    println!(
-        "[chat] ── 治理挂起，等待属主拍板（state={}）──",
+fn present_suspension(run: &GovernanceRun, run_dir: &Path, sink: &SessionSink) {
+    sink.notice(format!(
+        "── 治理挂起，等待属主拍板（state={}）──",
         state_label(run.state())
-    );
+    ));
     match run.state() {
         GovernanceState::PlanRejected => match run.plan_verdicts.last() {
-            Some(v) => println!("[chat] 计划审查意见（打回）：{}", v.reason),
-            None => println!(
-                "[chat] 打回原因: {}",
-                last_escalation_reason(run_dir).unwrap_or_else(|| "未知".into())
+            Some(v) => sink.escalation(
+                format!("计划审查意见（打回）：{}", v.reason),
+                EscalationSource::PlanReview,
+            ),
+            None => sink.escalation(
+                format!(
+                    "打回原因: {}",
+                    last_escalation_reason(run_dir).unwrap_or_else(|| "未知".into())
+                ),
+                EscalationSource::PlanReview,
             ),
         },
-        GovernanceState::Escalated => match run.exec_verdicts.last() {
-            Some(v) => {
-                println!(
-                    "[chat] 执行审查意见（{:?}，来源 {:?}）：{}",
-                    v.value, run.escalation_source, v.explanation
-                );
+        GovernanceState::Escalated => {
+            // 升级来源：run 上的 Option<EscalationSource>（转移表 None 走执行侧
+            // 重跑路由，事件侧同口径取 Execution 兜底）。
+            let source = run.escalation_source.unwrap_or(EscalationSource::Execution);
+            match run.exec_verdicts.last() {
+                Some(v) => sink.escalation(
+                    format!(
+                        "执行审查意见（{:?}，来源 {:?}）：{}",
+                        v.value, run.escalation_source, v.explanation
+                    ),
+                    source,
+                ),
+                None => sink.escalation(
+                    format!(
+                        "升级原因: {}（来源 {:?}）",
+                        last_escalation_reason(run_dir).unwrap_or_else(|| "未知".into()),
+                        run.escalation_source
+                    ),
+                    source,
+                ),
             }
-            None => println!(
-                "[chat] 升级原因: {}（来源 {:?}）",
-                last_escalation_reason(run_dir).unwrap_or_else(|| "未知".into()),
-                run.escalation_source
-            ),
-        },
+        }
         _ => {}
     }
 }
 
 /// 终态呈现 + 新需求引导（工单⑤：呈现结果 + "新需求请直接说 / Ctrl-D 退出"）。
-fn present_terminal_result(run: &GovernanceRun, run_dir: &Path) {
+fn present_terminal_result(run: &GovernanceRun, run_dir: &Path, sink: &SessionSink) {
     match run.state() {
         GovernanceState::Completed => {
-            println!(
-                "[chat] ── run 完成（Completed）：需求「{}」已通过执行审查（验收 C）。",
+            sink.notice(format!(
+                "── run 完成（Completed）：需求「{}」已通过执行审查（验收 C）。",
                 run.request.title
-            );
-            println!(
-                "[chat] 产物: {}/ws（执行审查已 git diff 验收）",
+            ));
+            sink.notice(format!(
+                "产物: {}/ws（执行审查已 git diff 验收）",
                 run_dir.display()
-            );
+            ));
         }
         GovernanceState::Abandoned => {
-            println!(
-                "[chat] ── run 已放弃（Abandoned）：需求「{}」。",
+            sink.notice(format!(
+                "── run 已放弃（Abandoned）：需求「{}」。",
                 run.request.title
-            );
+            ));
         }
         _ => {}
     }
-    println!("[chat] 新需求请直接说（Ctrl-D 退出）。");
+    sink.notice("新需求请直接说（Ctrl-D 退出）。".into());
 }
 
 /// planner 产出呈现（P2 纠偏，单一真源 conversation.json M4-a 语义轮次）：
 /// reply 分支的答复直显；否则扫描本轮新增轮次，最后一个 planner ConverseReply 轮
 /// （= 建图分支的计划摘要）以 [pi] 呈现。
-fn surface_planner_output(run_dir: &Path, reply: &Option<String>, turns_before: usize) {
+fn surface_planner_output(
+    run_dir: &Path,
+    reply: &Option<String>,
+    turns_before: usize,
+    sink: &SessionSink,
+) {
     if let Some(r) = reply {
-        println!("[pi] {r}");
+        sink.pi_reply(r.clone());
         return;
     }
     let Ok(Some(log)) = load_conversation(run_dir) else {
@@ -509,7 +693,7 @@ fn surface_planner_output(run_dir: &Path, reply: &Option<String>, turns_before: 
         if turn.role == ConversationRole::Planner
             && turn.source == ConversationSource::ConverseReply
         {
-            println!("[pi] {}", turn.content);
+            sink.pi_reply(turn.content.clone());
             return;
         }
     }
@@ -579,14 +763,14 @@ struct PlannerAuditTail {
 }
 
 impl PlannerAuditTail {
-    fn spawn(run_dir: &Path) -> Self {
+    fn spawn(run_dir: &Path, events: Option<ChatEventSender>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let handle = std::thread::Builder::new()
             .name("planner-audit-tail".to_string())
             .spawn({
                 let stop = Arc::clone(&stop);
                 let path = alfred_planner::host::planner_audit_path(run_dir);
-                move || tail_planner_audit(&path, &stop)
+                move || tail_planner_audit(&path, &stop, events)
             })
             .ok();
         Self { stop, handle }
@@ -601,14 +785,17 @@ impl PlannerAuditTail {
     }
 }
 
-/// tail 主体：轮询步进（[`AuditTailState::poll`]）→ 打印；stop 置位后末轮再
-/// poll 一次（兜住停止前最后窗口落盘的行）退出。语义全在 poll（可测），线程
-/// 壳只有步进+打印。
-fn tail_planner_audit(path: &Path, stop: &AtomicBool) {
+/// tail 主体：轮询步进（[`AuditTailState::poll`]）→ 终端行 + 事件双发；stop
+/// 置位后末轮再 poll 一次（兜住停止前最后窗口落盘的行）退出。语义全在 poll
+/// （可测），线程壳只有步进+呈现。事件端 None（REPL 路径）只打终端行。
+fn tail_planner_audit(path: &Path, stop: &AtomicBool, events: Option<ChatEventSender>) {
     let mut state = AuditTailState::new(path.to_path_buf());
     loop {
-        for line in state.poll() {
-            emit_process_line(&line);
+        for (kind, detail) in state.poll() {
+            emit_process_line(&format!("[pi] ⋯ {}", pi_action_text(kind, &detail)));
+            if let Some(tx) = &events {
+                tx.send(ChatEvent::PiAction { kind, detail });
+            }
         }
         if stop.load(Ordering::Relaxed) {
             break;
@@ -649,10 +836,9 @@ impl AuditTailState {
             printed: std::collections::HashSet::new(),
         }
     }
-
     /// 轮询一步。任何文件系统错误（文件消失等）按“无新内容”处理，状态保留
     /// 下轮重试——不崩不跳。
-    fn poll(&mut self) -> Vec<String> {
+    fn poll(&mut self) -> Vec<(ActionKind, String)> {
         let Ok(meta) = std::fs::metadata(&self.path) else {
             return Vec::new();
         };
@@ -677,7 +863,7 @@ impl AuditTailState {
 
     /// 读 `[offset, EOF)` 增量进 pending，剥完整行渲染节流；任何读失败停在
     /// 原位（下轮重试）。
-    fn read_delta(&mut self) -> Vec<String> {
+    fn read_delta(&mut self) -> Vec<(ActionKind, String)> {
         use std::io::{Read, Seek, SeekFrom};
         let Ok(mut f) = std::fs::File::open(&self.path) else {
             return Vec::new();
@@ -699,9 +885,9 @@ impl AuditTailState {
             if line.is_empty() {
                 continue;
             }
-            if let Some(text) = render_audit_action(line) {
-                if self.printed.insert(text.clone()) {
-                    out.push(text);
+            if let Some((kind, detail)) = parse_audit_action(line) {
+                if self.printed.insert(pi_action_text(kind, &detail)) {
+                    out.push((kind, detail));
                 }
             }
         }
@@ -717,11 +903,20 @@ fn emit_process_line(text: &str) {
     let _ = out.flush();
 }
 
-/// AGT 审计行 → 过程动作行（纯函数：tail 线程与测试共用单一真源）。
+/// AGT 审计行 → REPL 终端行（`[pi] ⋯ {…}`）：测试断言面（渲染 = parse_audit_action
+/// + pi_action_text + 前缀拼接，与 [`tail_planner_audit`] 打印行同一套件真源）。
+#[cfg(test)]
+fn render_audit_action(line: &str) -> Option<String> {
+    let (kind, detail) = parse_audit_action(line)?;
+    Some(format!("[pi] ⋯ {}", pi_action_text(kind, &detail)))
+}
+
+/// AGT 审计行 → 动作分类 + 已截断目标（纯函数：tail 线程、事件载荷与测试共用
+/// 单一真源）。
 ///
 /// 宽进：多余字段忽略；非法 JSON / 未知 decision / 无呈现目标 → None（不呈现
 /// 不崩——审计是 pi 子进程写的，坏行不能杀呈现）。
-fn render_audit_action(line: &str) -> Option<String> {
+fn parse_audit_action(line: &str) -> Option<(ActionKind, String)> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let decision = v.get("decision").and_then(|d| d.as_str())?;
     let tool = v.get("tool_name").and_then(|t| t.as_str()).unwrap_or("");
@@ -735,16 +930,27 @@ fn render_audit_action(line: &str) -> Option<String> {
         .and_then(|p| p.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let action = match (decision, tool) {
-        ("allow", "bash") => format!("探查: {}", truncate_action(command?)),
-        ("allow", "read") => format!("读取: {}", truncate_action(path?)),
+    match (decision, tool) {
+        ("allow", "bash") => Some((ActionKind::Probe, truncate_action(command?))),
+        ("allow", "read") => Some((ActionKind::Read, truncate_action(path?))),
         // deny 全可见（任意工具——拦截即治理边界信号）；command 缺失回退 path。
-        ("deny", _) => {
-            format!("探查（被治理拦截）: {}", truncate_action(command.or(path)?))
-        }
-        _ => return None,
-    };
-    Some(format!("[pi] ⋯ {action}"))
+        ("deny", _) => Some((
+            ActionKind::Blocked,
+            truncate_action(command.or(path)?),
+        )),
+        _ => None,
+    }
+}
+
+/// 过程动作行格式（kind → label + 目标文本）：REPL 终端行（`[pi] ⋯ {…}`）与
+/// TUI 左列渲染共用单一真源（chat_events.rs ActionKind 文档口径——行格式
+/// 真源留在本渲染侧，事件只承载分类）。
+pub(crate) fn pi_action_text(kind: ActionKind, detail: &str) -> String {
+    match kind {
+        ActionKind::Probe => format!("探查: {detail}"),
+        ActionKind::Read => format!("读取: {detail}"),
+        ActionKind::Blocked => format!("探查（被治理拦截）: {detail}"),
+    }
 }
 
 /// 动作目标截断：空白规整（多行命令压平单行——过程行一行一动作）+ 超限
@@ -769,14 +975,16 @@ struct ChatInput {
 }
 
 impl ChatInput {
-    fn new() -> Self {
+    /// `sink` 仅承接行编辑初始化失败行（覆盖表 Error/Stderr 点位；TUI 路径
+    /// 用 [`ChannelInput`] 不会走到这里）。
+    fn new(sink: &SessionSink) -> Self {
         // 行编辑仅交互双 tty 启用：stdout 非 tty（如 `alfred chat | tee`）时编辑
         // UI 无处渲染，回退裸读保持现状。
         let editor = if io::stdin().is_terminal() && io::stdout().is_terminal() {
             match Editor::with_history(Config::default(), MemHistory::new()) {
                 Ok(ed) => Some(ed),
                 Err(e) => {
-                    eprintln!("[chat] 行编辑初始化失败（{e}），回退裸读。");
+                    sink.error_stderr(format!("行编辑初始化失败（{e}），回退裸读。"));
                     None
                 }
             }
@@ -788,9 +996,11 @@ impl ChatInput {
             stdin: io::stdin(),
         }
     }
+}
 
-    /// 读一行（EOF/Ctrl-C → None，会话结束——对齐裸读时代 Ctrl-D→None、
-    /// Ctrl-C→SIGINT 终止语义，不 panic）。
+/// 读一行（EOF/Ctrl-C → None，会话结束——对齐裸读时代 Ctrl-D→None、
+/// Ctrl-C→SIGINT 终止语义，不 panic）。
+impl OwnerInput for ChatInput {
     fn read_line(&mut self, prompt: &str) -> Result<Option<String>> {
         if let Some(editor) = self.editor.as_mut() {
             return match editor.readline(prompt) {
@@ -869,6 +1079,7 @@ mod tests {
     use super::{
         render_audit_action, sanitize_raw_line, truncate_action, AuditTailState, PlannerAuditTail,
     };
+    use alfred_cli::chat_events::ActionKind;
 
     /// 干净 UTF-8 输入恒等：lossy 对合法输入不改内容，只剥行尾（调用点均
     /// trim()，语义逐字节不变）。
@@ -1018,7 +1229,7 @@ mod tests {
 
         // 文件未创建（离线 / AGT 尚未落盘）→ 空轮询零输出。
         let mut st = AuditTailState::new(audit.clone());
-        assert_eq!(st.poll(), Vec::<String>::new());
+        assert_eq!(st.poll(), Vec::<(ActionKind, String)>::new());
 
         // 首轮竞态（真跑实证：pi 启动慢于首个轮询，文件带着首行出现）：启动时
         // 无文件 → 会话中出现即从 0 读，已在文件里的行也照常渲出（不当历史跳过）。
@@ -1030,11 +1241,14 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(st.poll(), vec!["[pi] ⋯ 探查: ls -la .".to_string()]);
+        assert_eq!(
+            st.poll(),
+            vec![(ActionKind::Probe, "ls -la .".to_string())]
+        );
 
         // 多轮语义：tail 启动时文件已存在（上一轮 converse 产物）→ 历史不重放。
         let mut st = AuditTailState::new(audit.clone());
-        assert_eq!(st.poll(), Vec::<String>::new());
+        assert_eq!(st.poll(), Vec::<(ActionKind, String)>::new());
 
         // 本轮新增：探查/读取/拦截按序渲染。
         use std::io::Write;
@@ -1061,9 +1275,9 @@ mod tests {
         assert_eq!(
             st.poll(),
             vec![
-                "[pi] ⋯ 探查: ls src".to_string(),
-                "[pi] ⋯ 读取: /ws/Cargo.toml".to_string(),
-                "[pi] ⋯ 探查（被治理拦截）: cat ~/.omp/runs".to_string(),
+                (ActionKind::Probe, "ls src".to_string()),
+                (ActionKind::Read, "/ws/Cargo.toml".to_string()),
+                (ActionKind::Blocked, "cat ~/.omp/runs".to_string()),
             ]
         );
 
@@ -1083,7 +1297,7 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        assert_eq!(st.poll(), vec!["[pi] ⋯ 探查: ls tests".to_string()]);
+        assert_eq!(st.poll(), vec![(ActionKind::Probe, "ls tests".to_string())]);
 
         // 半行（无 \n）不误渲；补齐后渲出。
         let mut f = std::fs::OpenOptions::new()
@@ -1092,14 +1306,14 @@ mod tests {
             .unwrap();
         write!(f, r#"{{"tool_name":"read","path":"/ws/half"#).unwrap();
         drop(f);
-        assert_eq!(st.poll(), Vec::<String>::new());
+        assert_eq!(st.poll(), Vec::<(ActionKind, String)>::new());
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&audit)
             .unwrap();
         writeln!(f, r#".txt","decision":"allow"}}"#).unwrap();
         drop(f);
-        assert_eq!(st.poll(), vec!["[pi] ⋯ 读取: /ws/half.txt".to_string()]);
+        assert_eq!(st.poll(), vec![(ActionKind::Read, "/ws/half.txt".to_string())]);
 
         // 截断重置：文件缩回 < offset → 回退从 0 重读（新行照常渲出）。
         std::fs::write(
@@ -1110,7 +1324,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(st.poll(), vec!["[pi] ⋯ 读取: /fresh/x.txt".to_string()]);
+        assert_eq!(st.poll(), vec![(ActionKind::Read, "/fresh/x.txt".to_string())]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1124,7 +1338,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let run_dir = dir.join("run");
         std::fs::create_dir_all(run_dir.join("planner/agt/audit")).unwrap();
-        PlannerAuditTail::spawn(&run_dir).stop();
+        PlannerAuditTail::spawn(&run_dir, None).stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

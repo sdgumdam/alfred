@@ -20,6 +20,8 @@ dependencies = [
  "alfred-planner",
  "alfred-reviewer",
  "anyhow",
+ "libc",
+ "parking_lot",
  "ratatui",
  "rustyline",
  "serde",

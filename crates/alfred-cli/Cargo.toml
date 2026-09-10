@@ -23,3 +23,5 @@ anyhow = { workspace = true }
 rustyline = "18.0.1"
 ratatui = "0.30"
 unicode-width = "0.2"
+parking_lot = "0.12"
+libc = "0.2"
