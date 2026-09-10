@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""TUI S2a/S2b 汇合 pty 手验：真实 pty 起 alfred chat TUI，黑盒驱动+断言。
+"""TUI S2a/S2b/S3 pty 手验：真实 pty 起 alfred chat TUI，黑盒驱动+断言。
 
 阶段一（需求收集→Planning 停驻→退出卫生）：
-  TUI 起界面（顶栏无 run/左列空/右列占位/输入区"需求"提示）→ 提交需求 →
-  左列回声+已受理+[pi] 答复流式 → 顶栏 run_id+● planning 实时 → 右列看板
-  planning → 输入区提示切"对 pi 说" → Ctrl-D 退出 → 退出码 0 + 备用屏恢复 +
-  告别行可见。
+  TUI 起界面（顶栏无 run/左列空/右列占位/输入区"需求"提示）→ 空提交按态文案
+  （需求收集态"需求为空"，chat_session 单一真源与 REPL 同文，S1 审 P3 核对）
+  → 提交需求 → 左列回声+已受理+[pi] 答复流式 → 顶栏 run_id+● planning 实时 →
+  右列看板 planning → 输入区提示切"对 pi 说" → 空提交按态文案（Planning 态
+  "空输入已忽略"）→ Ctrl-D 退出 → 退出码 0 + 备用屏恢复 + 告别行可见。
 阶段二（断点恢复→建图→挂起提示→拍板→终态）：
   恢复 run → "直接建图" → [orchestrator] 事件化左列（计划审查中/已升级属主，
   S2b 前缀由渲染加回）+ [pi] 计划摘要 → 挂起提示可见（升级包+输入区
   "重试/放弃/修改意见"）→ 看板 escalated+节点 → "放弃" 拍板 → Abandoned
   终态呈现 + 输入区"新需求" → Ctrl-C 退出 → 退出码 0。
+阶段三（规划失败升级块多行呈现，S3 核对）：
+  新 run + 离线计划文件缺失 → planning_error 升级 → 升级块多行呈现完整
+  （标题行 + run_dir 续行 + 尾段 retry/revise/abandon 折行不截断）+ 挂起态
+  输入区拍板引导 → state.json 落盘 escalated。
 """
 import fcntl
 import json
@@ -173,6 +178,13 @@ try:
     check("boot-input-hint", "需求" in t, "输入区需求收集提示")
     check("boot-panel-placeholder", "无 run——提交需求后建立" in t, "右列占位")
 
+    # 空提交（需求收集态）：chat_session 单一真源按态文案，TUI 面经通道呈现
+    # （S1 审 P3 核对——与 REPL 同文）。
+    s1.send("\r")
+    check("empty-submit-requirement",
+          s1.wait_for("需求为空——请直接说需求。", 10),
+          "需求收集态空提交按态文案（与 REPL 同文）")
+
     s1.send("写一个 hello.txt 内容是 Hello\r")
     got_pi = s1.wait_for("pi 需要先澄清吗", 20)
     t = s1.text()
@@ -183,6 +195,12 @@ try:
     check("statusbar-planning", "● planning" in t, "顶栏 ● planning 实时")
     check("panel-planning", t.count("● planning") >= 1 and "计划: —" in t, "右列看板 planning 态")
     check("input-hint-planning", "对 pi 说" in t, "输入区切对 pi 说提示")
+
+    # 空提交（Planning 态）：另一套按态文案（S1 审 P3 核对——单一真源产生）。
+    s1.send("\r")
+    check("empty-submit-planning",
+          s1.wait_for("空输入已忽略。", 10),
+          "Planning 态空提交按态文案（与 REPL 同文）")
 
     s1.send(b"\x04")  # Ctrl-D 空缓冲退出
     status = s1.wait_exit(10)
@@ -259,8 +277,34 @@ state2 = json.load(open(f"{run1}/state.json"))
 check("run1-abandoned-persisted", state2["state_machine"]["state"] == "abandoned",
       f"state.json={state2['state_machine']['state']}")
 
+# ── 阶段三：规划失败升级块多行呈现（S3 核对：run_dir 续行完整） ──
+# 离线计划文件缺失 → planning_error 升级 → 升级块多行 notice（含 run_dir 续行）
+# 经 OrchestratorNotice 进左列，conversation_rows 按 '\n' 展开——断言折行不截断。
+run3 = f"{STATE}/run-tui-3"
+env3 = base_env() | {"ALFRED_OFFLINE_PLAN_FILE": f"{STATE}/definitely-missing.json"}
+s3 = PtySession(["chat", "--run-dir", run3], env3)
+active_session = s3
+try:
+    s3.wait_for("对话", 20)
+    s3.send("触发规划失败\r")
+    got_block = s3.wait_for("规划失败已升级属主", 30)
+    t = s3.text()
+    check("escalation-block-multiline", got_block, "升级块多行呈现（标题行）")
+    check("escalation-block-rundir", f"run_dir: {run3}" in t,
+          f"升级块 run_dir 续行可见（run_dir: {run3}）")
+    check("escalation-block-tail", "retry/revise/abandon" in t,
+          "升级块续行尾段（retry/revise/abandon）折行不截断")
+    check("escalation-suspend-hint", "回复：重试 / 放弃 / 或直接说修改意见" in t,
+          "挂起态输入区拍板引导")
+finally:
+    s3.close()
+
+state3 = json.load(open(f"{run3}/state.json"))
+check("run3-escalated-persisted", state3["state_machine"]["state"] == "escalated",
+      f"state.json={state3['state_machine']['state']}")
+
 print("=" * 60)
 if failures:
     print(f"TUI pty 手验失败：{failures}")
     sys.exit(1)
-print("TUI pty 手验全部通过（阶段一+阶段二）")
+print("TUI pty 手验全部通过（阶段一+阶段二+阶段三）")

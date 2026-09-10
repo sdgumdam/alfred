@@ -16,10 +16,12 @@
 //! - **顶状态条**：run_id + 治理态实时（看板快照数据源）。
 //! - **捕获管道**：TUI 期间进程 stdout/stderr 被重定向进捕获管道（libc dup2）
 //!   ——drainer 线程过滤兜底：`[chat]`/`[pi]`/`[orchestrator]` 前缀行均已
-//!   [`ChatEvent`] 事件化（透传=左列双显）丢弃；空行丢弃；其余（未事件化的
-//!   残留输出）整串透传左列。governance.rs `[orchestrator]` 点位 S2b 起事件化
-//!   （TUI 模式不打终端），捕获透传路径退役。渲染流写 `/dev/tty`（与捕获流
-//!   物理分离，画面不毁）。
+//!   [`ChatEvent`] 事件化（透传=左列双显）丢弃，例外白名单
+//!   `[orchestrator] warn:` 行透传（alfred-reviewer verdict 解析告警未事件化，
+//!   S2 审 P2 / S3 修复，见 [`ORCHESTRATOR_WARN_PREFIX`]）；空行丢弃；其余
+//!   （未事件化的残留输出）整串透传左列。governance.rs `[orchestrator]` 点位
+//!   S2b 起事件化（TUI 模式不打终端），捕获透传路径退役。渲染流写 `/dev/tty`
+//!   （与捕获流物理分离，画面不毁）。
 //! - **多行输入自实现**（不引 tui-textarea：需求面只有字符/Tab 缩进/退格/
 //!   回车提交/↑↓历史/Ctrl-J 换行，百行内可控且光标语义完全自明）。Tab
 //!   插入 '\t'——数据层保真（对齐 REPL `sanitize_raw_line` 保留 \t：粘贴
@@ -302,9 +304,10 @@ fn farewell_line(saved: &Arc<Mutex<Option<(RawFd, RawFd)>>>) {
 
 /// 捕获重定向：`dup2` 管道写端覆到 fd 1/2（原 fd 经 `dup` 留底给回位/告别），
 /// drainer 线程逐行读管道——`[chat]`/`[pi]`/`[orchestrator]` 前缀行已由
-/// [`ChatEvent`] 事件化（透传=左列双显）丢弃；其余（未事件化的残留输出）
-/// 整串透传左列。governance.rs `[orchestrator]` 点位 S2b 事件化后不再进管道
-/// （TUI 模式不打终端），本通道只剩残留兜底。
+/// [`ChatEvent`] 事件化（透传=左列双显）丢弃（例外白名单
+/// [`ORCHESTRATOR_WARN_PREFIX`] 透传，见 [`forward_line`]）；其余（未事件化的
+/// 残留输出）整串透传左列。governance.rs `[orchestrator]` 点位 S2b 事件化后
+/// 不再进管道（TUI 模式不打终端），本通道只剩残留兜底 + reviewer warn 白名单。
 ///
 /// 退出协议：fd 1/2 是管道唯一写端（`dup2` 后关原写端 fd）——回位后管道
 /// EOF，drainer 自然退；捕获线程绝不写坏画面（读端独立 fd）。
@@ -408,17 +411,25 @@ fn drain_capture(mut f: File, forward: mpsc::Sender<String>) {
     }
 }
 
+/// 捕获白名单前缀（S2 审 P2，S3 修复）：alfred-reviewer 两处 verdict 解析告警
+/// （exec_review.rs / plan_review.rs 的 `eprintln!`，stderr → 捕获管道）未事件化
+/// （reviewer crate 无事件通道，完整事件化留后续切片）——整体 `[orchestrator]`
+/// 丢弃规则会让审查 verdict 解析失败时属主在 TUI 看不到根因（REPL 面恒可见，
+/// 构成可见性回退），故白名单放行透传左列。governance.rs `[orchestrator]` 点位
+/// S2b 起 TUI 模式不打终端（事件化），该前缀行只可能来自捕获管道——无双显。
+const ORCHESTRATOR_WARN_PREFIX: &str = "[orchestrator] warn:";
+
 /// 捕获行过滤转发（纯函数，可测）：`[chat] `/`[pi] `/`[orchestrator] ` 前缀行
-/// 已由 [`ChatEvent`] 事件化覆盖 → 丢弃（透传=左列双显；`[orchestrator]` 行
-/// S2b 起事件化，governance.rs TUI 模式不打终端——含 alfred-reviewer 的
-/// `[orchestrator] warn:` 行，其事件化属后续切片，TUI 面暂不可见）；空行不
-/// 透传（噪音）；其余（未事件化的残留输出）整串透传。
+/// 已由 [`ChatEvent`] 事件化覆盖 → 丢弃（透传=左列双显）；**例外白名单**
+/// （S2 审 P2）：[`ORCHESTRATOR_WARN_PREFIX`] 前缀行透传（alfred-reviewer
+/// verdict 解析告警未事件化，丢弃=审查失败时属主看不到根因）；空行不透传
+/// （噪音）；其余（未事件化的残留输出）整串透传。
 fn forward_line(tx: &mpsc::Sender<String>, line: &str) {
     let line = line.trim_end_matches('\r');
     if line.is_empty()
         || line.starts_with("[chat] ")
         || line.starts_with("[pi] ")
-        || line.starts_with("[orchestrator] ")
+        || (line.starts_with("[orchestrator] ") && !line.starts_with(ORCHESTRATOR_WARN_PREFIX))
     {
         return;
     }
@@ -1484,8 +1495,11 @@ mod tests {
     // ── 捕获行过滤 ──
 
     /// [chat]/[pi]/[orchestrator] 前缀行已事件化（S2b 起 [orchestrator] 含
-    /// governance.rs 全部点位）→ 丢弃；空行丢弃；其余（未事件化残留——
-    /// 无前缀输出/[driver] 行）整串透传。
+    /// governance.rs 全部点位）→ 丢弃；**例外白名单**（S2 审 P2，S3 翻转）：
+    /// `[orchestrator] warn:` 行透传——alfred-reviewer verdict 解析告警未
+    /// 事件化（REPL 面可见，丢弃=TUI 可见性回退）；近前缀（`warning:`）不
+    /// 匹配白名单仍丢弃；空行丢弃；其余（未事件化残留——无前缀输出/
+    /// [driver] 行）整串透传。
     #[test]
     fn capture_line_filter() {
         let (tx, rx) = mpsc::channel();
@@ -1494,6 +1508,7 @@ mod tests {
         forward_line(&tx, "");
         forward_line(&tx, "[orchestrator] 计划审查中");
         forward_line(&tx, "[orchestrator] warn: exec verdict parse failed");
+        forward_line(&tx, "[orchestrator] warning: 近前缀不匹配白名单");
         forward_line(&tx, "  run_dir: /tmp/x（残留续行）");
         forward_line(&tx, "[driver] 状态行");
         drop(tx);
@@ -1501,10 +1516,44 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "[orchestrator] warn: exec verdict parse failed".to_string(),
                 "  run_dir: /tmp/x（残留续行）".to_string(),
                 "[driver] 状态行".to_string(),
             ]
         );
+    }
+
+    /// drainer 端到端（真实文件读端驱动 [`drain_capture`] 主体，S2 审 P2 的
+    /// warn 可见性黑盒）：行剥分 + 过滤规则生效——warn 白名单行透传（含无
+    /// 换行尾行 EOF 补发），事件化前缀行丢弃。
+    #[test]
+    fn drain_capture_warn_whitelist_end_to_end() {
+        let path = std::env::temp_dir()
+            .join(format!("alfred-drain-capture-{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "[orchestrator] warn: exec verdict parse failed: bad json\n\
+             [chat] 已受理：X\n\
+             [pi] 答复\n\
+             [orchestrator] 执行审查中…\n\
+             [orchestrator] warn: plan verdict parse failed: also bad\n\
+             docker: pulled image\n\
+             [driver] 尾行无换行",
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        drain_capture(File::open(&path).unwrap(), tx);
+        let got: Vec<String> = rx.iter().collect();
+        assert_eq!(
+            got,
+            vec![
+                "[orchestrator] warn: exec verdict parse failed: bad json".to_string(),
+                "[orchestrator] warn: plan verdict parse failed: also bad".to_string(),
+                "docker: pulled image".to_string(),
+                "[driver] 尾行无换行".to_string(),
+            ]
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     // ── 看板渲染 ──
@@ -1579,15 +1628,18 @@ mod tests {
         assert_eq!(fit_width("a\tb", 3), "a…"); // '\t' 计 TAB_WIDTH
     }
 
-    /// 输入区提示按治理态派生（挂起/推进/对话/收集/终态新需求）。
+    /// 输入区提示按治理态派生（挂起/推进/对话/收集/终态新需求）——全部 8 态
+    /// 覆盖（S3 补 plan_reviewing/exec_reviewing 两态断言，hint 完整性锁定）。
     #[test]
     fn input_hint_by_state() {
         assert_eq!(input_hint(None), "需求");
         assert_eq!(input_hint(Some("")), "需求");
         assert_eq!(input_hint(Some("planning")), "对 pi 说");
+        assert_eq!(input_hint(Some("plan_reviewing")), "治理推进中（输入将排队）");
+        assert_eq!(input_hint(Some("executing")), "治理推进中（输入将排队）");
+        assert_eq!(input_hint(Some("exec_reviewing")), "治理推进中（输入将排队）");
         assert_eq!(input_hint(Some("plan_rejected")), "回复：重试 / 放弃 / 或直接说修改意见");
         assert_eq!(input_hint(Some("escalated")), "回复：重试 / 放弃 / 或直接说修改意见");
-        assert_eq!(input_hint(Some("executing")), "治理推进中（输入将排队）");
         assert_eq!(input_hint(Some("completed")), "新需求");
         assert_eq!(input_hint(Some("abandoned")), "新需求");
     }
