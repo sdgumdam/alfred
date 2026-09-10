@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TUI S2a 汇合 pty 手验：真实 pty 起 alfred chat TUI，黑盒驱动+断言。
+"""TUI S2a/S2b 汇合 pty 手验：真实 pty 起 alfred chat TUI，黑盒驱动+断言。
 
 阶段一（需求收集→Planning 停驻→退出卫生）：
   TUI 起界面（顶栏无 run/左列空/右列占位/输入区"需求"提示）→ 提交需求 →
@@ -7,10 +7,10 @@
   planning → 输入区提示切"对 pi 说" → Ctrl-D 退出 → 退出码 0 + 备用屏恢复 +
   告别行可见。
 阶段二（断点恢复→建图→挂起提示→拍板→终态）：
-  恢复 run → "直接建图" → [orchestrator] 透传（计划审查中/已升级属主）+
-  [pi] 计划摘要 → 挂起提示可见（升级包+输入区"重试/放弃/修改意见"）→ 看板
-  escalated+节点 → "放弃" 拍板 → Abandoned 终态呈现 + 输入区"新需求" →
-  Ctrl-C 退出 → 退出码 0。
+  恢复 run → "直接建图" → [orchestrator] 事件化左列（计划审查中/已升级属主，
+  S2b 前缀由渲染加回）+ [pi] 计划摘要 → 挂起提示可见（升级包+输入区
+  "重试/放弃/修改意见"）→ 看板 escalated+节点 → "放弃" 拍板 → Abandoned
+  终态呈现 + 输入区"新需求" → Ctrl-C 退出 → 退出码 0。
 """
 import fcntl
 import json
@@ -232,9 +232,9 @@ try:
     got_susp = s2.wait_for("治理挂起，等待属主拍板", 30)
     t = s2.text()
     check("suspension-visible", got_susp, "挂起升级包可见")
-    check("orchestrator-passthrough",
+    check("orchestrator-eventized",
           "计划审查中" in t and "已升级属主" in t,
-          "捕获管道 [orchestrator] 透传左列")
+          "治理 [orchestrator] 行事件化左列可见（前缀渲染加回）")
     check("plan-summary-pi", "计划（1 节点）" in t, "[pi] 计划摘要")
     check("escalation-reason", "升级原因" in t or "执行审查意见" in t, "升级原因/意见行")
     check("suspended-input-hint", "回复：重试 / 放弃 / 或直接说修改意见" in t, "挂起输入区提示")

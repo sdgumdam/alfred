@@ -15,8 +15,8 @@
 //! | [`ChatEvent::OwnerEcho`] | 属主输入回显（TUI 左列呈现属主消息；REPL 由终端原生回显承担，无 println 点位——接线切片为 TUI 面新增） |
 //! | [`ChatEvent::PiAction`] | chat.rs `emit_process_line`：AGT 审计 tail 过程行 `[pi] ⋯ 探查/读取/探查（被治理拦截）`（`render_audit_action` 三呈现分支 ↔ [`ActionKind`]） |
 //! | [`ChatEvent::PiReply`] | chat.rs `surface_planner_output`：`[pi] {答复}`（reply 直显 + conversation.json 新增 ConverseReply 轮两分支） |
-//! | [`ChatEvent::OrchestratorNotice`] | 治理状态行与转写提示——chat.rs 横幅/run_dir/恢复 run/未发现 run/新建 run/已受理/当前状态/已重载/空输入×2/需求为空/会话结束/终态呈现（完成×2/放弃/新需求引导）/挂起块头行；governance.rs 每状态进入的 `[orchestrator]` 流转状态行（`orchestrator_status_line`）、机械重跑提示（`post_apply_notices`：超时放大重跑/同契约重跑）、contract_fault 预标注 |
-//! | [`ChatEvent::EscalationPrompt`] | chat.rs `present_suspension` 挂起意见行四分支（计划审查意见/打回原因/执行审查意见/升级原因）；governance.rs 规划失败升级块、计划/执行审查宿主失败升级块 |
+//! | [`ChatEvent::OrchestratorNotice`] | 治理状态行与转写提示——chat.rs 横幅/run_dir/恢复 run/未发现 run/新建 run/已受理/当前状态/已重载/空输入×2/需求为空/会话结束/终态呈现（完成×2/放弃/新需求引导）/挂起块头行；governance.rs **全部** `[orchestrator]` 点位（S2b 经 `orchestrator_notice` 单一出口事件化）：每状态进入的流转状态行（`orchestrator_status_line`）、机械重跑提示（`post_apply_notices`：超时放大重跑/同契约重跑）、contract_fault 预标注、规划失败升级块、计划/执行审查宿主失败升级块（升级块保持编排器语音，与 chat.rs 挂起呈现分置，见下行） |
+//! | [`ChatEvent::EscalationPrompt`] | chat.rs `present_suspension` 挂起意见行四分支（计划审查意见/打回原因/执行审查意见/升级原因）——governance.rs 升级块不走本变体（S2b 定夺：保持 `[orchestrator]` 编排器语音走 OrchestratorNotice，前缀由 sink 加回，不因变体混装丢失 REPL 同面） |
 //! | [`ChatEvent::Error`] | 一切错误行（原点位输出流由 `stream` 标记，见 [`ErrorStream`]）——chat.rs TUI 运行失败回退（stderr）、run 初始化失败、state 持久化失败、操作失败、多挂起 run 消歧清单（头行+列表行，stderr）、行编辑初始化失败（stderr）；reviewer verdict 解析 warn（alfred-reviewer，stderr） |
 //!
 //! 明确排除（非事件）：`print!` 输入提示（需求/对 pi 说/挂起拍板三处 prompt
@@ -28,9 +28,10 @@
 //! 载荷口径（定死，无例外）：正文**不含终端前缀**（`[chat]`/`[pi]`/
 //! `[orchestrator]` 是 sink 的渲染关注点——REPL sink 加前缀回 stdout 逐字节
 //! 等价，TUI sink 自由着色/分区）。[`ChatEvent::OrchestratorNotice`] 同口径：
-//! governance.rs 侧格式化产物自带 `[orchestrator] ` 前缀，**发送点负责剥
-//! 离**（S2 接线落地，本片定死契约）——前缀永远由 sink 渲染时统一加回，
-//! 载荷只承载纯正文。
+//! governance.rs 侧格式化产物自带 `[orchestrator] ` 前缀，发送点
+//! （`orchestrator_notice` 单一出口）负责剥离——S2a（chat.rs）+ S2b
+//! （governance.rs）已落地；前缀由 sink 渲染时统一加回（TUI 左列
+//! `[orchestrator] {text}`），载荷只承载纯正文。
 //!
 //! # 通道语义
 //!
@@ -89,18 +90,20 @@ pub enum ChatEvent {
     ///
     /// 载荷口径（单一口径，无例外）：**去前缀纯正文**——chat.rs 侧点位天然
     /// 无前缀直入；governance.rs 治理环通知（`orchestrator_status_line` /
-    /// `post_apply_notices`）的格式化产物自带 `[orchestrator] ` 前缀，发送
-    /// 点负责剥离（S2 接线落地，本片定死契约）。`[orchestrator]` 前缀由
-    /// sink 渲染时统一加回——REPL sink 回 stdout 逐字节等价，TUI sink 自由
-    /// 分区/着色；载荷不再混装两种口径。
+    /// `post_apply_notices` / 升级块）的格式化产物自带 `[orchestrator] ` 前缀，
+    /// 发送点（`orchestrator_notice` 单一出口）负责剥离（S2a/S2b 已落地）。
+    /// `[orchestrator]` 前缀由 sink 渲染时统一加回——REPL sink 回 stdout 逐字节
+    /// 等价，TUI sink 自由分区/着色；载荷不再混装两种口径。
     OrchestratorNotice(String),
     /// 挂起拍板（升级包）：run 挂起（plan_rejected/escalated）等待属主
     /// 重试/放弃/改口。
     ///
     /// - `reason` = **已按态格式化的意见/原因正文**（含意见 label，如
     ///   `计划审查意见（打回）：…`/`执行审查意见（…）：…`）——格式化留在数据
-    ///   所在地（chat.rs `present_suspension` 四分支 / governance.rs 升级块，
-    ///   单一真源不搬家），事件只承载结果文本。
+    ///   所在地（chat.rs `present_suspension` 四分支，单一真源不搬家），事件
+    ///   只承载结果文本。governance.rs 升级块不走本变体（S2b 定夺：保持
+    ///   `[orchestrator]` 编排器语音，走 [`ChatEvent::OrchestratorNotice`]，
+    ///   与 REPL 逐字节同面）。
     /// - `source` = 升级/打回来源，直接用 `alfred_core::governance::
     ///   EscalationSource` 类型（单一真源，消第二份字符串词表）：
     ///   `Planning`（规划失败升级）/ `PlanReview`（计划打回 + 计划审查宿主
@@ -152,10 +155,17 @@ impl ChatEventBus {
 }
 
 /// 事件发送端：`Clone` 给治理内核多处持有（主循环 + planner AGT 审计 tail
-/// 后台线程），`Send` 跨线程。
+/// 后台线程 + 治理环通知出口），`Send` 跨线程。
 #[derive(Clone)]
 pub struct ChatEventSender {
     tx: mpsc::Sender<ChatEvent>,
+}
+
+/// Debug：通道端点无观察值（`GovernanceContext` 派生 Debug 携带它，不泄内容）。
+impl std::fmt::Debug for ChatEventSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChatEventSender")
+    }
 }
 
 impl ChatEventSender {

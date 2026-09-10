@@ -39,7 +39,7 @@
 //! 仅呈现层投影）、`[driver]` CLI driver 状态行（run/feed/status 保留不动）、
 //! `[chat]` 本壳提示音。
 //!
-//! # S2a 输出双发（TUI 汇合，覆盖对照表见 chat_events.rs）
+//! # S2a 输出双发 + S2b 治理环通知事件化（覆盖对照表见 chat_events.rs）
 //!
 //! 本壳全部 owner 可见输出点位经 [`SessionSink`]：REPL 路径（管道/降级）只打印
 //! ——与原 println!/eprintln! 逐字节等价（e2e chat.sh 硬底线）；TUI 路径打印
@@ -47,8 +47,10 @@
 //! [`ChatEvent`] 双发（载荷=去前缀正文，契约见 chat_events.rs）。会话主体
 //! [`chat_session`] 由 REPL（stdin 行）与 TUI 治理 worker（通道行，
 //! [`run_tui_session`]）共用——输入抽象 [`OwnerInput`]，语义单一真源不重写。
-//! governance.rs 侧 `[orchestrator]` 点位本切片不动（M3/S2b 另行接线），其
-//! stdout 由 chat_tui 捕获管道整串透传（TODO S2b 剥离）。
+//! governance.rs 侧 `[orchestrator]` 点位 S2b 起同契约事件化：会话侧把
+//! `sink.events` 接入 `GovernanceContext`（drive_loop / feed_and_present 两处
+//! 建 ctx 点），治理环通知经 governance::`orchestrator_notice` 单一出口分流
+//! （REPL 打终端 / TUI 发事件），捕获管道透传路径退役。
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -419,10 +421,13 @@ fn feed_and_present(
     message: &str,
     sink: &SessionSink,
 ) -> Result<()> {
-    let ctx = match build_governance_context(run_dir) {
+    let mut ctx = match build_governance_context(run_dir) {
         Ok(ctx) => ctx,
         Err(e) => return reload_after_error(run, run_dir, &e, sink),
     };
+    // S2b：TUI 会话把事件通道接入治理环（governance.rs [orchestrator] 点位
+    // 事件化）；REPL（events=None）通知照旧打终端，逐字节不变。
+    ctx.events = sink.events.clone();
     let turns_before = conversation_turn_count(run_dir);
     let mut r = run.take().expect("feed state has run");
     // 过程呈现（工单：规划过程透明）：feed（Planning 续聊 / 挂起拍板重规划）
@@ -445,7 +450,9 @@ fn feed_and_present(
 /// 推进治理环到下一个挂起/终态/Reply 停驻（创建后首推与断点续跑共用）：
 /// loop 返回后 persist（P3 崩溃恢复显式化）+ planner 产出呈现。
 fn drive_loop(run: &mut GovernanceRun, run_dir: &Path, sink: &SessionSink) -> Result<()> {
-    let ctx = build_governance_context(run_dir)?;
+    let mut ctx = build_governance_context(run_dir)?;
+    // S2b：TUI 会话把事件通道接入治理环（同 feed_and_present）。
+    ctx.events = sink.events.clone();
     let turns_before = conversation_turn_count(run_dir);
     // 过程呈现：converse（及维护者，同写 planner AGT 审计）执行期间 tail 审计打
     // 动作行；loop 返回（含 Err）先停 tail 再呈现——过程行先于答复/状态行打完。

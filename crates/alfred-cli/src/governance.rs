@@ -4,7 +4,9 @@
 //! 推进到挂起态（PlanRejected / Escalated）或终态（Completed / Abandoned）。
 //! owner 交互入口 = `alfred chat`（`chat.rs` 持续会话 REPL，复用本库 +
 //! `feed_owner_message`）；`alfred run/feed/status` 为脚本/e2e 技术 driver。
-//! 每次状态进入打印 `[orchestrator]` 流转状态行（owner 可见的协调者路由行为）。
+//! 每次状态进入打一行 `[orchestrator]` 流转状态行（owner 可见的协调者路由行为）
+//! ——S2b 事件化：全部 `[orchestrator]` 点位经 [`orchestrator_notice`] 单一出口，
+//! REPL/driver 打终端（逐字节不变）、TUI 走 [`ChatEvent`] 事件通道。
 //!
 //! 确定性：状态转移全部经 `GovernanceRun.apply()`（alfred-core 状态机），
 //! 每次转移落 audit.jsonl + persist state.json（P3 崩溃恢复显式化）；机械失败
@@ -13,6 +15,7 @@
 //! 自环逐节点推进（completed_nodes 持久断点续跑），全图完成才进 ExecReviewing。
 use std::path::{Path, PathBuf};
 
+use crate::chat_events::{ChatEvent, ChatEventSender};
 use crate::governance_intent::{commit_intent, ConverseMaintain, Effects, StepIntent, VerdictKind};
 
 use alfred_core::conversation::{
@@ -49,6 +52,31 @@ pub struct GovernanceContext {
     /// `ALFRED_APPEND_SYSTEM_PROMPT` 读入）；追加到 planner pi 的 converse
     /// system prompt（P2-1：内存注入端到端生效）。空串 = 不注入。
     pub append_system_prompt: String,
+    /// TUI 事件通道（S2b 通知事件化）：`None` = REPL / CLI driver（run/feed）
+    /// ——`[orchestrator]` 通知打终端（与 HEAD 逐字节一致）；`Some` = TUI 治理
+    /// worker——通知经 [`ChatEvent::OrchestratorNotice`] 事件进左列（载荷=去前缀
+    /// 正文，契约见 chat_events.rs）。`build_governance_context` 恒 None，
+    /// chat.rs 会话侧按 sink 接入。
+    pub events: Option<ChatEventSender>,
+}
+
+/// 治理环 owner 通知单一出口（S2b 事件化）：governance.rs 全部 `[orchestrator]`
+/// 点位（流转状态行 / 机械重跑提示 / contract_fault 预标注 / 规划失败与审查
+/// 宿主失败升级块）经此发射。
+///
+/// - REPL / CLI driver（`ctx.events` 缺席）：终端 `println!` 带 `[orchestrator] `
+///   前缀——与 HEAD 逐字节一致（e2e chat.sh 硬底线；run/feed driver 同面）。
+/// - TUI（通道在场）：发 [`ChatEvent::OrchestratorNotice`]，载荷=去前缀纯正文
+///   （契约见 chat_events.rs：`[orchestrator]` 前缀由 sink 渲染时统一加回）；
+///   不打终端——TUI 期间 stdout 已被捕获管道接管，捕获透传路径已退役
+///   （chat_tui drainer 只留 [chat]/[pi] 残留兜底）。
+pub(crate) fn orchestrator_notice(ctx: &GovernanceContext, body: &str) {
+    match &ctx.events {
+        None => println!("[orchestrator] {body}"),
+        Some(tx) => {
+            tx.send(ChatEvent::OrchestratorNotice(body.to_string()));
+        }
+    }
 }
 
 /// 从挂起/初始状态推进治理环，直到挂起态或终态。
@@ -67,8 +95,9 @@ pub fn run_governance_loop(
             &serde_json::json!({ "state": state_label(run.state()) }),
         )?;
         // 自主流转呈现（工单③）：每次状态进入打一行 [orchestrator] 状态行——
-        // owner（chat 终端 / CLI driver）看到协调者的路由行为。
-        println!("[orchestrator] {}", orchestrator_status_line(run.state()));
+        // owner（chat 终端 / CLI driver）看到协调者的路由行为（S2b 经单一出口
+        // 事件化，REPL 逐字节不变）。
+        orchestrator_notice(ctx, orchestrator_status_line(run.state()));
         match run.state() {
             alfred_core::governance::GovernanceState::Planning => {
                 // P3 修复：规划侧失败（converse 出错）→ 升级属主（不悄悄放行），
@@ -93,10 +122,13 @@ pub fn run_governance_loop(
                                 reason: format!("{e:#}"),
                             },
                         )?;
-                        println!(
-                            "[orchestrator] 规划失败已升级属主（state=Escalated，挂起）。\n\
-                             \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
-                            ctx.run_dir.display()
+                        orchestrator_notice(
+                            ctx,
+                            &format!(
+                                "规划失败已升级属主（state=Escalated，挂起）。\n\
+                                 \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
+                                ctx.run_dir.display()
+                            ),
                         );
                         return Ok(None);
                     }
@@ -771,18 +803,20 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
                                 data["time_limit_adjusted"] =
                                     serde_json::json!({ "from": from, "to": to });
                                 format!(
-                                    "[orchestrator] 节点 {} 执行超时（timed_out），自适应放大时间上限重跑（{attempt}/{}，time_limit {from}s→{to}s）：{e}",
+                                    "节点 {} 执行超时（timed_out），自适应放大时间上限重跑（{attempt}/{}，time_limit {from}s→{to}s）：{e}",
                                     node.id,
                                     run.mechanical_budget
                                 )
                             }
                             None => format!(
-                                "[orchestrator] 节点 {} 执行机械失败，按同一契约重跑（{attempt}/{}）：{e}",
+                                "节点 {} 执行机械失败，按同一契约重跑（{attempt}/{}）：{e}",
                                 node.id,
                                 run.mechanical_budget
                             ),
                         };
                         effects.post_apply_audit("mechanical_retry", data);
+                        // S2b：notice 通道载荷=去前缀正文（前缀由 sink 加回，
+                        // 见 Effects::post_apply_notice 文档）。
                         effects.post_apply_notice(notice);
                         StepIntent::Proceed {
                             event: GovernanceEvent::ExecutionFailedRetry,
@@ -964,8 +998,9 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                     suggest_contract_change,
                 } => {
                     if suggest_contract_change {
-                        println!(
-                            "[orchestrator] 执行审查 contract_fault：预标注『建议改契约』，升级属主。"
+                        orchestrator_notice(
+                            ctx,
+                            "执行审查 contract_fault：预标注『建议改契约』，升级属主。",
                         );
                     }
                     let mut effects = Effects::default();
@@ -1040,15 +1075,18 @@ fn review_host_failure_escalate(
             reason: format!("{mode}: {e:#}"),
         },
     )?;
-    println!(
-        "[orchestrator] {}审查失败已升级属主（state=Escalated，挂起；审查 outcome 已落盘）。\n\
-         \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
-        if mode == "plan_review" {
-            "计划"
-        } else {
-            "执行"
-        },
-        ctx.run_dir.display()
+    orchestrator_notice(
+        ctx,
+        &format!(
+            "{}审查失败已升级属主（state=Escalated，挂起；审查 outcome 已落盘）。\n\
+             \x20 run_dir: {}；等待属主拍板（retry/revise/abandon）。",
+            if mode == "plan_review" {
+                "计划"
+            } else {
+                "执行"
+            },
+            ctx.run_dir.display()
+        ),
     );
     Ok(())
 }
@@ -1328,6 +1366,8 @@ pub fn build_governance_context(run_dir: &Path) -> Result<GovernanceContext> {
         executor_model: load_executor_model()?,
         reviewer_model: load_reviewer_model()?,
         append_system_prompt: std::env::var("ALFRED_APPEND_SYSTEM_PROMPT").unwrap_or_default(),
+        // S2b：driver / REPL 面恒 None（通知打终端）；TUI 由 chat.rs 会话侧接入。
+        events: None,
     })
 }
 

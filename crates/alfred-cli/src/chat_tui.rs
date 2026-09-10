@@ -15,9 +15,11 @@
 //!   治理态 / 计划节点 / 维护者 / 审查结论 / 参考卷 / 产物。
 //! - **顶状态条**：run_id + 治理态实时（看板快照数据源）。
 //! - **捕获管道**：TUI 期间进程 stdout/stderr 被重定向进捕获管道（libc dup2）
-//!   ——治理内核尚未事件化的 println（governance.rs `[orchestrator]` 点位，
-//!   S2b 接线）经 drainer 线程整串透传左列；已双发的 `[chat]`/`[pi]` 行过滤
-//!   丢弃（透传=双显）。渲染流写 `/dev/tty`（与捕获流物理分离，画面不毁）。
+//!   ——drainer 线程过滤兜底：`[chat]`/`[pi]`/`[orchestrator]` 前缀行均已
+//!   [`ChatEvent`] 事件化（透传=左列双显）丢弃；空行丢弃；其余（未事件化的
+//!   残留输出）整串透传左列。governance.rs `[orchestrator]` 点位 S2b 起事件化
+//!   （TUI 模式不打终端），捕获透传路径退役。渲染流写 `/dev/tty`（与捕获流
+//!   物理分离，画面不毁）。
 //! - **多行输入自实现**（不引 tui-textarea：需求面只有字符/Tab 缩进/退格/
 //!   回车提交/↑↓历史/Ctrl-J 换行，百行内可控且光标语义完全自明）。Tab
 //!   插入 '\t'——数据层保真（对齐 REPL `sanitize_raw_line` 保留 \t：粘贴
@@ -121,7 +123,7 @@ fn term_enables_tui(term: Option<&str>) -> bool {
 /// 后 fd 保持捕获直至进程退出（worker 残留输出绝不落真终端），告别行直写原
 /// stdout。
 pub fn run(run_dir_flag: Option<&Path>) -> Result<()> {
-    // 通道双向：submit 行 → 治理 worker；治理事件/捕获透传行 → TUI 事件循环。
+    // 通道双向：submit 行 → 治理 worker；治理事件/捕获残留行 → TUI 事件循环。
     let (input_tx, input_rx) = mpsc::channel::<String>();
     let (event_tx, event_rx) = ChatEventBus::new();
     let (capture_tx, capture_rx) = mpsc::channel::<String>();
@@ -299,9 +301,10 @@ fn farewell_line(saved: &Arc<Mutex<Option<(RawFd, RawFd)>>>) {
 }
 
 /// 捕获重定向：`dup2` 管道写端覆到 fd 1/2（原 fd 经 `dup` 留底给回位/告别），
-/// drainer 线程逐行读管道——`[chat]`/`[pi]` 前缀行已由 [`ChatEvent`] 双发
-/// （透传=左列双显）丢弃；其余（governance.rs `[orchestrator]` 点位及其续
-/// 行、reviewer warn 等）整串透传左列（S2b 事件化接线后此通道退役）。
+/// drainer 线程逐行读管道——`[chat]`/`[pi]`/`[orchestrator]` 前缀行已由
+/// [`ChatEvent`] 事件化（透传=左列双显）丢弃；其余（未事件化的残留输出）
+/// 整串透传左列。governance.rs `[orchestrator]` 点位 S2b 事件化后不再进管道
+/// （TUI 模式不打终端），本通道只剩残留兜底。
 ///
 /// 退出协议：fd 1/2 是管道唯一写端（`dup2` 后关原写端 fd）——回位后管道
 /// EOF，drainer 自然退；捕获线程绝不写坏画面（读端独立 fd）。
@@ -405,12 +408,18 @@ fn drain_capture(mut f: File, forward: mpsc::Sender<String>) {
     }
 }
 
-/// 捕获行过滤转发（纯函数，可测）：`[chat] `/`[pi] ` 前缀行已由 [`ChatEvent`]
-/// 双发覆盖 → 丢弃；空行不透传（噪音）；其余整串透传（`[orchestrator]` 状态
-/// 行/升级块续行——前缀是行内正文一部分，不剥离，S2b 事件化后本通道退役）。
+/// 捕获行过滤转发（纯函数，可测）：`[chat] `/`[pi] `/`[orchestrator] ` 前缀行
+/// 已由 [`ChatEvent`] 事件化覆盖 → 丢弃（透传=左列双显；`[orchestrator]` 行
+/// S2b 起事件化，governance.rs TUI 模式不打终端——含 alfred-reviewer 的
+/// `[orchestrator] warn:` 行，其事件化属后续切片，TUI 面暂不可见）；空行不
+/// 透传（噪音）；其余（未事件化的残留输出）整串透传。
 fn forward_line(tx: &mpsc::Sender<String>, line: &str) {
     let line = line.trim_end_matches('\r');
-    if line.is_empty() || line.starts_with("[chat] ") || line.starts_with("[pi] ") {
+    if line.is_empty()
+        || line.starts_with("[chat] ")
+        || line.starts_with("[pi] ")
+        || line.starts_with("[orchestrator] ")
+    {
         return;
     }
     let _ = tx.send(line.to_string());
@@ -418,8 +427,8 @@ fn forward_line(tx: &mpsc::Sender<String>, line: &str) {
 
 // ── 应用状态 ──
 
-/// TUI 应用状态（S2a 汇合）：输入编辑器 + 左列对话流（事件渲染行/捕获透传
-/// 行/属主回声）+ 右列看板快照 + 治理通道两端。
+/// TUI 应用状态（S2a 汇合 + S2b 治理事件化）：输入编辑器 + 左列对话流（事件
+/// 渲染行/捕获残留行/属主回声）+ 右列看板快照 + 治理通道两端。
 struct TuiApp {
     input: InputEditor,
     /// 左列对话流（一事件一行；自动跟随底部，PgUp/PgDn 回溯是 S4）。
@@ -437,7 +446,7 @@ struct TuiApp {
     worker: mpsc::Sender<String>,
     /// 治理事件端（try_recv 非阻塞消费）。
     events: ChatEventReceiver,
-    /// 捕获透传行端（drainer 线程 → 左列）。
+    /// 捕获残留行端（drainer 线程 → 左列；未事件化的残留输出）。
     captured: mpsc::Receiver<String>,
     /// run 目录共享位（worker 发布，看板取数据源）。
     run_dir: Arc<Mutex<Option<PathBuf>>>,
@@ -466,7 +475,7 @@ impl TuiApp {
         }
     }
 
-    /// 每帧 poll 前的数据汇聚（全部非阻塞）：捕获透传行 → 治理事件（FIFO
+    /// 每帧 poll 前的数据汇聚（全部非阻塞）：捕获残留行 → 治理事件（FIFO
     /// 取尽；Disconnected = worker 已退）→ 看板快照（置脏或周期）。
     fn pump(&mut self) {
         while let Ok(line) = self.captured.try_recv() {
@@ -515,7 +524,7 @@ impl TuiApp {
                 format!("[pi] ⋯ {}", pi_action_text(kind, &detail))
             }
             ChatEvent::PiReply(text) => format!("[pi] {text}"),
-            ChatEvent::OrchestratorNotice(text) => format!("[chat] {text}"),
+            ChatEvent::OrchestratorNotice(text) => format!("[orchestrator] {text}"),
             ChatEvent::EscalationPrompt { reason, source } => {
                 let _ = source; // S4 着色/来源标签用；S2a 正文即含来源（REPL 同文）
                 format!("[chat] {reason}")
@@ -992,7 +1001,7 @@ fn dashboard_lines(snap: &DashboardSnapshot, width: usize) -> Vec<String> {
 }
 
 /// 四区渲染：顶状态条（alfred 版本 + run_id + 治理态徽标，实时）/ 左列
-/// "对话"（事件渲染行 + 捕获透传行，自动跟随底部）/ 右列"状态"（看板快照）/
+/// "对话"（事件渲染行 + 捕获残留行，自动跟随底部）/ 右列"状态"（看板快照）/
 /// 底部"输入"（多行编辑 + 按态提示标题，光标可见）。输入框内容宽与终端宽
 /// 同源（框横贯全宽）：先定折行再定布局，无循环依赖；框高随内容增长（上限
 /// 半屏），内容超高时可视窗口贴底、光标行越窗顶则上移保光标可见。
@@ -1047,7 +1056,7 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
         status_area,
     );
 
-    // ── 左列：对话流（事件/透传行，自动跟随底部） ──
+    // ── 左列：对话流（事件/捕获残留行，自动跟随底部） ──
     let conv_block = Block::bordered().title(" 对话 ");
     let conv_inner = conv_block.inner(conv_area);
     let conv_lines = conversation_rows(
@@ -1391,6 +1400,10 @@ mod tests {
 
     // ── 事件渲染（左列，按变体） ──
 
+    /// 各变体左列渲染：OrchestratorNotice 加回 `[orchestrator] ` 前缀（S2b
+    /// 契约：governance.rs 点位载荷去前缀，前缀由 sink 渲染时统一加——左列
+    /// 与捕获透传时代逐字节同面）；[pi]/[chat]/错误行各自前缀。
+    #[test]
     fn apply_event_renders_each_variant() {
         let (mut app, _wrx) = test_app();
         app.dash_dirty = false; // 构造的首帧置脏先消费掉，断言聚焦事件本身
@@ -1424,35 +1437,35 @@ mod tests {
                 "[pi] ⋯ 探查: ls src".to_string(),
                 "[pi] ⋯ 探查（被治理拦截）: cat ~/.omp/runs".to_string(),
                 "[pi] 计划分两步".to_string(),
-                "[chat] 已受理：X".to_string(),
+                "[orchestrator] 已受理：X".to_string(),
                 "[chat] 计划审查意见（打回）：太粗".to_string(),
                 "[chat] 操作失败：boom".to_string(),
             ]
         );
     }
 
-    /// pump：捕获透传行入列 + 事件 FIFO 取尽 + Disconnected 置 session_ended
-    /// （提示行一次性，输入停用）。
+    /// pump：捕获残留行入列 + 事件 FIFO 取尽 + Disconnected 置 session_ended
+    /// （提示行一次性，输入停用）。S2b 后治理 `[orchestrator]` 行走事件通道
+    /// （渲染加回前缀），捕获通道只剩未事件化残留。
     #[test]
     fn pump_drains_channels_and_marks_session_end() {
         let (wtx, wrx) = mpsc::channel();
         let (etx, erx) = ChatEventBus::new();
         let (ctx, crx) = mpsc::channel();
-        ctx.send("[orchestrator] 进入计划审查（state=plan_reviewing）".to_string())
-            .unwrap();
-        ctx.send("（续行）run_dir: /tmp/x".to_string()).unwrap();
+        ctx.send("docker: pulled image（未事件化残留）".to_string()).unwrap();
+        assert!(etx.send(ChatEvent::OrchestratorNotice(
+            "进入计划审查（state=plan_reviewing）".into()
+        )));
         assert!(etx.send(ChatEvent::PiReply("答复".into())));
-        assert!(etx.send(ChatEvent::OrchestratorNotice("状态行".into())));
         drop(etx); // worker 退场
         let mut app = TuiApp::new(wtx, erx, crx, Arc::new(Mutex::new(None)));
         app.pump();
         assert_eq!(
             app.messages,
             vec![
+                "docker: pulled image（未事件化残留）".to_string(),
                 "[orchestrator] 进入计划审查（state=plan_reviewing）".to_string(),
-                "（续行）run_dir: /tmp/x".to_string(),
                 "[pi] 答复".to_string(),
-                "[chat] 状态行".to_string(),
                 "[chat] 治理会话已退出（Ctrl-D/Ctrl-C 关闭界面）。".to_string(),
             ]
         );
@@ -1470,7 +1483,9 @@ mod tests {
 
     // ── 捕获行过滤 ──
 
-    /// [chat]/[pi] 前缀行已事件双发 → 丢弃；[orchestrator]/续行/空行语义。
+    /// [chat]/[pi]/[orchestrator] 前缀行已事件化（S2b 起 [orchestrator] 含
+    /// governance.rs 全部点位）→ 丢弃；空行丢弃；其余（未事件化残留——
+    /// 无前缀输出/[driver] 行）整串透传。
     #[test]
     fn capture_line_filter() {
         let (tx, rx) = mpsc::channel();
@@ -1478,15 +1493,15 @@ mod tests {
         forward_line(&tx, "[pi] ⋯ 探查: ls");
         forward_line(&tx, "");
         forward_line(&tx, "[orchestrator] 计划审查中");
-        forward_line(&tx, "  run_dir: /tmp/x（续行）");
+        forward_line(&tx, "[orchestrator] warn: exec verdict parse failed");
+        forward_line(&tx, "  run_dir: /tmp/x（残留续行）");
         forward_line(&tx, "[driver] 状态行");
         drop(tx);
         let got: Vec<String> = rx.iter().collect();
         assert_eq!(
             got,
             vec![
-                "[orchestrator] 计划审查中".to_string(),
-                "  run_dir: /tmp/x（续行）".to_string(),
+                "  run_dir: /tmp/x（残留续行）".to_string(),
                 "[driver] 状态行".to_string(),
             ]
         );

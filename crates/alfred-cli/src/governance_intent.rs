@@ -16,6 +16,7 @@
 //!         降级的新一轮 commit_intent 进 audits 通道保交织序）
 //!   2. run.apply(event)（Reply 停驻无事件）
 //!   flush ②（apply 后）：audits(转移后) 按序 emit → persist → notices
+//!     （经 governance::orchestrator_notice 单一出口：REPL 打终端 / TUI 事件化）
 //! ```
 //!
 //! 副作用失败（维护者停摆等）→ `Err` 穿出 → `run_governance_loop` 治理降级
@@ -27,8 +28,8 @@
 //! `execution_hard_error_escalated`，按机械/硬错误分支二选一）——所以
 //! [`StepIntent::Proceed`] 由 step 显式收集审计名 + data，不按事件名推导。
 use crate::governance::{
-    audit, maintain_after_converse, maintain_after_plan_review, persist_governance_run,
-    write_dagspec, GovernanceContext,
+    audit, maintain_after_converse, maintain_after_plan_review, orchestrator_notice,
+    persist_governance_run, write_dagspec, GovernanceContext,
 };
 use alfred_core::conversation::{append_to_disk, ConversationRole, ConversationSource};
 use alfred_core::governance::{GovernanceEvent, GovernanceRun};
@@ -87,8 +88,11 @@ pub struct Effects {
     /// 维护触发通道：收集指令延迟执行（flush 时才跑维护者 LLM 调用，apply 前）；
     /// 其失败的 audit 经治理降级新一轮 `commit_intent` 追加进 audits 通道保交织序。
     pub maintain_triggers: Vec<MaintainTrigger>,
-    /// apply 后属主可见提示通道（execution_step 机械重跑 println；转移生效后
-    /// 呈现——persist 之后，与 HEAD println 时机一致）。
+    /// apply 后属主可见提示通道（execution_step 机械重跑提示；转移生效后
+    /// 呈现——persist 之后，与 HEAD println 时机一致）。**载荷=去前缀纯正文**
+    /// （S2b 契约：`[orchestrator]` 前缀由 sink 渲染时统一加回，见
+    /// chat_events.rs）——flush 经 [`orchestrator_notice`] 单一出口：REPL 打
+    /// 终端（前缀拼回，逐字节不变）、TUI 发 [`ChatEvent::OrchestratorNotice`]。
     pub post_apply_notices: Vec<String>,
 }
 
@@ -148,7 +152,7 @@ impl Effects {
         self.maintain_triggers
             .push(MaintainTrigger::PlanReviewed(reason.into()));
     }
-    /// 收集一条 apply 后属主可见提示。
+    /// 收集一条 apply 后属主可见提示（去前缀纯正文——前缀由 sink 加回）。
     pub fn post_apply_notice(&mut self, notice: impl Into<String>) {
         self.post_apply_notices.push(notice.into());
     }
@@ -240,7 +244,7 @@ pub fn commit_intent(
             flush_audits(run, ctx, &effects.audits.post_apply)?;
             persist_governance_run(&ctx.run_dir, run)?;
             for notice in &effects.post_apply_notices {
-                println!("{notice}");
+                orchestrator_notice(ctx, notice);
             }
             Ok(None)
         }
@@ -344,6 +348,7 @@ fn flush_maintain_triggers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_events::{ChatEvent, ChatEventBus};
     use alfred_core::governance::{GovernanceOptions, GovernanceState};
     use alfred_core::request::OwnerRequest;
     use std::path::PathBuf;
@@ -386,6 +391,8 @@ mod tests {
                 executor_model: test_model(),
                 reviewer_model: test_model(),
                 append_system_prompt: String::new(),
+                // S2b：driver/REPL 面缺省无通道（通知打终端）；事件化用例按需注入。
+                events: None,
             },
             dir,
         )
@@ -573,6 +580,57 @@ mod tests {
         // 副作用失败 → Err 穿出（治理降级由 loop 接），状态机不动、无 persist。
         assert_eq!(run.state(), GovernanceState::PlanReviewing);
         std::fs::remove_file(&file_path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// S2b 通知事件化：通道在场 → 通知变 [`ChatEvent::OrchestratorNotice`] 事件
+    /// 且载荷=去前缀纯正文（契约见 chat_events.rs）。两个出口同一语义：
+    /// commit_intent 的 post_apply_notices 落点（机械重跑提示通道）与治理环
+    /// 直接出口 `orchestrator_notice`（状态行/升级块/contract_fault 共用）。
+    /// REPL 面（通道缺席）打终端逐字节不变——e2e chat.sh 黑盒覆盖，此处不重证。
+    #[test]
+    fn orchestrator_notices_emit_deprefixed_events_when_channel_present() {
+        let (mut ctx, dir) = temp_ctx("s2b-notice");
+        let (tx, rx) = ChatEventBus::new();
+        ctx.events = Some(tx);
+        let mut run = test_run();
+        run.apply(GovernanceEvent::PlanProduced).unwrap();
+
+        // 落点①：commit_intent flush post_apply_notices（Effects 通道正文）。
+        let mut effects = Effects::default();
+        effects.post_apply_notice("节点 task-1 执行机械失败，按同一契约重跑（1/2）：boom");
+        commit_intent(
+            &mut run,
+            &ctx,
+            StepIntent::Proceed {
+                event: GovernanceEvent::PlanReviewPassed,
+                effects,
+            },
+        )
+        .unwrap();
+
+        // 落点②：治理环直接出口（状态行/升级块同函数）。
+        orchestrator_notice(&ctx, "进入计划审查（state=plan_reviewing）");
+
+        let got: Vec<ChatEvent> = {
+            let mut v = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                v.push(ev);
+            }
+            v
+        };
+        assert_eq!(
+            got,
+            vec![
+                ChatEvent::OrchestratorNotice(
+                    "节点 task-1 执行机械失败，按同一契约重跑（1/2）：boom".into()
+                ),
+                ChatEvent::OrchestratorNotice(
+                    "进入计划审查（state=plan_reviewing）".into()
+                ),
+            ],
+            "两条通知均事件化且载荷无 [orchestrator] 前缀"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
