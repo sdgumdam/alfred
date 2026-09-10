@@ -233,6 +233,11 @@ pub fn build_messages(
 }
 
 /// 解析 LLM 输出 → 指令序列 → GraphBuilder → DagSpec。
+///
+/// builder 的指令/图错误在出口处经 [`neutralize_graph_error`] 中性化（M2
+/// 红线）：builder 先于 validate_dagspec 拒绝环/悬空/重复边——真实 converse
+/// 产出必经此路径，原样包装会把 "builder"/"edge"/"cycle" 等词形带进
+/// planning_error_escalated 审计面（经属主转述给规划器即泄漏治理词形）。
 pub fn instructions_to_dagspec(text: &str, request: &OwnerRequest) -> Result<DagSpec> {
     let cleaned = strip_fences(text);
     let v: serde_json::Value = serde_json::from_str(&cleaned)
@@ -246,11 +251,11 @@ pub fn instructions_to_dagspec(text: &str, request: &OwnerRequest) -> Result<Dag
     for inst in insts {
         builder
             .apply(inst)
-            .map_err(|e| anyhow::anyhow!("builder error: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{}", neutralize_graph_error(&e)))?;
     }
     let mut dagspec = builder
         .build()
-        .map_err(|e| anyhow::anyhow!("builder error: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{}", neutralize_graph_error(&e)))?;
     validate_dagspec(&dagspec, request)?;
     // B：大文件感知兜底——契约 time_limit_secs 字段在此写入（planner 产
     // instructions.json 的 dagspec 构造处）。提示词指导 planner 主动写对，
@@ -368,14 +373,27 @@ fn validate_dagspec(dagspec: &DagSpec, request: &OwnerRequest) -> Result<()> {
     Ok(())
 }
 
-/// 依赖图诊断（`topological_order` 错误文案）→ 中性措辞。
+/// 依赖图诊断 → 中性措辞（`GraphBuilder` 指令错误与 `topological_order`
+/// 校验错误的单一中性化真源）。
 ///
-/// 错误文案前缀/句式是 alfred-core M1 契约（entities.rs 逐条断言），按稳定
-/// 前缀分类转写：去内部实体名（dagspec）与英文诊断词形，保留节点 id/路径
-/// 细节（属主可读、可转述给规划器定位问题）。未识别的原文透传——宁可保持
-/// 原样也不吞掉诊断信息（无静默出口）。
+/// 错误文案前缀/句式是 alfred-core M1 契约（builder.rs / dagspec.rs 构造、
+/// entities.rs 逐条断言），按稳定前缀分类转写：去内部实体名
+/// （builder/dagspec）与英文诊断词形，保留节点 id/路径细节（属主可读、可
+/// 转述给规划器定位问题）。未识别的原文透传——宁可保持原样也不吞掉诊断
+/// 信息（无静默出口）。
 fn neutralize_graph_error(err: &str) -> String {
+    // builder 指令路径（P2 泄漏面）：add_edge/add_node/set_routes 的结构性
+    // 拒绝先于 validate_dagspec 发生（真实 converse 产出与指令形态注入必经），
+    // 同一条 M2 红线在此收敛。
+    if let Some(detail) = err.strip_prefix("builder: ") {
+        return neutralize_builder_detail(detail).unwrap_or_else(|| err.to_string());
+    }
     let detail = err.strip_prefix("dagspec: ").unwrap_or(err);
+    if let Some(rest) = detail.strip_prefix("duplicate node id '") {
+        if let Some(id) = rest.strip_suffix('\'') {
+            return format!("计划里任务 {id} 声明了两次");
+        }
+    }
     if let Some(path) = detail.strip_prefix("cycle detected: ") {
         return format!("计划里有些任务的先后关系成了环：{path}");
     }
@@ -393,6 +411,85 @@ fn neutralize_graph_error(err: &str) -> String {
         }
     }
     err.to_string()
+}
+
+/// builder 错误细节（strip `builder: ` 后）→ 中性措辞；未识别返回 None
+/// （调用方原文透传，无静默出口）。
+///
+/// 覆盖 builder.rs 错误文案的全集（M1 契约闭集）：图结构拒绝（环/自环/
+/// 重复边/重复任务/悬空端点）+ 契约字段缺失 + begin/commit 指令序列违规。
+/// 措辞用规划器提示词已教过的词汇（前置/后继/声明/任务描述/验收标准），
+/// 不留英文词形（begin/commit → 开始指令/结束指令）。
+fn neutralize_builder_detail(detail: &str) -> Option<String> {
+    // ---- 图结构拒绝（P2 核心泄漏面：环/悬空/重复边）----
+    if let Some(rest) = detail.strip_prefix("edge '") {
+        // "<from> -> <to>' would create a cycle"
+        if let Some(pair) = rest.strip_suffix("' would create a cycle") {
+            return Some(format!("计划里的依赖 {pair} 会让先后关系成环"));
+        }
+    }
+    if let Some(rest) = detail.strip_prefix("self-loop edge '") {
+        // "<from> -> <to>'"（from == to）
+        if let Some(pair) = rest.strip_suffix('\'') {
+            let from = pair.split_once(" -> ").map(|(f, _)| f).unwrap_or(pair);
+            return Some(format!("计划里任务 {from} 依赖了自己"));
+        }
+    }
+    if let Some(rest) = detail.strip_prefix("duplicate edge '") {
+        if let Some(pair) = rest.strip_suffix('\'') {
+            return Some(format!("计划里同样的依赖 {pair} 声明了两次"));
+        }
+    }
+    if let Some(rest) = detail.strip_prefix("add_edge from unknown node '") {
+        if let Some(id) = rest.strip_suffix('\'') {
+            return Some(format!("计划里依赖的前置任务 {id} 没有声明过"));
+        }
+    }
+    if let Some(rest) = detail.strip_prefix("add_edge to unknown node '") {
+        if let Some(id) = rest.strip_suffix('\'') {
+            return Some(format!("计划里依赖的后继任务 {id} 没有声明过"));
+        }
+    }
+    if let Some(rest) = detail.strip_prefix("set_routes references unknown node '") {
+        if let Some(id) = rest.strip_suffix('\'') {
+            return Some(format!("计划的起始任务 {id} 没有声明过"));
+        }
+    }
+    if let Some(rest) = detail.strip_prefix("duplicate node id '") {
+        if let Some(id) = rest.strip_suffix('\'') {
+            return Some(format!("计划里任务 {id} 声明了两次"));
+        }
+    }
+    // ---- 契约字段缺失 ----
+    if let Some(rest) = detail.strip_prefix("add_node '") {
+        // "<id>' contract.<field> is empty"
+        if let Some(id) = rest.strip_suffix("' contract.prompt is empty") {
+            return Some(format!("计划里任务 {id} 的任务描述是空的"));
+        }
+        if let Some(id) = rest.strip_suffix("' contract.acceptance_criteria is empty") {
+            return Some(format!("计划里任务 {id} 的验收标准是空的"));
+        }
+    }
+    // ---- begin/commit 指令序列违规（闭集，整句匹配）----
+    Some(match detail {
+        "begin already called (only once)" => "建图指令序列里开始指令出现了不止一次",
+        "begin must be the first instruction" => "建图指令序列的第一条必须是开始指令",
+        "begin requires non-empty request_id" => "开始指令没带需求 id",
+        "add_node before begin" => "有任务声明出现在开始指令之前",
+        "add_edge before begin" => "有依赖声明出现在开始指令之前",
+        "set_routes before begin" => "起始任务声明出现在开始指令之前",
+        "commit before begin" => "结束指令出现在开始指令之前",
+        "add_node after commit" => "有任务声明出现在结束指令之后",
+        "add_edge after commit" => "有依赖声明出现在结束指令之后",
+        "set_routes after commit" => "起始任务声明出现在结束指令之后",
+        "commit already called" => "结束指令出现了不止一次",
+        "commit requires at least one node" => "结束指令之前一个任务都没有声明",
+        "add_node requires non-empty id" => "有任务声明没带 id",
+        "build before commit" => "建图指令序列缺结束指令",
+        "build without request_id" => "建图指令序列缺开始指令",
+        _ => return None,
+    }
+    .to_string())
 }
 
 /// 离线确定性直通（`ALFRED_OFFLINE=1` 或 `ALFRED_PLANNER_OFFLINE=1`）：§2.4 两分支由注入文件二选一。
@@ -452,8 +549,10 @@ fn read_offline_plan(path: &str, request: &OwnerRequest) -> Result<DagSpec> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("read offline plan {}", path))?;
     if text.trim_start().starts_with('[') {
-        return instructions_to_dagspec(&text, request)
-            .with_context(|| format!("parse offline plan {}", path));
+        // 指令序列形态的错误不加 context：错误链会原样进
+        // planning_error_escalated 审计面（M2 红线——英文/宿主路径词形经属主
+        // 转述即泄漏），且宿主 pi 真跑路径（converse 直调）同样无 context。
+        return instructions_to_dagspec(&text, request);
     }
     let plan: DagSpec =
         serde_json::from_str(&text).with_context(|| format!("parse offline plan {}", path))?;
@@ -777,6 +876,15 @@ mod tests {
                 },
                 &["声明了两次", "task-1 -> task-2"],
             ),
+            (
+                "重复任务 id",
+                DagSpec {
+                    request_id: "req-1".into(),
+                    nodes: vec![mn_node("task-1"), mn_node("task-1")],
+                    edges: vec![],
+                },
+                &["声明了两次", "task-1"],
+            ),
         ];
         for (name, dag, expected) in &cases {
             let err = validate_dagspec(dag, &owner_request())
@@ -791,6 +899,184 @@ mod tests {
                 "unknown node",
                 "duplicate edge",
                 "references",
+            ] {
+                assert!(!err.contains(tech), "{name}: err 含技术词 {tech}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn builder_path_graph_errors_are_neutral() {
+        // P2（多节点审查）：builder 路径图错误中性化。真实 converse 产出与
+        // 指令形态注入走 instructions_to_dagspec → GraphBuilder，builder 先于
+        // validate_dagspec 拒绝环/悬空/重复边——错误原样包装曾把
+        // "builder"/"edge"/"cycle" 等词形带进 planning_error_escalated（经属主
+        // 转述给规划器即泄漏治理词形）。断言词表照 M2
+        // validate_graph_errors_are_neutral 扩展；保留节点 id 定位细节。
+        let node = |id: &str| {
+            format!(
+                r#"{{"op":"add_node","id":"{id}","summary":"s","contract":{{"prompt":"p","acceptance_criteria":"a"}},"sandbox":{{"workspace_subdirs":["src"]}}}}"#
+            )
+        };
+        let insts = |ops: Vec<String>| format!("[{}]", ops.join(","));
+        let begin = r#"{"op":"begin","request_id":"req-1"}"#.to_string();
+        let edge = |from: &str, to: &str| {
+            format!(r#"{{"op":"add_edge","from":"{from}","to":"{to}"}}"#)
+        };
+
+        // (名, 指令序列, 期望包含)：环/悬空/重复边 = P2 复现三件套；自环/
+        // 重复任务/悬空起始任务 = 同类图结构拒绝（builder 错误闭集）。
+        let cases: Vec<(&str, String, Vec<&str>)> = vec![
+            (
+                "环",
+                insts(vec![
+                    begin.clone(),
+                    node("task-1"),
+                    node("task-2"),
+                    edge("task-1", "task-2"),
+                    edge("task-2", "task-1"),
+                ]),
+                vec!["先后关系成环", "task-2 -> task-1"],
+            ),
+            (
+                "悬空前置",
+                insts(vec![begin.clone(), node("task-1"), edge("ghost", "task-1")]),
+                vec!["前置任务 ghost", "没有声明过"],
+            ),
+            (
+                "悬空后继",
+                insts(vec![begin.clone(), node("task-1"), edge("task-1", "ghost")]),
+                vec!["后继任务 ghost", "没有声明过"],
+            ),
+            (
+                "重复边",
+                insts(vec![
+                    begin.clone(),
+                    node("task-1"),
+                    node("task-2"),
+                    edge("task-1", "task-2"),
+                    edge("task-1", "task-2"),
+                ]),
+                vec!["声明了两次", "task-1 -> task-2"],
+            ),
+            (
+                "自环",
+                insts(vec![begin.clone(), node("task-1"), edge("task-1", "task-1")]),
+                vec!["依赖了自己", "task-1"],
+            ),
+            (
+                "重复任务 id",
+                insts(vec![begin.clone(), node("task-1"), node("task-1")]),
+                vec!["声明了两次", "task-1"],
+            ),
+            (
+                "悬空起始任务",
+                insts(vec![
+                    begin.clone(),
+                    node("task-1"),
+                    r#"{"op":"set_routes","start":["ghost"]}"#.to_string(),
+                ]),
+                vec!["起始任务 ghost", "没有声明过"],
+            ),
+        ];
+        for (name, text, expected) in &cases {
+            let err = instructions_to_dagspec(text, &owner_request())
+                .unwrap_err()
+                .to_string();
+            for word in expected {
+                assert!(err.contains(word), "{name}: err = {err}");
+            }
+            // 断言词表照 M2 扩展：内部实体名（builder/dagspec）+ 图诊断词形
+            // + 指令词形（builder 路径新增泄漏面）零出现。
+            for tech in [
+                "builder",
+                "dagspec",
+                "cycle",
+                "edge",
+                "node",
+                "duplicate",
+                "unknown",
+                "references",
+                "self-loop",
+                "would",
+                "add_edge",
+                "add_node",
+                "set_routes",
+                "begin",
+                "commit",
+            ] {
+                assert!(!err.contains(tech), "{name}: err 含技术词 {tech}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn builder_path_instruction_errors_are_neutral() {
+        // P2 同一泄漏面的兄弟形态：指令序列违规与契约字段缺失同样经
+        // instructions_to_dagspec 进 planning_error_escalated——闭集内全部
+        // 中性化（begin/commit → 开始指令/结束指令；contract 字段 → 任务
+        // 描述/验收标准），不留英文词形。
+        let node = |id: &str| {
+            format!(
+                r#"{{"op":"add_node","id":"{id}","summary":"s","contract":{{"prompt":"p","acceptance_criteria":"a"}},"sandbox":{{"workspace_subdirs":["src"]}}}}"#
+            )
+        };
+        let insts = |ops: Vec<String>| format!("[{}]", ops.join(","));
+        let begin = r#"{"op":"begin","request_id":"req-1"}"#.to_string();
+
+        let cases: Vec<(&str, String, Vec<&str>)> = vec![
+            (
+                "任务声明在开始指令之前",
+                insts(vec![node("task-1")]),
+                vec!["开始指令之前"],
+            ),
+            (
+                "缺结束指令",
+                insts(vec![begin.clone(), node("task-1")]),
+                vec!["缺结束指令"],
+            ),
+            (
+                "结束指令前无任务",
+                insts(vec![
+                    begin.clone(),
+                    r#"{"op":"commit"}"#.to_string(),
+                ]),
+                vec!["结束指令之前一个任务都没有"],
+            ),
+            (
+                "任务描述为空",
+                insts(vec![
+                    begin.clone(),
+                    r#"{"op":"add_node","id":"task-1","summary":"s","contract":{"prompt":"","acceptance_criteria":"a"},"sandbox":{"workspace_subdirs":["src"]}}"#.to_string(),
+                ]),
+                vec!["任务描述是空的", "task-1"],
+            ),
+            (
+                "验收标准为空",
+                insts(vec![
+                    begin.clone(),
+                    r#"{"op":"add_node","id":"task-1","summary":"s","contract":{"prompt":"p","acceptance_criteria":""},"sandbox":{"workspace_subdirs":["src"]}}"#.to_string(),
+                ]),
+                vec!["验收标准是空的", "task-1"],
+            ),
+        ];
+        for (name, text, expected) in &cases {
+            let err = instructions_to_dagspec(text, &owner_request())
+                .unwrap_err()
+                .to_string();
+            for word in expected {
+                assert!(err.contains(word), "{name}: err = {err}");
+            }
+            for tech in [
+                "builder",
+                "dagspec",
+                "begin",
+                "commit",
+                "add_node",
+                "contract",
+                "empty",
+                "request_id",
+                "requires",
             ] {
                 assert!(!err.contains(tech), "{name}: err 含技术词 {tech}: {err}");
             }
