@@ -661,6 +661,12 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
 /// 语义 = 全图完成）。所有节点共享同一 run/ws（挂载面不变——下游节点天然
 /// 看到上游产物）。断点恢复：`completed_nodes` 落 state.json，崩溃后从已完成
 /// 节点续跑；机械重跑预算 per-node（节点完成即重置 attempts_used）。
+///
+/// G1（driver 孤儿检测）：执行前查下一 exec 目录的孤儿签名（驱动已启动未
+/// 收尾——[`orphaned_driver_run`]）——上个进程在 poll 中途死亡（TUI 退出收割 /
+/// kill -9）时驱动与容器成孤儿、done 永不出现，state.json 永停 executing。
+/// 检出即按 crashed 语义路由 [`execution_failure_intent`]（机械重跑/耗尽
+/// 升级），不无限等也不覆写孤儿目录。
 fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()> {
     let dagspec = run
         .dagspec
@@ -692,6 +698,23 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
         contract: node.contract.clone(),
         sandbox: node.sandbox.clone(),
     };
+    // G1（driver 孤儿检测）：下一 exec 目录已有"驱动已启动未收尾"痕迹 = 上个
+    // 进程在 poll 中途死亡——本进程续跑必须接住，视为机械失败（crashed 语义：
+    // 与驱动进程内崩溃同路由，error 非 timeout 不放大时间上限）走既有
+    // mechanical_retry/耗尽路径。孤儿目录序号消费掉：重跑落新 exec 目录，
+    // 孤儿目录（driver.py/audit/done 痕迹）不被覆写，取证面保留。
+    let orphan_dir = ctx.run_dir.join(format!("exec-{}", run.execution_count + 1));
+    if orphaned_driver_run(&orphan_dir) {
+        run.execution_count += 1;
+        let err = anyhow::anyhow!(
+            "orphaned driver run {}: previous process died mid-poll \
+             (driver launched without done/state record)",
+            orphan_dir.display()
+        );
+        let intent = execution_failure_intent(run, &dagspec, &node, Some("crashed"), &err, true);
+        commit_intent(run, ctx, intent)?;
+        return Ok(());
+    }
     run.execution_count += 1;
     let exec_dir = ctx.run_dir.join(format!("exec-{}", run.execution_count));
     // M3：节点执行轨迹——node_started 直写（容器长跑前落盘，中途崩溃审计
@@ -764,103 +787,158 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
             // 机械失败判定：driver timed_out / error / crash（读 exec 子 run 的
             // state.json 的 eval_status）。
             let failure_status = exec_failure_status(&exec_dir)?;
-            let intent = if let Some(status) = failure_status {
-                match route_mechanical_failure(
-                    &status,
-                    &dagspec,
-                    // M3：放大/重跑落点 = 当前失败节点（多节点图非首节点）。
-                    &node.id,
-                    run.options.exec_time_limit_secs,
-                    run.attempts_used,
-                    run.mechanical_budget,
-                ) {
-                    MechanicalFailureRouting::Retry {
-                        attempt,
-                        amplified_dagspec,
-                        time_limit_adjusted,
-                    } => {
-                        run.attempts_used += 1;
-                        // HEAD 顺序（execution_step 特有）：apply(ExecutionFailedRetry)
-                        // 在前 → mechanical_retry 审计在后（audits 通道 post_apply 段
-                        // 保序）→ println 重跑提示（post_apply_notices 通道）。
-                        let mut effects = Effects::default();
-                        // C：放大后的 dagspec 经通道写回（dagspec.json 落盘 +
-                        // run.dagspec 注入，与 PlanProduced 同机制）——下轮
-                        // execution_step 用节点新值重新渲染 driver.py（execute_run
-                        // 每次 exec-N 全新生成）。
-                        if let Some(dagspec) = amplified_dagspec {
-                            effects.dagspec = Some(dagspec);
-                        }
-                        let mut data = serde_json::json!({
-                            "node_id": node.id,
-                            "attempt": attempt,
-                            "budget": run.mechanical_budget,
-                            "error": format!("{e:#}"),
-                            "failure_status": status,
-                        });
-                        let notice = match time_limit_adjusted {
-                            Some((from, to)) => {
-                                data["time_limit_adjusted"] =
-                                    serde_json::json!({ "from": from, "to": to });
-                                format!(
-                                    "节点 {} 执行超时（timed_out），自适应放大时间上限重跑（{attempt}/{}，time_limit {from}s→{to}s）：{e}",
-                                    node.id,
-                                    run.mechanical_budget
-                                )
-                            }
-                            None => format!(
-                                "节点 {} 执行机械失败，按同一契约重跑（{attempt}/{}）：{e}",
-                                node.id,
-                                run.mechanical_budget
-                            ),
-                        };
-                        effects.post_apply_audit("mechanical_retry", data);
-                        // S2b：notice 通道载荷=去前缀正文（前缀由 sink 加回，
-                        // 见 Effects::post_apply_notice 文档）。
-                        effects.post_apply_notice(notice);
-                        StepIntent::Proceed {
-                            event: GovernanceEvent::ExecutionFailedRetry,
-                            effects,
-                        }
-                    }
-                    MechanicalFailureRouting::Exhausted {
-                        final_time_limit_secs,
-                    } => {
-                        // 放大后仍耗尽 → 照旧升级；data 带最终预算（属主决策
-                        // 信息充分：知道系统已把上限抬到哪、仍不够）。
-                        let mut effects = Effects::default();
-                        effects.audit(
-                            "mechanical_budget_exhausted_escalated",
-                            serde_json::json!({
-                                "node_id": node.id,
-                                "error": format!("{e:#}"),
-                                "failure_status": status,
-                                "time_limit_secs": final_time_limit_secs,
-                            }),
-                        );
-                        StepIntent::Proceed {
-                            event: GovernanceEvent::ExecutionFailedEscalate,
-                            effects,
-                        }
-                    }
-                }
-            } else {
-                // 非机械的硬错误（如非默认沙箱档案）→ 升级属主，不悄悄放行。
-                let mut effects = Effects::default();
-                effects.audit(
-                    "execution_hard_error_escalated",
-                    serde_json::json!({
-                        "node_id": node.id,
-                        "error": format!("{e:#}"),
-                    }),
-                );
-                StepIntent::Proceed {
-                    event: GovernanceEvent::ExecutionFailedEscalate,
-                    effects,
-                }
-            };
+            let intent = execution_failure_intent(
+                run,
+                &dagspec,
+                &node,
+                failure_status.as_deref(),
+                &e,
+                false,
+            );
             commit_intent(run, ctx, intent)?;
             Ok(())
+        }
+    }
+}
+
+/// G1：exec 子目录的 driver 孤儿签名——审计含 `container_driver_launched`
+/// （驱动子进程已 spawn）且无 state.json（execute_run 的任何收尾路径——
+/// 成功写 state / 机械失败 fail_run——都会落 state.json）。
+///
+/// = 上个进程在 poll 中途死亡（TUI 退出收割 / kill -9 alfred）：驱动与容器
+/// 成孤儿，done 永不出现；state.json 停 executing，无人推进。已收尾（有
+/// state.json）或未启动过驱动（无 launched 审计，如 spawn 前失败）都不是
+/// 孤儿——前者已定论，后者无孤儿进程需要接住。
+fn orphaned_driver_run(exec_dir: &Path) -> bool {
+    if exec_dir.join("state.json").exists() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(exec_dir.join("audit.jsonl")) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| v["event"].as_str().map(|e| e == "container_driver_launched"))
+            .unwrap_or(false)
+    })
+}
+
+/// 执行失败的路由意图（决策纯——副作用经 [`Effects`] 通道收集，提交统一在
+/// [`commit_intent`]）。
+///
+/// 机械失败（`failure_status = Some`：timed_out / error / crashed，eval_status
+/// 读自 exec 子 run 的 state.json，或 G1 孤儿检测的 crashed 语义）→
+/// [`route_mechanical_failure`] 路由（timed_out 自适应放大 / error·crashed 同
+/// 契约重跑 / 预算耗尽升级）；非机械硬错误（`None`，如非默认沙箱档案）→
+/// 升级属主，不悄悄放行。execution_step 的 Err 分支与 G1 孤儿检测共用——
+/// 同一失败只走一条路由真源。
+///
+/// `orphaned` = G1 孤儿路径标记：mechanical_retry 审计带 `orphaned_driver`
+/// 字段（与驱动进程内崩溃的 crashed 区分取证）。
+fn execution_failure_intent(
+    run: &mut GovernanceRun,
+    dagspec: &alfred_core::DagSpec,
+    node: &alfred_core::PlanNode,
+    failure_status: Option<&str>,
+    err: &anyhow::Error,
+    orphaned: bool,
+) -> StepIntent {
+    let Some(status) = failure_status else {
+        // 非机械的硬错误（如非默认沙箱档案）→ 升级属主，不悄悄放行。
+        let mut effects = Effects::default();
+        effects.audit(
+            "execution_hard_error_escalated",
+            serde_json::json!({
+                "node_id": node.id,
+                "error": format!("{err:#}"),
+            }),
+        );
+        return StepIntent::Proceed {
+            event: GovernanceEvent::ExecutionFailedEscalate,
+            effects,
+        };
+    };
+    match route_mechanical_failure(
+        status,
+        dagspec,
+        // M3：放大/重跑落点 = 当前失败节点（多节点图非首节点）。
+        &node.id,
+        run.options.exec_time_limit_secs,
+        run.attempts_used,
+        run.mechanical_budget,
+    ) {
+        MechanicalFailureRouting::Retry {
+            attempt,
+            amplified_dagspec,
+            time_limit_adjusted,
+        } => {
+            run.attempts_used += 1;
+            // HEAD 顺序（execution_step 特有）：apply(ExecutionFailedRetry)
+            // 在前 → mechanical_retry 审计在后（audits 通道 post_apply 段
+            // 保序）→ println 重跑提示（post_apply_notices 通道）。
+            let mut effects = Effects::default();
+            // C：放大后的 dagspec 经通道写回（dagspec.json 落盘 +
+            // run.dagspec 注入，与 PlanProduced 同机制）——下轮
+            // execution_step 用节点新值重新渲染 driver.py（execute_run
+            // 每次 exec-N 全新生成）。
+            if let Some(dagspec) = amplified_dagspec {
+                effects.dagspec = Some(dagspec);
+            }
+            let mut data = serde_json::json!({
+                "node_id": node.id,
+                "attempt": attempt,
+                "budget": run.mechanical_budget,
+                "error": format!("{err:#}"),
+                "failure_status": status,
+            });
+            if orphaned {
+                data["orphaned_driver"] = serde_json::json!(true);
+            }
+            let notice = match time_limit_adjusted {
+                Some((from, to)) => {
+                    data["time_limit_adjusted"] =
+                        serde_json::json!({ "from": from, "to": to });
+                    format!(
+                        "节点 {} 执行超时（timed_out），自适应放大时间上限重跑（{attempt}/{}，time_limit {from}s→{to}s）：{err}",
+                        node.id,
+                        run.mechanical_budget
+                    )
+                }
+                None => format!(
+                    "节点 {} 执行机械失败，按同一契约重跑（{attempt}/{}）：{err}",
+                    node.id,
+                    run.mechanical_budget
+                ),
+            };
+            effects.post_apply_audit("mechanical_retry", data);
+            // S2b：notice 通道载荷=去前缀正文（前缀由 sink 加回，
+            // 见 Effects::post_apply_notice 文档）。
+            effects.post_apply_notice(notice);
+            StepIntent::Proceed {
+                event: GovernanceEvent::ExecutionFailedRetry,
+                effects,
+            }
+        }
+        MechanicalFailureRouting::Exhausted {
+            final_time_limit_secs,
+        } => {
+            // 放大后仍耗尽 → 照旧升级；data 带最终预算（属主决策
+            // 信息充分：知道系统已把上限抬到哪、仍不够）。
+            let mut effects = Effects::default();
+            effects.audit(
+                "mechanical_budget_exhausted_escalated",
+                serde_json::json!({
+                    "node_id": node.id,
+                    "error": format!("{err:#}"),
+                    "failure_status": status,
+                    "time_limit_secs": final_time_limit_secs,
+                }),
+            );
+            StepIntent::Proceed {
+                event: GovernanceEvent::ExecutionFailedEscalate,
+                effects,
+            }
         }
     }
 }
@@ -1697,4 +1775,204 @@ mod tests {
         assert!(load_governance_run(&dir).is_ok(), "覆写后仍完整可读回");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    // ---------- G1：driver 孤儿检测（进程死亡无 done → 机械失败路由） ----------
+
+    /// 造一个"驱动已启动未收尾"的孤儿 exec 目录（run_started + launched 审计、
+    /// 无 state.json——上个进程 poll 中途死亡的落盘形态）。
+    fn orphan_exec_dir(run_dir: &Path, n: u32) -> PathBuf {
+        let dir = run_dir.join(format!("exec-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("audit.jsonl"),
+            concat!(
+                r#"{"data":{"run_id":"exec-N","task_id":"task-1"},"event":"run_started","ts":"t"}"#,
+                "\n",
+                r#"{"data":{"pid":123,"done_marker":"x"},"event":"container_driver_launched","ts":"t"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn orphan_signature_is_launched_without_state_json() {
+        // G1 孤儿签名 = container_driver_launched 审计 + 无 state.json（任何
+        // 收尾路径都落 state.json）。已收尾 / 未启动过驱动 / 目录不存在 都不是
+        // 孤儿——前者已定论，后者无孤儿进程要接住（重跑即覆写，HEAD 语义）。
+        let dir = temp_exec_dir("g1-signature", None);
+
+        // 驱动已启动未收尾 → 孤儿。
+        let orphan = orphan_exec_dir(&dir, 1);
+        assert!(orphaned_driver_run(&orphan), "launched + 无 state.json = 孤儿");
+
+        // 已收尾（state.json 在，无论成败）→ 非孤儿。
+        let concluded = orphan_exec_dir(&dir, 2);
+        std::fs::write(
+            concluded.join("state.json"),
+            r#"{"run": {"eval_status": "crashed"}}"#,
+        )
+        .unwrap();
+        assert!(
+            !orphaned_driver_run(&concluded),
+            "launched + state.json = 已收尾，非孤儿"
+        );
+
+        // spawn 前失败（无 launched 审计，如 compose 生成失败）→ 非孤儿
+        //（无驱动进程/容器需要接住，走既有硬错误路径）。
+        let pre_spawn = dir.join("exec-3");
+        std::fs::create_dir_all(&pre_spawn).unwrap();
+        std::fs::write(
+            pre_spawn.join("audit.jsonl"),
+            r#"{"data":{"run_id":"exec-3"},"event":"run_started","ts":"t"}"#,
+        )
+        .unwrap();
+        assert!(
+            !orphaned_driver_run(&pre_spawn),
+            "无 launched 审计 = 未启动驱动，非孤儿"
+        );
+
+        // 目录不存在（全新 run / 全部已收尾）→ 非孤儿。
+        assert!(!orphaned_driver_run(&dir.join("exec-99")), "目录不存在 = 非孤儿");
+
+        // done.json 在而 state.json 缺（进程死在 done 落盘与收尾之间）→ 仍按
+        // 孤儿接住：outcome 未采集未提交，同按 crashed 重跑（宁可重跑不丢账）。
+        let done_orphan = orphan_exec_dir(&dir, 4);
+        std::fs::write(
+            done_orphan.join("driver.done.json"),
+            r#"{"event":"done","status":"success"}"#,
+        )
+        .unwrap();
+        assert!(
+            orphaned_driver_run(&done_orphan),
+            "done 在但未收尾（无 state.json）= 孤儿"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Executing 态 run + 治理上下文（execution_step 黑盒驱动的最小装配——
+    /// 模型字段不被孤儿路径消费，占位即可）。
+    fn run_in_executing(tag: &str) -> (GovernanceRun, GovernanceContext, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "alfred-g1-{tag}-{}",
+            alfred_core::util::short_id("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut run = GovernanceRun::new(
+            "run-g1",
+            OwnerRequest::new("req-g1", "标题", "描述", "验收"),
+            GovernanceOptions::default(),
+        );
+        run.apply(GovernanceEvent::PlanProduced).unwrap();
+        run.apply(GovernanceEvent::PlanReviewPassed).unwrap();
+        run.dagspec = Some(single_node_dagspec(None));
+        let model = ExecutorModel {
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            max_tokens: 8192,
+            raw_id: true,
+        };
+        let ctx = GovernanceContext {
+            run_dir: dir.clone(),
+            planner_model: model.clone(),
+            executor_model: model.clone(),
+            reviewer_model: model,
+            append_system_prompt: String::new(),
+            events: None,
+        };
+        (run, ctx, dir)
+    }
+
+    fn run_audit_events(dir: &Path) -> Vec<(String, Value)> {
+        std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                (v["event"].as_str().unwrap().to_string(), v["data"].clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn orphaned_driver_routes_mechanical_retry_and_consumes_exec_index() {
+        // G1 主路径：续跑进程在 execution_step 检出孤儿 exec 目录（上个进程
+        // poll 中途死亡、驱动无 done）→ 按 crashed 语义走既有 mechanical_retry
+        // 路由——孤儿尝试计入预算、状态自环 Executing 续跑、孤儿目录序号消费
+        // （重跑落新目录，取证面不被覆写）、persist 可读回（断点续跑契约）。
+        // 孤儿路径在 execute_run 之前短路——本测试不真起容器。
+        let (mut run, ctx, dir) = run_in_executing("retry");
+        let orphan = orphan_exec_dir(&dir, 1); // execution_count=0 → 下一目录 exec-1
+        let orphan_audit_before = std::fs::read_to_string(orphan.join("audit.jsonl")).unwrap();
+
+        execution_step(&mut run, &ctx).unwrap();
+
+        // 自环 Executing：机械重跑已记账（孤儿尝试 = 一次机械失败）。
+        assert_eq!(run.state(), GovernanceState::Executing);
+        assert_eq!(run.attempts_used, 1, "孤儿尝试计入机械预算");
+        assert_eq!(run.execution_count, 1, "孤儿目录序号已消费（重跑落 exec-2）");
+        // mechanical_retry 审计：crashed + orphaned_driver 标记（与进程内崩溃
+        // 的 crashed 区分取证）。
+        let events = run_audit_events(&dir);
+        let retry = events
+            .iter()
+            .find(|(name, _)| name == "mechanical_retry")
+            .expect("mechanical_retry audit");
+        assert_eq!(retry.1["failure_status"], "crashed");
+        assert_eq!(retry.1["orphaned_driver"], true);
+        assert_eq!(retry.1["node_id"], "task-1");
+        assert_eq!(retry.1["attempt"], 1);
+        // 孤儿目录不被覆写（无 state.json 写入、审计不变）。
+        assert!(!orphan.join("state.json").exists(), "孤儿目录不被覆写");
+        assert_eq!(
+            std::fs::read_to_string(orphan.join("audit.jsonl")).unwrap(),
+            orphan_audit_before,
+            "孤儿目录审计痕迹保持原样"
+        );
+        // persist 落盘可读回（崩溃恢复 / TUI resume 契约）。
+        let reloaded = load_governance_run(&dir).unwrap();
+        assert_eq!(reloaded.state(), GovernanceState::Executing);
+        assert_eq!(reloaded.attempts_used, 1);
+        assert_eq!(reloaded.execution_count, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn orphaned_driver_exhausts_budget_and_escalates() {
+        // G1 耗尽路径：孤儿反复出现（环境性 kill -9）→ 预算耗尽走既有升级
+        // （Escalated + mechanical_budget_exhausted_escalated），不无限重跑。
+        let (mut run, ctx, dir) = run_in_executing("exhausted");
+
+        orphan_exec_dir(&dir, 1);
+        execution_step(&mut run, &ctx).unwrap(); // 失败 1 → 重跑（attempt 1/2）
+        assert_eq!(run.state(), GovernanceState::Executing);
+        orphan_exec_dir(&dir, 2);
+        execution_step(&mut run, &ctx).unwrap(); // 失败 2 → 重跑（attempt 2/2）
+        assert_eq!(run.state(), GovernanceState::Executing);
+        orphan_exec_dir(&dir, 3);
+        execution_step(&mut run, &ctx).unwrap(); // 失败 3 → 预算耗尽 → 升级
+        assert_eq!(
+            run.state(),
+            GovernanceState::Escalated,
+            "孤儿耗尽机械预算 → 升级属主"
+        );
+        assert_eq!(run.attempts_used, 2);
+        let events = run_audit_events(&dir);
+        assert!(
+            events
+                .iter()
+                .any(|(name, data)| name == "mechanical_budget_exhausted_escalated"
+                    && data["failure_status"] == "crashed"),
+            "耗尽升级审计带 crashed 失败形态"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }

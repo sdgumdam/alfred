@@ -94,14 +94,14 @@ pub struct DriverLaunch {
 }
 
 /// done 记录（驱动脚本产出；status: "success" | "error" | "timed_out"）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DriverDone {
     pub status: String,
     pub error: Option<String>,
 }
 
 /// 轮询结果。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DriverOutcome {
     /// 读到 done 记录。
     Done(DriverDone),
