@@ -99,11 +99,13 @@ impl SessionSink {
         Self { events: Some(events) }
     }
 
-    /// `[chat] {body}` 状态/转写行 → [`ChatEvent::OrchestratorNotice`]（纯正文）。
+    /// `[chat] {body}` 状态/转写行 → [`ChatEvent::ShellNotice`]（S4 前缀分职：
+    /// REPL 前缀 `[chat]` 与 TUI 左列渲染前缀回归一致——此前复用
+    /// OrchestratorNotice 令 TUI 误标 `[orchestrator]`）。
     fn notice(&self, body: String) {
         println!("[chat] {body}");
         if let Some(tx) = &self.events {
-            tx.send(ChatEvent::OrchestratorNotice(body));
+            tx.send(ChatEvent::ShellNotice(body));
         }
     }
 

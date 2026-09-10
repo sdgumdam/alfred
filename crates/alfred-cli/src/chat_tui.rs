@@ -1,4 +1,4 @@
-//! alfred chat TUI 呈现层（S1 骨架 + S2a 汇合）。
+//! alfred chat TUI 呈现层（S1 骨架 + S2a 汇合 + S4 体验收口）。
 //!
 //! 定位（方案 `.plans/施工方案-TUI界面.md`）：治理内核零改动，本模块是
 //! `alfred chat` 的终端呈现层。S2a 汇合后数据全部接线：
@@ -53,6 +53,18 @@
 //! - **worker 不 join**：Ctrl-D/Ctrl-C 退出时会话可能仍在推进（converse 秒级
 //!   返回），强等会吊死已恢复的终端；进程退出即收割，run 落盘状态可断点续跑
 //!   （P3 语义，与 REPL 时代 Ctrl-C 同级）。
+//!
+//! - **S4 体验收口**：着色（治理态 [`state_color`]——状态条徽标 + 右列看板
+//!   态行；左列事件按来源 [`LineVoice`] 着色：[pi] 答复青 / [orchestrator]
+//!   白 / warn 黄 / Error 红 / 过程行暗灰——**REPL 面逐字节不变**，着色只
+//!   在 TUI 渲染层）；滚动（左列 PgUp/PgDn 翻页 + End 回底；手动滚动视口
+//!   锚定内容，新行到达不打断——底部"↓ 新增 N 行"提示）；前缀分职
+//!   （[`ChatEvent::ShellNotice`]——chat.rs 会话壳通知渲染 `[chat]`，不再
+//!   误标 `[orchestrator]`，与 REPL 逐面对齐）；折行 grapheme 原子性
+//!   （ZWJ emoji 序列不被拆行）；光标行尾满宽落下一显示行首；0x0 pty
+//!   （script/expect 类）降级 REPL（[`tui_supported`] 尺寸门）；终端恢复
+//!   失败非致命（成功路径不回退 REPL——fd 仍在捕获会黑屏）；state.json
+//!   原子写对冲"退出击杀 worker × 非原子写"撕裂窗口（governance.rs）。
 
 use std::env;
 use std::fs::File;
@@ -69,8 +81,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -89,7 +102,7 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 /// 看板快照轮询周期（run 目录全量读；事件到达置脏即触发，无事件兜底周期刷）。
 const DASH_REFRESH: Duration = Duration::from_millis(1000);
 
-/// 状态条底色（S4 治理态着色前的骨架底色）。
+/// 状态条底色（前景按内容着色：治理态徽标走 [`state_color`]，标题/提示白灰）。
 const STATUS_BG: Color = Color::DarkGray;
 
 /// Tab 显示宽：'\t' 渲染为固定 4 列空格缩进。不对齐 8 列终端 tab stop——
@@ -102,13 +115,20 @@ const TAB_WIDTH: usize = 4;
 /// 渲染流与捕获流物理分离）。
 type TuiTerminal = Terminal<CrosstermBackend<File>>;
 
-/// TUI 降级门（cmd_chat 入口分流判定）：交互双 tty 且 TERM 有效 → TUI；
-/// 否则（管道/重定向/dumb 终端/TERM 缺失）降级既有 REPL 路径。TERM 判定拆
-/// 纯函数 [`term_enables_tui`]（可测）。
+/// TUI 降级门（cmd_chat 入口分流判定）：交互双 tty 且 TERM 有效且终端尺寸
+/// 非零 → TUI；否则（管道/重定向/dumb 终端/TERM 缺失/0x0 pty）降级既有
+/// REPL 路径。TERM/尺寸判定拆纯函数 [`term_enables_tui`]/
+/// [`size_enables_tui`]（可测）。
+///
+/// 尺寸门（S1 审 P3，S4 落地）：script/expect 类工具起的 0x0 pty 下
+/// stdin/stdout 双 tty、TERM 亦有效——尺寸检查缺席则 TUI 进零宽画面静默
+/// 空白。crossterm `size()` 走 /dev/tty ioctl（TTYCOLS/TTYROWS=0 如实上报）
+/// ——查询失败（无控制终端）视同不可用，不赌。
 pub fn tui_supported() -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()
         && term_enables_tui(env::var("TERM").ok().as_deref())
+        && matches!(size(), Ok((w, h)) if size_enables_tui(w, h))
 }
 
 /// TERM 判定：非空且非 `dumb`（dumb 无光标寻址，TUI 无处渲染）；未设置视
@@ -118,6 +138,12 @@ fn term_enables_tui(term: Option<&str>) -> bool {
         Some(t) => !t.is_empty() && t != "dumb",
         None => false,
     }
+}
+
+/// 尺寸判定：宽高均非零（0x0 pty = script/expect 类驱动终端，TUI 无处渲染
+/// ——降级 REPL 保持可用性，见 [`tui_supported`] 文档）。
+fn size_enables_tui(w: u16, h: u16) -> bool {
+    w > 0 && h > 0
 }
 
 /// TUI 主入口（cmd_chat 降级门调用）：捕获重定向 + 治理 worker + 终端生命周期
@@ -164,12 +190,16 @@ pub fn run(run_dir_flag: Option<&Path>) -> Result<()> {
     let result = event_loop(&mut terminal, &mut app);
 
     // 恢复顺序：终端面先退（画面消失）→ 成功路径 fd 保持捕获、告别行直写原
-    // stdout；错误路径 fd 回位（REPL 回退需要真 stdout）。恢复失败不掩盖主
-    // 结果。
-    if let Err(e) = restore_terminal(&mut terminal) {
-        if result.is_ok() {
-            return Err(e);
-        }
+    // stdout；错误路径 fd 回位（REPL 回退需要真 stdout）。
+    //
+    // 终端恢复失败非致命（S2 审 P3，S4 落地）：成功路径此前直接 `return Err`
+    // ——cmd_chat 会回退 REPL，而此时 fd 仍在捕获（成功路径约定），REPL 全部
+    // 输出进捕获管道 = 属主黑屏。改为兜底重试（[`restore_tty_only`] 重开
+    // /dev/tty 写恢复序列，幂等）后照常告别返回：会话本身已正常结束，恢复
+    // 失败只损失画面收尾，不构成回退 REPL 的理由。错误路径维持原 Err（回退
+    // REPL 前 fd 已回位，错误如实上报）。
+    if restore_terminal(&mut terminal).is_err() {
+        restore_tty_only();
     }
     match result {
         Ok(()) => {
@@ -438,12 +468,81 @@ fn forward_line(tx: &mpsc::Sender<String>, line: &str) {
 
 // ── 应用状态 ──
 
-/// TUI 应用状态（S2a 汇合 + S2b 治理事件化）：输入编辑器 + 左列对话流（事件
-/// 渲染行/捕获残留行/属主回声）+ 右列看板快照 + 治理通道两端。
+/// 左列行来源（前缀分职 + 着色单一真源，S4）：事件变体 → 前缀 + 颜色的
+/// 唯一映射。着色只作用于 TUI 面（REPL 逐字节不变是硬底线——REPL 路径
+/// 不经本模块）；色板口径：[pi] 答复青 / [orchestrator] 白 / warn 黄 /
+/// Error 红，过程行（[pi] ⋯/捕获残留）暗灰退居次要，挂起拍板意见黄
+/// （需属主行动）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineVoice {
+    /// 属主回声（`你: …`）。
+    Owner,
+    /// `[pi] ⋯` 过程动作行（次要——暗灰）。
+    PiAction,
+    /// `[pi]` 答复（青）。
+    PiReply,
+    /// `[chat]` 会话壳状态行（S4 前缀分职：ShellNotice 专属——灰）。
+    Chat,
+    /// `[chat]` 挂起拍板/升级意见（需属主行动——黄）。
+    Escalation,
+    /// `[orchestrator]` 治理环通知（白）。
+    Orchestrator,
+    /// `[orchestrator] warn:` 白名单透传（黄）。
+    Warn,
+    /// `[chat]` 错误行（红）。
+    Error,
+    /// 未事件化捕获残留（次要——暗灰）。
+    Plain,
+}
+
+impl LineVoice {
+    /// 行颜色（着色单一真源，测试锁定）。
+    fn color(self) -> Color {
+        match self {
+            LineVoice::Owner => Color::White,
+            LineVoice::PiAction => Color::DarkGray,
+            LineVoice::PiReply => Color::Cyan,
+            LineVoice::Chat => Color::Gray,
+            LineVoice::Escalation => Color::Yellow,
+            LineVoice::Orchestrator => Color::White,
+            LineVoice::Warn => Color::Yellow,
+            LineVoice::Error => Color::Red,
+            LineVoice::Plain => Color::DarkGray,
+        }
+    }
+}
+
+/// 左列对话流条目：正文 + 来源（渲染按来源加前缀/着色；数据层只存原文）。
+#[derive(Debug, Clone, PartialEq)]
+struct ConvLine {
+    text: String,
+    voice: LineVoice,
+}
+
+/// 治理态着色（S4，状态条徽标 + 右列看板态行共用单一真源）：planning 黄 /
+/// reviewing（计划/执行审查）蓝 / executing 绿 / 挂起（plan_rejected/
+/// escalated）红 / completed 亮绿 / abandoned 灰（终态中性）/ 未知白。
+/// 态值词表与 [`input_hint`] 同源（state.json 投影）。
+fn state_color(state: &str) -> Color {
+    match state {
+        "planning" => Color::Yellow,
+        "plan_reviewing" | "exec_reviewing" => Color::Blue,
+        "executing" => Color::Green,
+        "plan_rejected" | "escalated" => Color::Red,
+        "completed" => Color::LightGreen,
+        "abandoned" => Color::Gray,
+        _ => Color::White,
+    }
+}
+
+/// TUI 应用状态（S2a 汇合 + S2b 治理事件化 + S4 着色/滚动）：输入编辑器 +
+/// 左列对话流（事件渲染行/捕获残留行/属主回声，来源分职着色 + PgUp/PgDn
+/// 回溯）+ 右列看板快照 + 治理通道两端。
 struct TuiApp {
     input: InputEditor,
-    /// 左列对话流（一事件一行；自动跟随底部，PgUp/PgDn 回溯是 S4）。
-    messages: Vec<String>,
+    /// 左列对话流（一事件一条目；跟随底部，PgUp/PgDn/End 滚动见
+    /// [`TuiApp::scroll_page`]）。
+    messages: Vec<ConvLine>,
     exit: bool,
     /// 治理会话已退出（事件端 Disconnected——worker Err 退场）：输入停用，
     /// 状态条提示，属主读完余量再退出。
@@ -461,6 +560,15 @@ struct TuiApp {
     captured: mpsc::Receiver<String>,
     /// run 目录共享位（worker 发布，看板取数据源）。
     run_dir: Arc<Mutex<Option<PathBuf>>>,
+    /// 左列滚动位（S4）：`None` = 跟随底部（新内容恒可见）；`Some(top)` =
+    /// 手动滚动（视口首行 = 显示行绝对序号——新行到达只追加在下方，视口
+    /// 锚定内容不打断历史区阅读）。
+    conv_top: Option<usize>,
+    /// 手动滚动期间新到达的显示行数（底部提示"↓ 新增 N 行"；回底清零）。
+    new_below: usize,
+    /// 左列几何缓存（上帧渲染尺寸：折行宽/可视高——滚动键按可视高分页、
+    /// 新行计数按折行宽折算；首帧前 (0,0) 不可滚动）。
+    conv_geom: (usize, usize),
 }
 
 impl TuiApp {
@@ -483,6 +591,9 @@ impl TuiApp {
             events,
             captured,
             run_dir,
+            conv_top: None,
+            new_below: 0,
+            conv_geom: (0, 0),
         }
     }
 
@@ -490,7 +601,13 @@ impl TuiApp {
     /// 取尽；Disconnected = worker 已退）→ 看板快照（置脏或周期）。
     fn pump(&mut self) {
         while let Ok(line) = self.captured.try_recv() {
-            self.messages.push(line);
+            // warn 白名单行（S3）黄色警示；其余残留暗灰退居次要。
+            let voice = if line.starts_with(ORCHESTRATOR_WARN_PREFIX) {
+                LineVoice::Warn
+            } else {
+                LineVoice::Plain
+            };
+            self.push_line(ConvLine { text: line, voice });
         }
         loop {
             match self.events.try_recv() {
@@ -499,14 +616,80 @@ impl TuiApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if !self.session_ended {
                         self.session_ended = true;
-                        self.messages
-                            .push("[chat] 治理会话已退出（Ctrl-D/Ctrl-C 关闭界面）。".into());
+                        self.push_line(ConvLine {
+                            text: "[chat] 治理会话已退出（Ctrl-D/Ctrl-C 关闭界面）。".into(),
+                            voice: LineVoice::Chat,
+                        });
                     }
                     break;
                 }
             }
         }
         self.refresh_dashboard();
+    }
+
+    /// 左列消息入列单一入口（S4 滚动）：跟随态直接入列；手动滚动态视口
+    /// 锚定内容（`conv_top` 不动），新行折算显示行数计入 [`Self::new_below`]
+    /// （底部"↓ 新增 N 行"提示——不打断历史区阅读）。
+    fn push_line(&mut self, line: ConvLine) {
+        if self.conv_top.is_some() {
+            self.new_below += display_row_count(&line.text, self.conv_geom.0);
+        }
+        self.messages.push(line);
+    }
+
+    /// 左列全部显示行数（滚动窗口/分页计算用；折行与渲染同一真源
+    /// [`wrap_segments`]）。
+    fn total_conv_rows(&self, width: usize) -> usize {
+        self.messages.iter().map(|m| display_row_count(&m.text, width)).sum()
+    }
+
+    /// 左列视口（渲染入口，每帧调用）：跟随态取底部窗口；手动态锚定
+    /// `conv_top`，越界（resize 后内容不足一屏）自动回跟随。缓存几何
+    /// （`conv_geom`）供滚动键分页/新行计数。返回视口显示行。
+    fn conv_viewport(&mut self, width: usize, height: usize) -> Vec<(String, LineVoice)> {
+        let total = self.total_conv_rows(width);
+        if let Some(t) = self.conv_top {
+            if t >= total.saturating_sub(height) {
+                self.follow_bottom();
+            }
+        }
+        self.conv_geom = (width, height);
+        conversation_rows(&self.messages, width, height, self.conv_top)
+    }
+
+    /// 左列滚动键分页（S4）：PgUp 上翻一页（进入手动滚动——视口锚定内容，
+    /// 新行不打断）；PgDn 下翻一页（触底回跟随）。页大小 = 上帧左列可视高
+    /// （首帧前无几何不可滚动）；内容不足一屏无处可滚。
+    fn scroll_page(&mut self, up: bool) {
+        let (w, h) = self.conv_geom;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let total = self.total_conv_rows(w);
+        if total <= h {
+            return;
+        }
+        let bottom_start = total - h;
+        match (up, self.conv_top) {
+            (true, None) => self.conv_top = Some(bottom_start.saturating_sub(h)),
+            (true, Some(t)) => self.conv_top = Some(t.saturating_sub(h)),
+            (false, None) => {} // 已在底部
+            (false, Some(t)) => {
+                let t = t + h;
+                if t + h >= total {
+                    self.follow_bottom();
+                } else {
+                    self.conv_top = Some(t);
+                }
+            }
+        }
+    }
+
+    /// 回底跟随：清滚动位 + 新行计数（提示随消）。
+    fn follow_bottom(&mut self) {
+        self.conv_top = None;
+        self.new_below = 0;
     }
 
     /// 看板快照刷新：run 目录未发布（worker 定位中）跳过；置脏或周期到点才
@@ -525,30 +708,37 @@ impl TuiApp {
             self.dashboard = Some(snap);
         }
     }
-
-    /// 治理事件 → 左列行（按变体渲染；`[pi] ⋯`/`[pi]`/`[chat]` 行格式与 REPL
+    /// 治理事件 → 左列条目（按变体渲染行 + 来源；行格式与 REPL 逐字节同面
+    /// ——前缀分职见 [`LineVoice`]：ShellNotice 渲染 `[chat]`（S4 前缀分职
+    /// 修复：此前 chat.rs 会话壳通知误标 `[orchestrator]`），OrchestratorNotice
+    /// 渲染 `[orchestrator]`，与 REPL 两面前缀逐面对齐）。挂起/错误类事件
+    /// 置脏看板（态/verdict 可能已变）。
     fn apply_event(&mut self, ev: ChatEvent) {
         let stateful = !matches!(ev, ChatEvent::OwnerEcho(_) | ChatEvent::PiAction { .. });
-        let line = match ev {
-            ChatEvent::OwnerEcho(text) => format!("你: {text}"),
-            ChatEvent::PiAction { kind, detail } => {
-                format!("[pi] ⋯ {}", pi_action_text(kind, &detail))
+        let (text, voice) = match ev {
+            ChatEvent::OwnerEcho(text) => (format!("你: {text}"), LineVoice::Owner),
+            ChatEvent::PiAction { kind, detail } => (
+                format!("[pi] ⋯ {}", pi_action_text(kind, &detail)),
+                LineVoice::PiAction,
+            ),
+            ChatEvent::PiReply(text) => (format!("[pi] {text}"), LineVoice::PiReply),
+            ChatEvent::ShellNotice(text) => (format!("[chat] {text}"), LineVoice::Chat),
+            ChatEvent::OrchestratorNotice(text) => {
+                (format!("[orchestrator] {text}"), LineVoice::Orchestrator)
             }
-            ChatEvent::PiReply(text) => format!("[pi] {text}"),
-            ChatEvent::OrchestratorNotice(text) => format!("[orchestrator] {text}"),
             ChatEvent::EscalationPrompt { reason, source } => {
-                let _ = source; // S4 着色/来源标签用；S2a 正文即含来源（REPL 同文）
-                format!("[chat] {reason}")
+                let _ = source; // S2a 正文即含来源（REPL 同文）；着色按变体不按来源
+                (format!("[chat] {reason}"), LineVoice::Escalation)
             }
             ChatEvent::Error { message, stream } => {
                 let _ = stream; // REPL 按流写回原点位；TUI 单列统一呈现
-                format!("[chat] {message}")
+                (format!("[chat] {message}"), LineVoice::Error)
             }
         };
         if stateful {
             self.dash_dirty = true;
         }
-        self.messages.push(line);
+        self.push_line(ConvLine { text, voice });
     }
 
     /// 键 → 状态转移。raw mode 下 Ctrl-C/Ctrl-D 以按键到达（无 SIGINT）：
@@ -556,7 +746,9 @@ impl TuiApp {
     /// 恒为提交（治理消息边界，路由治理 worker）；Ctrl-J 换行（LF 键序在 raw
     /// mode 下即 Ctrl-J，与 Enter 的 CR 区分）；Tab 插入 '\t'（数据层保真，
     /// 对齐 REPL sanitize_raw_line 保留 \t——粘贴缩进不失真；显示层展开见
-    /// [`expand_tabs`]）；其余可见字符进编辑器。只处理按下/自动重复
+    /// [`expand_tabs`]）；PgUp/PgDn 左列翻页、End 回底（S4 滚动——End 仅在
+    /// 手动滚动态承担回底，跟随态仍是输入行行尾：滚动态有"End 回底"提示
+    /// 在场，无歧义）；其余可见字符进编辑器。只处理按下/自动重复
     /// （Windows 终端按下与释放都发事件）。
     fn handle_key(&mut self, key: KeyEvent) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -584,6 +776,11 @@ impl TuiApp {
             KeyCode::Left => self.input.left(),
             KeyCode::Right => self.input.right(),
             KeyCode::Home => self.input.home(),
+            KeyCode::PageUp => self.scroll_page(true),
+            KeyCode::PageDown => self.scroll_page(false),
+            // End 双职（S4）：手动滚动态回底（提示"End 回底"在场）；跟随态
+            // 输入行行尾（编辑惯例——两种状态各有明确在场提示，不混义）。
+            KeyCode::End if self.conv_top.is_some() => self.follow_bottom(),
             KeyCode::End => self.input.end(),
             KeyCode::Tab => self.input.insert_char('\t'),
             KeyCode::Char(c)
@@ -839,27 +1036,34 @@ fn expand_tabs(s: &str) -> String {
     }
 }
 
-/// 软折行（CJK 宽度感知）：一条逻辑行按显示宽 `width` 折成显示段序列，每段
-/// (段首 char 偏移, 段文本)。段文本保真原文（含 '\t'——光标定位按原 char
-/// 计，展开是渲染边界 [`expand_tabs`] 的事）；字符显示宽走 [`display_width`]
-/// 单一真源（'\t' = [`TAB_WIDTH`]）。宽度 0（防御：极小终端边框内宽为 0）
-/// 不折行单段返回；单字符宽 > 总宽（极小终端放 CJK/Tab）不可再分——独占
-/// 一段。
+/// 软折行（CJK 宽度感知 + grapheme 原子性，S4）：一条逻辑行按显示宽
+/// `width` 折成显示段序列，每段 (段首 char 偏移, 段文本)。段文本保真原文
+/// （含 '\t'——光标定位按原 char 计，展开是渲染边界 [`expand_tabs`] 的
+/// 事）；显示宽走 [`display_width`] 单一真源（'\t' = [`TAB_WIDTH`]）。
+///
+/// **grapheme 迭代**（S1 审 P3，S4 落地）：按 grapheme cluster 而非 char
+/// 折段——ZWJ emoji 序列（👨‍👩‍👧‍👦）、肤色修饰（👍🏽）、旗帜（🇨🇳）是用户
+/// 感知的单个字符，char 迭代会把序列拆到两行 = 视觉碎裂。cluster 宽 =
+/// 成员 char 宽求和（'\t' 真源同源）。宽度 0（防御：极小终端边框内宽为
+/// 0）不折行单段返回；单 cluster 宽 > 总宽（极小终端放 CJK/Tab/emoji）
+/// 不可再分——独占一段。
 fn wrap_segments(text: &str, width: usize) -> Vec<(usize, String)> {
     if width == 0 {
         return vec![(0, text.to_string())];
     }
     let mut segs = Vec::new();
     let (mut seg, mut start, mut w) = (String::new(), 0usize, 0usize);
-    for (ci, ch) in text.chars().enumerate() {
-        let cw = display_width(ch);
+    let mut char_off = 0usize; // 段首 char 偏移追踪（cluster 含多 char）
+    for g in text.graphemes(true) {
+        let cw: usize = g.chars().map(display_width).sum();
         if !seg.is_empty() && w + cw > width {
             segs.push((start, std::mem::take(&mut seg)));
-            start = ci;
+            start = char_off;
             w = 0;
         }
-        seg.push(ch);
+        seg.push_str(g);
         w += cw;
+        char_off += g.chars().count();
     }
     segs.push((start, seg));
     segs
@@ -893,26 +1097,60 @@ fn input_display(editor: &InputEditor, width: usize) -> InputDisplay {
     let mut cursor = (0, 0);
     for (li, line) in editor.lines.iter().enumerate() {
         let segs = wrap_segments(line, width);
+        let mut seg_rows: Vec<String> = segs.iter().map(|(_, s)| expand_tabs(s)).collect();
         if li == editor.row {
             let (ri, w) = cursor_segment_pos(&segs, editor.col);
-            cursor = (rows.len() + ri, w);
+            // 行尾恰在满宽末段（S1 审 P3，S4 落地）：下一个将输入的字符必落
+            // 下一显示行（同输入再敲一字即折行），光标随之——补一空续行承载，
+            // 不再被 ui 的列 clamp 压回本行末列（压在末字符上，视觉错位）。
+            if w >= width && ri + 1 == seg_rows.len() {
+                seg_rows.push(String::new());
+                cursor = (rows.len() + ri + 1, 0);
+            } else {
+                cursor = (rows.len() + ri, w);
+            }
         }
-        rows.extend(segs.into_iter().map(|(_, s)| expand_tabs(&s)));
+        rows.extend(seg_rows);
     }
     InputDisplay { rows, cursor }
 }
 
-/// 左列显示行（对话流）：消息按内宽折行，只保留最后 `height` 行——自动跟随
-/// 底部（新内容恒可见，PgUp/PgDn 回溯是 S4）。
-fn conversation_rows(messages: &[String], width: usize, height: usize) -> Vec<String> {
-    let mut rows = Vec::new();
+/// 一条消息的左列显示行数（滚动分页/新行计数用；折行与渲染同一真源
+/// [`wrap_segments`]，宽度 0 时每逻辑行单段）。
+fn display_row_count(text: &str, width: usize) -> usize {
+    text.split('\n').map(|l| wrap_segments(l, width).len()).sum()
+}
+
+/// 左列显示行（对话流，S4 滚动）：全部消息按内宽折行成显示行序列（每行
+/// 带来源——着色是渲染关注点，数据层只存原文），视口二选一：`top = None`
+/// 跟随底部（末 `height` 行，新内容恒可见）；`top = Some(t)` 手动滚动
+/// （`[t, t+height)` 窗口——新行到达不移动视口，见 [`TuiApp::push_line`]）。
+/// `t` 越界夹取到末行（防御：resize/直接调用）。
+fn conversation_rows(
+    messages: &[ConvLine],
+    width: usize,
+    height: usize,
+    top: Option<usize>,
+) -> Vec<(String, LineVoice)> {
+    let mut rows: Vec<(String, LineVoice)> = Vec::new();
     for msg in messages {
-        for line in msg.split('\n') {
-            rows.extend(wrap_segments(line, width).into_iter().map(|(_, s)| expand_tabs(&s)));
+        for line in msg.text.split('\n') {
+            let voice = msg.voice;
+            rows.extend(
+                wrap_segments(line, width)
+                    .into_iter()
+                    .map(|(_, s)| (expand_tabs(&s), voice)),
+            );
         }
     }
-    let start = rows.len().saturating_sub(height);
-    rows.split_off(start)
+    let (start, end) = match top {
+        None => (rows.len().saturating_sub(height), rows.len()),
+        Some(t) => {
+            let start = t.min(rows.len().saturating_sub(1));
+            (start, (start + height).min(rows.len()))
+        }
+    };
+    rows[start..end].to_vec()
 }
 
 /// 看板行宽适配：超宽截断带省略号（按显示宽——CJK/ASCII 混排对齐；字符宽走
@@ -1011,11 +1249,13 @@ fn dashboard_lines(snap: &DashboardSnapshot, width: usize) -> Vec<String> {
     rows
 }
 
-/// 四区渲染：顶状态条（alfred 版本 + run_id + 治理态徽标，实时）/ 左列
-/// "对话"（事件渲染行 + 捕获残留行，自动跟随底部）/ 右列"状态"（看板快照）/
-/// 底部"输入"（多行编辑 + 按态提示标题，光标可见）。输入框内容宽与终端宽
-/// 同源（框横贯全宽）：先定折行再定布局，无循环依赖；框高随内容增长（上限
-/// 半屏），内容超高时可视窗口贴底、光标行越窗顶则上移保光标可见。
+/// 四区渲染：顶状态条（alfred 版本 + run_id + 治理态徽标——按态着色，实时）/
+/// 左列"对话"（事件渲染行 + 捕获残留行——按来源着色；跟随底部，PgUp/PgDn
+/// 手动滚动时视口锚定 + 底部新行提示）/ 右列"状态"（看板快照，态行按态
+/// 着色）/ 底部"输入"（多行编辑 + 按态提示标题，光标可见）。输入框内容宽
+/// 与终端宽同源（框横贯全宽）：先定折行再定布局，无循环依赖；框高随内容
+/// 增长（上限半屏），内容超高时可视窗口贴底、光标行越窗顶则上移保光标
+/// 可见。着色只在此渲染层（REPL 面逐字节不变是硬底线）。
 fn ui(f: &mut Frame, app: &mut TuiApp) {
     let area = f.area();
     let inner_w = area.width.saturating_sub(2) as usize;
@@ -1035,61 +1275,87 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
     ])
     .areas(main_area);
 
-    // ── 顶状态条：标题 + run/态徽标 + 按键提示，整行底色（Paragraph.style
-    //    铺满区域） ──
+    // ── 顶状态条：标题 + run/态徽标（S4 按态着色）+ 按键提示，整行底色
+    //    （Paragraph.style 铺满区域） ──
     let title = format!(" alfred v{} ", env!("CARGO_PKG_VERSION"));
-    let mid = if app.session_ended {
-        " 治理会话已退出 ".to_string()
+    let mut spans = vec![Span::styled(
+        title.clone(),
+        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+    )];
+    let mut mid_w = 0usize;
+    if app.session_ended {
+        let mid = " 治理会话已退出 ";
+        spans.push(Span::styled(mid, Style::new().fg(Color::White)));
+        mid_w += mid.width();
     } else {
         match &app.dashboard {
             Some(s) if !s.run_id.is_empty() => {
+                let run = format!(" {} ", s.run_id);
                 let state = if s.state.is_empty() { "…" } else { s.state.as_str() };
-                format!(" {} ● {} ", s.run_id, state)
+                let badge = format!("● {state} ");
+                spans.push(Span::styled(run.clone(), Style::new().fg(Color::White)));
+                spans.push(Span::styled(
+                    badge.clone(),
+                    Style::new().fg(state_color(&s.state)).add_modifier(Modifier::BOLD),
+                ));
+                mid_w += run.width() + badge.width();
             }
-            _ => " 无 run ".to_string(),
+            _ => {
+                spans.push(Span::raw(" 无 run "));
+                mid_w += " 无 run ".width();
+            }
         }
-    };
-    let hint = "Enter 提交 · Ctrl-J 换行 · ↑↓ 历史 · Ctrl-D/Ctrl-C 退出 ";
+    }
+    let hint = "Enter 提交 · Ctrl-J 换行 · ↑↓ 历史 · PgUp/PgDn/End 滚动 · Ctrl-D/C 退出 ";
     let pad = status_area
         .width
-        .saturating_sub(title.width() as u16 + mid.width() as u16 + hint.width() as u16);
+        .saturating_sub(title.width() as u16 + mid_w as u16 + hint.width() as u16);
+    spans.push(Span::raw(" ".repeat(pad as usize)));
+    spans.push(Span::styled(hint, Style::new().fg(Color::Gray)));
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                title,
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(mid, Style::new().fg(Color::White)),
-            Span::raw(" ".repeat(pad as usize)),
-            Span::styled(hint, Style::new().fg(Color::Gray)),
-        ]))
-        .style(Style::new().bg(STATUS_BG)),
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(STATUS_BG)),
         status_area,
     );
 
-    // ── 左列：对话流（事件/捕获残留行，自动跟随底部） ──
+    // ── 左列：对话流（事件/捕获残留行——按来源着色；视口 = 跟随底部或
+    //    手动滚动锚定，新行不打断历史区阅读） ──
     let conv_block = Block::bordered().title(" 对话 ");
     let conv_inner = conv_block.inner(conv_area);
-    let conv_lines = conversation_rows(
-        &app.messages,
-        conv_inner.width as usize,
-        conv_inner.height as usize,
-    )
-    .into_iter()
-    .map(Line::from)
-    .collect::<Vec<_>>();
+    let viewport = app.conv_viewport(conv_inner.width as usize, conv_inner.height as usize);
+    let mut conv_lines: Vec<Line<'_>> = viewport
+        .into_iter()
+        .map(|(text, voice)| Line::styled(text, Style::new().fg(voice.color())))
+        .collect();
+    // 手动滚动期间新行到达：视口末行让位新行提示（黄色——历史区阅读不被
+    // 打断，新内容不静默）。
+    if app.conv_top.is_some() && app.new_below > 0 {
+        if let Some(last) = conv_lines.last_mut() {
+            *last = Line::styled(
+                format!("↓ 新增 {} 行（End 回底）", app.new_below),
+                Style::new().fg(Color::Yellow),
+            );
+        }
+    }
     f.render_widget(Paragraph::new(conv_lines).block(conv_block), conv_area);
 
-    // ── 右列：状态看板（run 目录周期聚合快照） ──
+    // ── 右列：状态看板（run 目录周期聚合快照；首行 = 治理态行——按态着色，
+    //    构造序由 dashboard_lines 固定） ──
     let panel_block = Block::bordered().title(" 状态 ");
     let panel_inner = panel_block.inner(panel_area);
-    let panel_lines = match &app.dashboard {
-        Some(snap) => dashboard_lines(snap, panel_inner.width as usize),
-        None => vec!["（无 run——提交需求后建立）".to_string()],
-    }
-    .into_iter()
-    .map(Line::from)
-    .collect::<Vec<_>>();
+    let panel_lines: Vec<Line<'_>> = match &app.dashboard {
+        Some(snap) => dashboard_lines(snap, panel_inner.width as usize)
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i == 0 {
+                    Line::styled(s, Style::new().fg(state_color(&snap.state)))
+                } else {
+                    Line::from(s)
+                }
+            })
+            .collect(),
+        None => vec![Line::from("（无 run——提交需求后建立）")],
+    };
     f.render_widget(Paragraph::new(panel_lines).block(panel_block), panel_area);
 
     // ── 底部：输入框（多行编辑 + 按态提示标题 + 光标） ──
@@ -1184,6 +1450,29 @@ mod tests {
         out
     }
 
+    /// 整帧里找 marker 首字符所在 cell 的前景色（着色断言辅助，S4）：宽字符
+    /// 跳格语义同 [`frame_text`]（CJK 不打断定位）。
+    fn frame_fg(terminal: &Terminal<TestBackend>, marker: &str) -> Option<Color> {
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        for cells in buf.content.chunks(w) {
+            let mut s = String::new();
+            let mut idx = Vec::new();
+            let mut skip = 0usize;
+            for (i, c) in cells.iter().enumerate() {
+                if skip == 0 {
+                    s.push_str(c.symbol());
+                    idx.push(i);
+                }
+                skip = skip.max(c.symbol().width()).saturating_sub(1);
+            }
+            if let Some(pos) = s.find(marker) {
+                return Some(cells[idx[pos]].fg);
+            }
+        }
+        None
+    }
+
     // ── 降级门 ──
 
     /// TERM 判定：有效终端名通过；dumb/空/缺失降级 REPL。
@@ -1194,6 +1483,17 @@ mod tests {
         assert!(!term_enables_tui(Some("dumb")));
         assert!(!term_enables_tui(Some("")));
         assert!(!term_enables_tui(None));
+    }
+
+    /// 尺寸门（S1 审 P3，S4 落地）：0x0 pty（script/expect 类）双 tty 且 TERM
+    /// 有效——尺寸非零检查是唯一能拦住它的门；宽或高任一为零均降级 REPL。
+    #[test]
+    fn size_gate_zero_pty_degrades_to_repl() {
+        assert!(size_enables_tui(80, 24));
+        assert!(size_enables_tui(1, 1), "极小但非零——可渲染（折行/截断兜底）");
+        assert!(!size_enables_tui(0, 0), "0x0 pty：无处渲染，降级 REPL");
+        assert!(!size_enables_tui(0, 24), "零宽降级");
+        assert!(!size_enables_tui(80, 0), "零高降级");
     }
 
     // ── 折行真源 ──
@@ -1219,6 +1519,34 @@ mod tests {
                 (1, "超".to_string()),
                 (2, "b".to_string())
             ]
+        );
+    }
+
+    /// grapheme 原子性（S1 审 P3，S4 落地）：ZWJ 家庭 emoji / 旗帜 / 肤色
+    /// 修饰是用户感知的单个字符——折行绝不把 cluster 拆到两段；cluster 宽
+    /// 超总宽时独占一段（同"单字符超宽"惯例）；段首 char 偏移按 cluster
+    /// 累计（光标定位同源）。
+    #[test]
+    fn wrap_grapheme_clusters_never_split() {
+        // ZWJ 家庭 emoji：4 人 + 3 ZWJ = 7 char 一个 cluster。
+        let family = "👨‍👩‍👧‍👦";
+        assert_eq!(family.chars().count(), 7);
+        let segs = wrap_segments(&format!("a{family}b"), 4);
+        // "a"(1) + cluster(8) > 4 → 折段；cluster 整体一段（不拆）；b 另起。
+        assert_eq!(segs.len(), 3, "三段：a / family / b：{segs:?}");
+        assert_eq!(segs[1].1, family, "ZWJ 序列不拆段：{:?}", segs[1].1);
+        assert_eq!(segs[2], (8, "b".to_string()), "cluster 后段首 char 偏移 = 1+7");
+
+        // 旗帜（区域指示符对）与肤色修饰同理原子。
+        let flag = "🇨🇳";
+        assert_eq!(wrap_segments(flag, 1).len(), 1, "旗帜不拆段");
+        let tone = "👍🏽";
+        assert_eq!(wrap_segments(&format!("x{tone}"), 2)[1].1, tone, "肤色修饰不拆段");
+
+        // 纯 CJK/ASCII 行为不变（单 char 即单 cluster，既有语义回归锁）。
+        assert_eq!(
+            wrap_segments("超超超超", 4),
+            vec![(0, "超超".to_string()), (2, "超超".to_string())]
         );
     }
 
@@ -1337,7 +1665,10 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.messages, vec!["你: 需求甲".to_string()]);
+        assert_eq!(
+            app.messages,
+            vec![ConvLine { text: "你: 需求甲".into(), voice: LineVoice::Owner }]
+        );
         assert_eq!(wrx.try_recv(), Ok("需求甲".to_string()));
 
         app.handle_key(key(KeyCode::Enter)); // 空提交：发原文，不回声不本地文案
@@ -1393,12 +1724,13 @@ mod tests {
         assert_eq!(d.rows, vec!["ab    c".to_string()]);
         assert_eq!(d.cursor, (0, 7));
 
-        // 提交：消息数据保真 '\t'（回声含原文），左列渲染展开缩进。
+        // 提交：消息数据保真 '\t'（回声含原文），左列渲染展开缩进（+来源着色）。
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.messages.last().unwrap(), "你: ab\tc");
+        assert_eq!(app.messages.last().unwrap().text, "你: ab\tc");
+        assert_eq!(app.messages.last().unwrap().voice, LineVoice::Owner);
         assert_eq!(
-            conversation_rows(&app.messages, 20, 5),
-            vec!["你: ab    c".to_string()]
+            conversation_rows(&app.messages, 20, 5, None),
+            vec![("你: ab    c".to_string(), LineVoice::Owner)]
         );
 
         // 整帧黑盒：回显含可见缩进，帧内无 '\t'（cell 只见空格）。
@@ -1411,9 +1743,11 @@ mod tests {
 
     // ── 事件渲染（左列，按变体） ──
 
-    /// 各变体左列渲染：OrchestratorNotice 加回 `[orchestrator] ` 前缀（S2b
-    /// 契约：governance.rs 点位载荷去前缀，前缀由 sink 渲染时统一加——左列
-    /// 与捕获透传时代逐字节同面）；[pi]/[chat]/错误行各自前缀。
+    /// 各变体左列渲染（正文 + 来源）：前缀分职（S4）——ShellNotice 渲染
+    /// `[chat]`（chat.rs 会话壳通知，修复此前误标 `[orchestrator]`）、
+    /// OrchestratorNotice 渲染 `[orchestrator]`（S2b 契约：governance.rs 点位
+    /// 载荷去前缀，前缀由 sink 渲染时统一加回——左列与 REPL 逐面同面前缀）；
+    /// [pi]/错误行各自前缀；来源 → 着色单一映射。
     #[test]
     fn apply_event_renders_each_variant() {
         let (mut app, _wrx) = test_app();
@@ -1431,7 +1765,10 @@ mod tests {
         app.apply_event(ChatEvent::PiReply("计划分两步".into()));
         assert!(app.dash_dirty, "状态类事件置脏");
         app.dash_dirty = false;
-        app.apply_event(ChatEvent::OrchestratorNotice("已受理：X".into()));
+        app.apply_event(ChatEvent::ShellNotice("已受理：X".into()));
+        app.apply_event(ChatEvent::OrchestratorNotice(
+            "进入计划审查（state=plan_reviewing）".into(),
+        ));
         app.apply_event(ChatEvent::EscalationPrompt {
             reason: "计划审查意见（打回）：太粗".into(),
             source: alfred_core::governance::EscalationSource::PlanReview,
@@ -1444,13 +1781,26 @@ mod tests {
         assert_eq!(
             app.messages,
             vec![
-                "你: 需求".to_string(),
-                "[pi] ⋯ 探查: ls src".to_string(),
-                "[pi] ⋯ 探查（被治理拦截）: cat ~/.omp/runs".to_string(),
-                "[pi] 计划分两步".to_string(),
-                "[orchestrator] 已受理：X".to_string(),
-                "[chat] 计划审查意见（打回）：太粗".to_string(),
-                "[chat] 操作失败：boom".to_string(),
+                ConvLine { text: "你: 需求".into(), voice: LineVoice::Owner },
+                ConvLine {
+                    text: "[pi] ⋯ 探查: ls src".into(),
+                    voice: LineVoice::PiAction,
+                },
+                ConvLine {
+                    text: "[pi] ⋯ 探查（被治理拦截）: cat ~/.omp/runs".into(),
+                    voice: LineVoice::PiAction,
+                },
+                ConvLine { text: "[pi] 计划分两步".into(), voice: LineVoice::PiReply },
+                ConvLine { text: "[chat] 已受理：X".into(), voice: LineVoice::Chat },
+                ConvLine {
+                    text: "[orchestrator] 进入计划审查（state=plan_reviewing）".into(),
+                    voice: LineVoice::Orchestrator,
+                },
+                ConvLine {
+                    text: "[chat] 计划审查意见（打回）：太粗".into(),
+                    voice: LineVoice::Escalation,
+                },
+                ConvLine { text: "[chat] 操作失败：boom".into(), voice: LineVoice::Error },
             ]
         );
     }
@@ -1464,6 +1814,7 @@ mod tests {
         let (etx, erx) = ChatEventBus::new();
         let (ctx, crx) = mpsc::channel();
         ctx.send("docker: pulled image（未事件化残留）".to_string()).unwrap();
+        ctx.send("[orchestrator] warn: exec verdict parse failed".to_string()).unwrap();
         assert!(etx.send(ChatEvent::OrchestratorNotice(
             "进入计划审查（state=plan_reviewing）".into()
         )));
@@ -1474,10 +1825,23 @@ mod tests {
         assert_eq!(
             app.messages,
             vec![
-                "docker: pulled image（未事件化残留）".to_string(),
-                "[orchestrator] 进入计划审查（state=plan_reviewing）".to_string(),
-                "[pi] 答复".to_string(),
-                "[chat] 治理会话已退出（Ctrl-D/Ctrl-C 关闭界面）。".to_string(),
+                ConvLine {
+                    text: "docker: pulled image（未事件化残留）".into(),
+                    voice: LineVoice::Plain,
+                },
+                ConvLine {
+                    text: "[orchestrator] warn: exec verdict parse failed".into(),
+                    voice: LineVoice::Warn,
+                },
+                ConvLine {
+                    text: "[orchestrator] 进入计划审查（state=plan_reviewing）".into(),
+                    voice: LineVoice::Orchestrator,
+                },
+                ConvLine { text: "[pi] 答复".into(), voice: LineVoice::PiReply },
+                ConvLine {
+                    text: "[chat] 治理会话已退出（Ctrl-D/Ctrl-C 关闭界面）。".into(),
+                    voice: LineVoice::Chat,
+                },
             ]
         );
         assert!(app.session_ended);
@@ -1644,6 +2008,38 @@ mod tests {
         assert_eq!(input_hint(Some("abandoned")), "新需求");
     }
 
+    /// 治理态着色（S4）：planning 黄 / 审查态蓝 / executing 绿 / 挂起红 /
+    /// completed 亮绿 / abandoned 灰 / 未知白——状态条徽标 + 看板态行共用。
+    #[test]
+    fn state_color_mapping() {
+        assert_eq!(state_color("planning"), Color::Yellow);
+        assert_eq!(state_color("plan_reviewing"), Color::Blue);
+        assert_eq!(state_color("exec_reviewing"), Color::Blue);
+        assert_eq!(state_color("executing"), Color::Green);
+        assert_eq!(state_color("plan_rejected"), Color::Red);
+        assert_eq!(state_color("escalated"), Color::Red);
+        assert_eq!(state_color("completed"), Color::LightGreen);
+        assert_eq!(state_color("abandoned"), Color::Gray);
+        assert_eq!(state_color(""), Color::White);
+        assert_eq!(state_color("未知态"), Color::White);
+    }
+
+    /// 左列来源着色（S4）：[pi] 答复青 / [orchestrator] 白 / warn 黄 /
+    /// Error 红 / 过程行（[pi] ⋯、捕获残留）暗灰 / [chat] 灰 / 挂起意见黄 /
+    /// 属主回声白。
+    #[test]
+    fn line_voice_color_mapping() {
+        assert_eq!(LineVoice::PiReply.color(), Color::Cyan);
+        assert_eq!(LineVoice::Orchestrator.color(), Color::White);
+        assert_eq!(LineVoice::Warn.color(), Color::Yellow);
+        assert_eq!(LineVoice::Error.color(), Color::Red);
+        assert_eq!(LineVoice::PiAction.color(), Color::DarkGray);
+        assert_eq!(LineVoice::Plain.color(), Color::DarkGray);
+        assert_eq!(LineVoice::Chat.color(), Color::Gray);
+        assert_eq!(LineVoice::Escalation.color(), Color::Yellow);
+        assert_eq!(LineVoice::Owner.color(), Color::White);
+    }
+
     // ── 显示布局 ──
 
     /// 输入区折行布局 + 光标跨行定位（渲染与光标同一真源）。
@@ -1654,8 +2050,20 @@ mod tests {
             ed.insert_char(c);
         }
         let d = input_display(&ed, 2);
-        assert_eq!(d.rows, vec!["ab".to_string(), "cd".to_string()]);
-        assert_eq!(d.cursor, (1, 2)); // 行尾 = 末段末
+        // S4 光标满行修正（S1 审 P3）：行尾恰在满宽末段——下一个将输入字符
+        // 必落下一显示行，光标随之（补空续行承载），不再被压回本行末列。
+        assert_eq!(d.rows, vec!["ab".to_string(), "cd".to_string(), String::new()]);
+        assert_eq!(d.cursor, (2, 0));
+
+        // 光标在段中/未满行：常规定位（段内偏移 = 显示宽）。
+        let mut ed_mid = InputEditor::new();
+        for c in "abcd".chars() {
+            ed_mid.insert_char(c);
+        }
+        ed_mid.left(); // col 3：末段（"cd"）中段
+        let d_mid = input_display(&ed_mid, 2);
+        assert_eq!(d_mid.rows, vec!["ab".to_string(), "cd".to_string()]);
+        assert_eq!(d_mid.cursor, (1, 1), "末段中段（col 3）= 末段 x=1");
 
         let mut ed2 = InputEditor::new();
         for c in "ab".chars() {
@@ -1666,8 +2074,18 @@ mod tests {
             ed2.insert_char(c);
         }
         let d2 = input_display(&ed2, 2);
-        assert_eq!(d2.rows, vec!["ab".to_string(), "cd".to_string()]);
-        assert_eq!(d2.cursor, (1, 2)); // 逻辑行 1 的行尾
+        // 逻辑行 1 行尾满宽 → 续行承载光标（多行缓冲中间不吞行）。
+        assert_eq!(d2.rows, vec!["ab".to_string(), "cd".to_string(), String::new()]);
+        assert_eq!(d2.cursor, (2, 0));
+
+        // 未满行行尾：光标本行末列（无续行）。
+        let mut ed4 = InputEditor::new();
+        for c in "abc".chars() {
+            ed4.insert_char(c);
+        }
+        let d4 = input_display(&ed4, 10);
+        assert_eq!(d4.rows, vec!["abc".to_string()]);
+        assert_eq!(d4.cursor, (0, 3));
 
         let mut ed3 = InputEditor::new();
         for c in "超超".chars() {
@@ -1679,15 +2097,126 @@ mod tests {
         assert_eq!(d3.cursor, (0, 2));
     }
 
-    /// 左列自动跟随底部：只保留最后可视行数。
+    /// 左列视口（S4 滚动）：跟随态取末 `height` 行；手动态锚定 `[top, top+height)`；
+    /// top 越界夹取；多行消息按行折行展开。
     #[test]
-    fn conversation_follows_bottom() {
-        let msgs: Vec<String> = (0..50).map(|i| format!("行{i}")).collect();
-        let rows = conversation_rows(&msgs, 10, 3);
-        assert_eq!(rows, vec!["行47".to_string(), "行48".to_string(), "行49".to_string()]);
-        // 多行消息按行折行展开后同样只留尾部
-        let rows2 = conversation_rows(&["a\nb\nc".to_string()], 10, 2);
-        assert_eq!(rows2, vec!["b".to_string(), "c".to_string()]);
+    fn conversation_viewport_follow_and_manual() {
+        let msgs: Vec<ConvLine> = (0..50)
+            .map(|i| ConvLine { text: format!("行{i}"), voice: LineVoice::Plain })
+            .collect();
+        let rows = conversation_rows(&msgs, 10, 3, None);
+        assert_eq!(
+            rows,
+            vec![
+                ("行47".to_string(), LineVoice::Plain),
+                ("行48".to_string(), LineVoice::Plain),
+                ("行49".to_string(), LineVoice::Plain),
+            ]
+        );
+        // 手动滚动：top 锚定窗口（新行追加不移动——由 app.conv_top 语义承担，
+        // 此处断言纯函数窗口）。
+        let rows_top = conversation_rows(&msgs, 10, 3, Some(10));
+        assert_eq!(
+            rows_top,
+            vec![
+                ("行10".to_string(), LineVoice::Plain),
+                ("行11".to_string(), LineVoice::Plain),
+                ("行12".to_string(), LineVoice::Plain),
+            ]
+        );
+        // top 越界夹取到末行（防御：resize/内容收缩）。
+        let rows_clamp = conversation_rows(&msgs, 10, 3, Some(48));
+        assert_eq!(rows_clamp.last().unwrap().0, "行49");
+        assert_eq!(rows_clamp.len(), 2, "末行起窗口只剩 2 行：{:?}", rows_clamp);
+        // 多行消息按行折行展开后同样只留尾部。
+        let multi = vec![ConvLine { text: "a\nb\nc".into(), voice: LineVoice::Chat }];
+        let rows2 = conversation_rows(&multi, 10, 2, None);
+        assert_eq!(
+            rows2,
+            vec![("b".to_string(), LineVoice::Chat), ("c".to_string(), LineVoice::Chat)]
+        );
+    }
+
+    /// 左列滚动（S4 app 级）：PgUp 进手动滚动（视口锚定，新行不打断 + 计数）/
+    /// PgDn 翻回 / End 回底清计数；内容不足一屏不可滚；几何由渲染帧缓存
+    /// （scroll_page 依赖 conv_geom）。
+    #[test]
+    fn scroll_paging_anchor_and_new_line_count() {
+        let (mut app, _wrx) = test_app();
+        // 首帧渲染缓存几何（80x24 → 左列区 56 宽 20 高，内宽 54/内高 18）。
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for i in 0..60 {
+            app.push_line(ConvLine { text: format!("消息{i}"), voice: LineVoice::Chat });
+        }
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        assert_eq!(app.conv_geom, (54, 18), "几何缓存 = 左列内宽×内高");
+        assert_eq!(app.conv_top, None, "初始跟随底部");
+
+        // PgUp：进入手动滚动，视口上翻一页（top = 60-18-18 = 24）。
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.conv_top, Some(24));
+        let view = app.conv_viewport(54, 18);
+        assert_eq!(view.first().unwrap().0, "消息24", "视口锚定历史区");
+        assert!(!view.iter().any(|(t, _)| t == "消息59"), "最新行不在视口");
+
+        // 手动滚动期间新行到达：视口不动 + 新行计数（提示数据源）。
+        app.apply_event(ChatEvent::PiReply("新答复".into()));
+        app.apply_event(ChatEvent::ShellNotice("新通知".into()));
+        assert_eq!(app.conv_top, Some(24), "视口锚定不打断");
+        assert_eq!(app.new_below, 2, "两条新行计数");
+        let view2 = app.conv_viewport(54, 18);
+        assert_eq!(view2.first().unwrap().0, "消息24", "新行不移视口");
+
+        // End：回底跟随 + 计数清零。
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.conv_top, None);
+        assert_eq!(app.new_below, 0);
+        let view3 = app.conv_viewport(54, 18);
+        assert_eq!(view3.last().unwrap().0, "[chat] 新通知", "回底最新行可见");
+
+        // PgDn 在底部：无操作（跟随态保持）。
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.conv_top, None);
+
+        // 再次 PgUp → PgDn 翻回底部窗口 → 自动回跟随。
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.conv_top, Some(62 - 18 - 18));
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.conv_top, None, "PgDn 触底回跟随");
+
+        // 内容不足一屏：PgUp 无处可滚（保持跟随）。
+        let (mut app2, _wrx2) = test_app();
+        let mut terminal2 = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        app2.push_line(ConvLine { text: "只有一行".into(), voice: LineVoice::Chat });
+        terminal2.draw(|f| ui(f, &mut app2)).unwrap();
+        app2.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app2.conv_top, None, "不足一屏不可滚");
+    }
+
+    /// 滚动整帧黑盒（S4）：手动滚动 + 新行 → 视口末行让位"↓ 新增 N 行
+    /// （End 回底）"提示（黄色）；End 回底提示消失、最新行回归。
+    #[test]
+    fn render_scroll_new_line_hint() {
+        let (mut app, _wrx) = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for i in 0..60 {
+            app.push_line(ConvLine { text: format!("消息{i}"), voice: LineVoice::Chat });
+        }
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        app.handle_key(key(KeyCode::PageUp));
+        app.apply_event(ChatEvent::PiReply("滚动期间新答复".into()));
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let text = frame_text(&terminal);
+        assert!(text.contains("↓ 新增 1 行（End 回底）"), "新行提示占末行：\n{text}");
+        assert!(!text.contains("滚动期间新答复"), "新行本体不打断视口：\n{text}");
+        assert_eq!(frame_fg(&terminal, "↓ 新增"), Some(Color::Yellow), "提示黄色");
+        assert!(text.contains("消息24"), "历史区可见：\n{text}");
+
+        app.handle_key(key(KeyCode::End));
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let text2 = frame_text(&terminal);
+        assert!(!text2.contains("新增"), "回底提示消失：\n{text2}");
+        assert!(text2.contains("滚动期间新答复"), "最新行回归：\n{text2}");
     }
 
     // ── 整帧渲染（TestBackend 黑盒：帧内容 + 光标落点） ──
@@ -1749,5 +2278,61 @@ mod tests {
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let text2 = frame_text(&terminal);
         assert!(text2.contains("治理会话已退出"), "会话退出提示：\n{text2}");
+    }
+
+    /// 着色整帧黑盒（S4）：状态条徽标按治理态、看板态行同色、左列按来源——
+    /// [pi] 答复青 / [orchestrator] 白 / [chat] 灰 / Error 红 / Escalation 黄 /
+    /// 属主回声白 / 过程行暗灰。TestBackend cell fg 即最终 ANSI 前景（pty 面
+    /// 由 tui_pty.py 按 SGR 色码复核）。
+    #[test]
+    fn render_colored_zones_by_state_and_voice() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _wrx) = test_app();
+        let mut snap = sample_snapshot();
+        snap.state = "planning".into();
+        app.dashboard = Some(snap);
+        app.apply_event(ChatEvent::OwnerEcho("需求".into()));
+        app.apply_event(ChatEvent::PiAction {
+            kind: ActionKind::Probe,
+            detail: "ls src".into(),
+        });
+        app.apply_event(ChatEvent::PiReply("计划分两步".into()));
+        app.apply_event(ChatEvent::ShellNotice("已受理：X".into()));
+        app.apply_event(ChatEvent::OrchestratorNotice("计划审查中…".into()));
+        app.apply_event(ChatEvent::EscalationPrompt {
+            reason: "计划审查意见（打回）：太粗".into(),
+            source: alfred_core::governance::EscalationSource::PlanReview,
+        });
+        app.apply_event(ChatEvent::Error {
+            message: "操作失败：boom".into(),
+            stream: alfred_cli::chat_events::ErrorStream::Stdout,
+        });
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        // 状态条徽标 + 看板态行：planning 黄（同色单一真源）。
+        assert_eq!(frame_fg(&terminal, "● planning"), Some(Color::Yellow), "状态条徽标");
+        // 左列按来源。
+        assert_eq!(frame_fg(&terminal, "你: 需求"), Some(Color::White), "属主回声白");
+        assert_eq!(frame_fg(&terminal, "[pi] ⋯"), Some(Color::DarkGray), "过程行暗灰");
+        assert_eq!(frame_fg(&terminal, "[pi] 计划分两步"), Some(Color::Cyan), "答复青");
+        assert_eq!(frame_fg(&terminal, "[chat] 已受理"), Some(Color::Gray), "壳通知灰");
+        assert_eq!(
+            frame_fg(&terminal, "[orchestrator] 计划审查中"),
+            Some(Color::White),
+            "治理环通知白"
+        );
+        assert_eq!(
+            frame_fg(&terminal, "[chat] 计划审查意见"),
+            Some(Color::Yellow),
+            "挂起意见黄"
+        );
+        assert_eq!(frame_fg(&terminal, "[chat] 操作失败"), Some(Color::Red), "错误红");
+
+        // 看板态行同源着色（escalated 红）。
+        let mut snap2 = sample_snapshot();
+        snap2.state = "escalated".into();
+        app.dashboard = Some(snap2);
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        assert_eq!(frame_fg(&terminal, "● escalated"), Some(Color::Red), "挂起态红");
     }
 }

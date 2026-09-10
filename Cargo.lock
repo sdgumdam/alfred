@@ -26,6 +26,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

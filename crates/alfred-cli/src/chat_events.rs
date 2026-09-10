@@ -15,8 +15,8 @@
 //! | [`ChatEvent::OwnerEcho`] | 属主输入回显（TUI 左列呈现属主消息；REPL 由终端原生回显承担，无 println 点位——接线切片为 TUI 面新增） |
 //! | [`ChatEvent::PiAction`] | chat.rs `emit_process_line`：AGT 审计 tail 过程行 `[pi] ⋯ 探查/读取/探查（被治理拦截）`（`render_audit_action` 三呈现分支 ↔ [`ActionKind`]） |
 //! | [`ChatEvent::PiReply`] | chat.rs `surface_planner_output`：`[pi] {答复}`（reply 直显 + conversation.json 新增 ConverseReply 轮两分支） |
-//! | [`ChatEvent::OrchestratorNotice`] | 治理状态行与转写提示——chat.rs 横幅/run_dir/恢复 run/未发现 run/新建 run/已受理/当前状态/已重载/空输入×2/需求为空/会话结束/终态呈现（完成×2/放弃/新需求引导）/挂起块头行；governance.rs **全部** `[orchestrator]` 点位（S2b 经 `orchestrator_notice` 单一出口事件化）：每状态进入的流转状态行（`orchestrator_status_line`）、机械重跑提示（`post_apply_notices`：超时放大重跑/同契约重跑）、contract_fault 预标注、规划失败升级块、计划/执行审查宿主失败升级块（升级块保持编排器语音，与 chat.rs 挂起呈现分置，见下行） |
-//! | [`ChatEvent::EscalationPrompt`] | chat.rs `present_suspension` 挂起意见行四分支（计划审查意见/打回原因/执行审查意见/升级原因）——governance.rs 升级块不走本变体（S2b 定夺：保持 `[orchestrator]` 编排器语音走 OrchestratorNotice，前缀由 sink 加回，不因变体混装丢失 REPL 同面） |
+//! | [`ChatEvent::ShellNotice`] | 会话壳通知（chat.rs REPL 面 `[chat]` 前缀点位，S4 前缀分职拆出）：横幅/run_dir/恢复 run/未发现 run/新建 run/已受理/当前状态/已重载/空输入×2/需求为空/会话结束/终态呈现（完成×2/放弃/新需求引导）/挂起块头行 |
+//! | [`ChatEvent::OrchestratorNotice`] | governance.rs **全部** `[orchestrator]` 点位（S2b 经 `orchestrator_notice` 单一出口事件化）：每状态进入的流转状态行（`orchestrator_status_line`）、机械重跑提示（`post_apply_notices`：超时放大重跑/同契约重跑）、contract_fault 预标注、规划失败升级块、计划/执行审查宿主失败升级块（升级块保持编排器语音，与 chat.rs 挂起呈现分置，见下行） |
 //! | [`ChatEvent::Error`] | 一切错误行（原点位输出流由 `stream` 标记，见 [`ErrorStream`]）——chat.rs TUI 运行失败回退（stderr）、run 初始化失败、state 持久化失败、操作失败、多挂起 run 消歧清单（头行+列表行，stderr）、行编辑初始化失败（stderr）；reviewer verdict 解析 warn（alfred-reviewer，stderr） |
 //!
 //! 明确排除（非事件）：`print!` 输入提示（需求/对 pi 说/挂起拍板三处 prompt
@@ -85,15 +85,25 @@ pub enum ChatEvent {
     /// 数据源 conversation.json M4-a 语义轮次单一真源，接线切片沿用
     /// `surface_planner_output` 取数）。
     PiReply(String),
-    /// 治理状态行/编排器转写提示（规划中…/执行中…/机械重跑/已受理/会话结束
-    /// 等一切编排侧 owner 提示）。
+    /// 会话壳通知（chat.rs 本壳的 owner 提示音——REPL 面 `[chat]` 前缀点位）。
     ///
-    /// 载荷口径（单一口径，无例外）：**去前缀纯正文**——chat.rs 侧点位天然
-    /// 无前缀直入；governance.rs 治理环通知（`orchestrator_status_line` /
-    /// `post_apply_notices` / 升级块）的格式化产物自带 `[orchestrator] ` 前缀，
-    /// 发送点（`orchestrator_notice` 单一出口）负责剥离（S2a/S2b 已落地）。
-    /// `[orchestrator]` 前缀由 sink 渲染时统一加回——REPL sink 回 stdout 逐字节
-    /// 等价，TUI sink 自由分区/着色；载荷不再混装两种口径。
+    /// S4 前缀分职（S2 审 P3）：这些点位 REPL 恒呈现 `[chat] {…}`，此前复用
+    /// [`ChatEvent::OrchestratorNotice`] 导致 TUI 左列误标 `[orchestrator]`
+    /// （同一载荷两面前缀漂移）。拆独立变体后前缀各归其主：本变体渲染
+    /// `[chat]`，OrchestratorNotice 只承载 governance.rs 治理环点位（REPL
+    /// `[orchestrator]`，TUI 同面前缀加回）——与 REPL 逐面（prefix×voice）
+    /// 对齐。载荷口径同全局约定：去前缀纯正文。
+    ShellNotice(String),
+    /// 治理环编排器通知（governance.rs 治理环全部 `[orchestrator]` 点位：
+    /// 流转状态行 / 机械重跑提示 / contract_fault 预标注 / 规划失败与审查
+    /// 宿主失败升级块，经 `orchestrator_notice` 单一出口）。
+    ///
+    /// 载荷口径（单一口径，无例外）：**去前缀纯正文**——governance.rs 治理环
+    /// 通知（`orchestrator_status_line` / `post_apply_notices` / 升级块）的
+    /// 格式化产物自带 `[orchestrator] ` 前缀，发送点（`orchestrator_notice`
+    /// 单一出口）负责剥离（S2a/S2b 已落地）。`[orchestrator]` 前缀由 sink
+    /// 渲染时统一加回——REPL sink 回 stdout 逐字节等价，TUI sink 自由分区/
+    /// 着色；载荷不再混装两种口径。
     OrchestratorNotice(String),
     /// 挂起拍板（升级包）：run 挂起（plan_rejected/escalated）等待属主
     /// 重试/放弃/改口。
@@ -201,8 +211,9 @@ mod tests {
     use alfred_core::governance::EscalationSource;
     use std::sync::mpsc::TryRecvError;
 
-    /// 六变体逐一构造 + FIFO 收发（覆盖面烟测：全部变体可表达——Error 双流
-    /// 标记各一条、source 用 alfred_core 枚举真源，按发送序取回）。
+    /// 八变体逐一构造 + FIFO 收发（覆盖面烟测：全部变体可表达——Error 双流
+    /// 标记各一条、source 用 alfred_core 枚举真源，按发送序取回；ShellNotice
+    /// 与 OrchestratorNotice 分职后各一条，前缀分职契约锁定）。
     #[test]
     fn send_recv_fifo_all_variants() {
         let (tx, rx) = ChatEventBus::new();
@@ -214,6 +225,7 @@ mod tests {
             },
             ChatEvent::PiReply("计划分两步：先建图再执行。".into()),
             ChatEvent::OrchestratorNotice("当前状态: planning".into()),
+            ChatEvent::ShellNotice("已受理：写 hello.txt".into()),
             ChatEvent::EscalationPrompt {
                 reason: "计划审查意见（打回）：需求不可验收。".into(),
                 source: EscalationSource::PlanReview,

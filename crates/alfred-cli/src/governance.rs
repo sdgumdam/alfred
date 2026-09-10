@@ -1203,7 +1203,23 @@ fn write_verdict_history<T: serde::Serialize>(
 ) -> Result<()> {
     let text =
         serde_json::to_string_pretty(verdicts).with_context(|| format!("serialize {name}"))?;
-    std::fs::write(run_dir.join(name), text).with_context(|| format!("write {name}"))
+    atomic_write(&run_dir.join(name), &text).with_context(|| format!("write {name}"))
+}
+
+/// 原子落盘（temp + rename，S4）：写同目录 `<file>.tmp.<pid>` 后 rename 覆盖
+/// ——读端（state.json 断点 reload / 看板轮询 / reviewer 挂载）恒见完整旧值
+/// 或完整新值，绝无半截文件窗口。对冲存量撕裂窗口：TUI 退出不 join 治理
+/// worker（P3 语义，进程退出即收割），非原子写在击杀瞬间可留半截
+/// state.json——reload 失败 = run 不可续（会话死锁）。tmp 名带 pid：两个
+/// 写者（跨进程同 run）各写各的 tmp，rename 原子性不被共享 tmp 破坏。
+fn atomic_write(path: &Path, text: &str) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("atomic write 路径无名 {}", path.display()))?;
+    let tmp = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {} → {}", tmp.display(), path.display()))
 }
 
 /// 把 converse 产出的 DagSpec 格式化为语义回复（对话记录 converse.reply 轮的 content）。
@@ -1229,10 +1245,11 @@ pub fn load_governance_run(run_dir: &Path) -> Result<GovernanceRun> {
 }
 
 /// 落盘治理环 state.json + run 级 verdict 历史投影（plan-verdicts.json /
-/// exec-verdicts.json，矩阵 §1.1 第 8 行 reviewer 挂载输入）。
+/// exec-verdicts.json，矩阵 §1.1 第 8 行 reviewer 挂载输入）。全量重写走
+/// [`atomic_write`]（S4 原子写）——TUI 退出击杀 worker 的撕裂窗口对冲。
 pub fn persist_governance_run(run_dir: &Path, run: &GovernanceRun) -> Result<()> {
     let text = serde_json::to_string_pretty(run).context("serialize governance state")?;
-    std::fs::write(run_dir.join("state.json"), text).context("write governance state.json")?;
+    atomic_write(&run_dir.join("state.json"), &text).context("write governance state.json")?;
     // verdict 历史单一真源 = state.json 的 plan_verdicts/exec_verdicts：每次
     // persist 整体重写（不追加不删改），与状态机持久化同生命周期——崩溃恢复后
     // 仍同步。reviewer 容器（container.rs verdict_history_mounts）按存在性挂 ro。
@@ -1645,5 +1662,39 @@ mod tests {
             }
             other => panic!("expected Retry, got {other:?}"),
         }
+    }
+
+    /// S4 原子写：persist 落盘完整可读回（断点续跑 reload 路径）+ 无 temp
+    /// 残留（半截内容只存在于 `.tmp.<pid>`，rename 后消失）+ 覆写完整替换。
+    /// 撕裂窗口本身（击杀在写中途）无法确定性复现——锁定的是"完成态契约"：
+    /// 任何完成 persist 的 run 目录，state.json / verdict 投影恒完整可解析。
+    #[test]
+    fn persist_state_and_verdicts_atomic_no_torn_window() {
+        let dir = temp_exec_dir("persist-atomic", None);
+        let request = OwnerRequest::new("req-atomic", "标题", "描述", "验收");
+        let run = GovernanceRun::new("run-atomic", request, GovernanceOptions::default());
+        persist_governance_run(&dir, &run).unwrap();
+
+        // 三文件完整可读回（load = 会话 reload 单一真源路径）。
+        assert!(load_governance_run(&dir).is_ok(), "state.json 原子落盘可读回");
+        for name in [PLAN_VERDICTS_FILE, EXEC_VERDICTS_FILE] {
+            let text = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), serde_json::json!([]),
+                "{name} 投影完整可解析");
+        }
+
+        // 无 temp 残留（rename 完成态）。
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "原子写完成态无 temp 残留：{leftovers:?}");
+
+        // 覆写完整替换（第二次 persist 后仍完整——旧值不与新值拼接）。
+        persist_governance_run(&dir, &run).unwrap();
+        assert!(load_governance_run(&dir).is_ok(), "覆写后仍完整可读回");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
