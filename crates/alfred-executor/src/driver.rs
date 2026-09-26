@@ -336,7 +336,8 @@ import anyio
 from inspect_ai.util._sandbox.docker.cleanup import project_cleanup
 from inspect_ai.util._sandbox.docker.util import ComposeProject
 name, config = sys.argv[1], (sys.argv[2] or None)
-project = ComposeProject(name=name, config=config)
+project = ComposeProject(name=name, config=config,
+                         sample_id=None, epoch=None, env=None)
 anyio.run(project_cleanup, project, True)
 print(json.dumps({"down": name}))
 "#;
