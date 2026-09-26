@@ -643,12 +643,23 @@ async def _run_with_timeout(session_info: dict) -> None:
     # 先跑完，再向 main 抛 TimeoutError。
     #
     # 可捕获终止（SIGTERM/SIGINT）同一条收尾链：open_signal_receiver 把信号
-    # 转成本协程内的取消（interrupt_scope），_run_container 的 shield 清理
-    # （Inspect compose down + 项目登记回收）跑完后取消在本层吸收、正常返回，
-    # main 按 session_info 里的中断事实写 done(status="cancelled")。默认
-    # SIGTERM 处置会直接杀进程——finally/done 全跳过、容器孤立（case02-a2-r1
-    # 宿主取消事故的孤儿根因）——本层把它拉回既有超时收尾链，不做第二套
-    # 清理框架。
+    # 转成 interrupt_scope 取消——_run_container 的 shield 清理（Inspect
+    # compose down + 项目登记回收）跑完后取消在本层吸收、正常返回，main 按
+    # session_info 里的中断事实写 done(status="cancelled")。默认 SIGTERM 处置
+    # 会直接杀进程——finally/done 全跳过、容器孤立（case02-a2-r1 宿主取消
+    # 事故的孤儿根因）——本层把它拉回既有超时收尾链，不做第二套清理框架。
+    #
+    # watcher 生命周期 + 异常保型（两处必须的结构约束）：
+    # - _run_container 一切出口（正常/异常/超时）都要解除 task group 对信号
+    #   watcher 的等待——watcher 永等下一个信号，不解除则 tg 退出永久阻塞
+    #   （body 返回了进程却挂死）。出口统一 interrupt_scope.cancel() 机械
+    #   解锁：不设中断事实，session_info 不动。
+    # - body 异常先捕获暂存、退出 task group 后原样重抛：异常带在飞状态进
+    #   tg.__aexit__ 会被 anyio 包成 BaseExceptionGroup，TimeoutError/
+    #   RuntimeError 的类型语义被吞，main 按 except 类型路由 timed_out/error
+    #   即失效。取消类异常（SIGTERM/SIGINT 取消、fail_after 转换前的取消）
+    #   在捕获点区分：已在 scope 吸收，事实在 session_info，不上抛。
+    outcome: BaseException | None = None
     with anyio.CancelScope() as interrupt_scope:
         with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
             async with anyio.create_task_group() as tg:
@@ -660,8 +671,18 @@ async def _run_with_timeout(session_info: dict) -> None:
                         return
 
                 tg.start_soon(_watch_signals)
-                with anyio.fail_after(TIME_LIMIT_SECS):
-                    await _run_container(session_info)
+                try:
+                    with anyio.fail_after(TIME_LIMIT_SECS):
+                        await _run_container(session_info)
+                except BaseException as exc:
+                    outcome = exc
+                finally:
+                    interrupt_scope.cancel()
+    if isinstance(outcome, anyio.get_cancelled_exc_class()):
+        # 中断取消：事实在 session_info（main 收尾链按标记落 cancelled）。
+        return
+    if outcome is not None:
+        raise outcome
 
 
 def main() -> None:
