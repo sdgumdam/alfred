@@ -36,7 +36,7 @@ use alfred_cli::governance::{
     init_governance_run, load_governance_run, persist_governance_run, run_governance_loop,
     state_label,
 };
-use alfred_core::governance::{GovernanceOptions, OwnerDecision};
+use alfred_core::governance::{GovernanceAblation, GovernanceOptions, OwnerDecision};
 use alfred_core::request::OwnerRequest;
 use anyhow::{bail, Context, Result};
 
@@ -98,9 +98,8 @@ fn print_help() {
     println!(
         "  chat    owner 持续会话入口（REPL：需求收集/对话/拍板/断点恢复；[--run-dir <dir>]）"
     );
-    println!("  run     初始化治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 路由）");
     println!("  feed    喂属主决策（revise|retry|abandon）并从挂起态续跑");
-    println!("  status  只读打印当前治理环状态");
+    println!("  run     初始化治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 路由；[--ablation a1|a2|a3] 方案A消融档位，缺省完整链；[--env-compose <绝对路径>] [--env-metadata <JSON文件>] 任务真实环境接线（原任务 compose + SAMPLE_METADATA 插值键，缺省内置 network none 单容器））");
     println!();
     println!("通用 flag: --append-system-prompt <value>（前置注入，追加到 planner pi 系统提示）; -h/--help; -V/--version");
 }
@@ -114,7 +113,9 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let mut planner_time_limit: u32 = 600;
     let mut image = "alfred-executor:latest".to_string();
     let mut no_ctl = false;
-
+    let mut ablation: Option<GovernanceAblation> = None;
+    let mut env_compose: Option<String> = None;
+    let mut env_metadata: Option<std::collections::BTreeMap<String, String>> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -124,7 +125,10 @@ fn cmd_run(args: &[String]) -> Result<()> {
             | "--time-limit"
             | "--review-time-limit"
             | "--planner-time-limit"
-            | "--image" => {
+            | "--image"
+            | "--ablation"
+            | "--env-compose"
+            | "--env-metadata" => {
                 i += 1;
                 let val = args
                     .get(i)
@@ -141,6 +145,24 @@ fn cmd_run(args: &[String]) -> Result<()> {
                         planner_time_limit = val.parse().context("--planner-time-limit 非数字")?
                     }
                     "--image" => image = val,
+                    "--ablation" => {
+                        ablation = Some(parse_ablation(&val)?);
+                    }
+                    "--env-compose" => env_compose = Some(val),
+                    "--env-metadata" => {
+                        let path = PathBuf::from(&val);
+                        let text = std::fs::read_to_string(&path).with_context(|| {
+                            format!("alfred run: --env-metadata 读取失败 {}", path.display())
+                        })?;
+                        env_metadata = Some(
+                            serde_json::from_str(&text).with_context(|| {
+                                format!(
+                                    "alfred run: --env-metadata 需为 JSON 对象(字符串键值) {}",
+                                    path.display()
+                                )
+                            })?,
+                        );
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -158,6 +180,32 @@ fn cmd_run(args: &[String]) -> Result<()> {
 
     // 模型配置 + run 目录初始化走共享真源（init_governance_run /
     // build_governance_context，chat 需求收集同路径，不复制第二份）。
+    // 任务环境接线（G1 native_inspect 真实环境）：--env-compose = 原任务
+    // compose 绝对路径；--env-metadata = 其 `${SAMPLE_METADATA_*}` 插值键
+    // (JSON 文件)。值进 GovernanceOptions → state.json（续跑/孤儿恢复绑定
+    // 同一环境）。校验：metadata 无 compose = 接线错误（fail-closed）；
+    // compose 必须绝对路径（相对路径经 docker 静默变 named volume）。
+    let env_compose = env_compose
+        .map(|p| {
+            let path = PathBuf::from(&p);
+            if !path.is_absolute() {
+                bail!(
+                    "alfred run: --env-compose 必须为绝对路径（相对路径经 docker 静默变 named volume）: {p}"
+                );
+            }
+            if !path.is_file() {
+                bail!("alfred run: --env-compose 文件不存在: {p}");
+            }
+            Ok(p)
+        })
+        .transpose()?;
+    let env_metadata = match (env_metadata, env_compose.as_ref()) {
+        (Some(meta), Some(_)) => meta,
+        (Some(_), None) => {
+            bail!("alfred run: --env-metadata 只能与 --env-compose 同用（无任务 compose 的插值键无处解析）");
+        }
+        (None, _) => std::collections::BTreeMap::new(),
+    };
     let options = GovernanceOptions {
         image,
         exec_time_limit_secs: time_limit,
@@ -166,9 +214,35 @@ fn cmd_run(args: &[String]) -> Result<()> {
         port_base: 13100,
         settle_grace_seconds: 20.0,
         ctl_enabled: !no_ctl,
+        ablation,
+        env_compose,
+        env_metadata,
     };
     let run_dir = run_dir.unwrap_or_else(default_governance_dir);
     let mut run = init_governance_run(&run_dir, request, options)?;
+    // 任务环境绑定进原生审计轨迹（run 身份绑定：续跑/孤儿恢复从 state.json
+    // 读同一环境；audit 只记非秘密引用——插值键名与 compose 路径）。
+    if let Some(compose) = &run.options.env_compose {
+        audit(
+            &run_dir,
+            "task_environment_bound",
+            &serde_json::json!({
+                "env_compose": compose,
+                "env_metadata_keys": run.options.env_metadata.keys().collect::<Vec<_>>(),
+            }),
+        )?;
+    }
+    if let Some(abl) = run.options.ablation {
+        // 消融档位进原生审计轨迹（run 身份绑定；A3 语义下 audit 照写的组成部分）。
+        audit(
+            &run_dir,
+            "governance_ablation",
+            &serde_json::json!({
+                "arm": format!("{:?}", abl),
+                "ablation": ablation_label(abl),
+            }),
+        )?;
+    }
     let ctx = build_governance_context(&run_dir)?;
     let pending_reply = run_governance_loop(&mut run, &ctx)?;
     persist_governance_run(&run_dir, &run)?;
@@ -192,6 +266,25 @@ fn cmd_run(args: &[String]) -> Result<()> {
         run.mechanical_budget
     );
     Ok(())
+}
+
+/// 方案A消融档位 CLI 解析（`--ablation a1|a2|a3`；不新增第四种）。
+fn parse_ablation(value: &str) -> Result<GovernanceAblation> {
+    match value {
+        "a1" => Ok(GovernanceAblation::NoProcessEvidence),
+        "a2" => Ok(GovernanceAblation::NoActiveVerification),
+        "a3" => Ok(GovernanceAblation::AuditOnly),
+        other => bail!("alfred run: --ablation 未知档位 {other:?}（a1|a2|a3；缺省 = 完整治理链）"),
+    }
+}
+
+/// 消融档位短标签（审计/记录用）。
+fn ablation_label(abl: GovernanceAblation) -> &'static str {
+    match abl {
+        GovernanceAblation::NoProcessEvidence => "a1",
+        GovernanceAblation::NoActiveVerification => "a2",
+        GovernanceAblation::AuditOnly => "a3",
+    }
 }
 
 /// `feed`：喂属主消息 → 续跑治理环（`feed_owner_message` 库 API）。

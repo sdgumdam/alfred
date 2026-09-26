@@ -374,6 +374,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             max_tokens: 8192,
+            context_window: None,
             raw_id: true,
         }
     }

@@ -280,6 +280,40 @@ pub fn route(verdict: &ExecVerdict) -> Result<RoutingDecision, String> {
         )),
     }
 }
+/// 方案A消融档位（用户2026-09-25批准；三个独立实验臂，不组合、不新增第四种）。
+///
+/// 每档 = 对治理环的**配置化裁剪**：只取消档位指定的治理成分，其余主体与
+/// 运行链（规划→计划审查→执行→执行审查→续接→提交）原样保留；状态机只走
+/// 合法转移（打回/升级经对应 step 的档位分支改走既有合法事件，不非法跳转）。
+/// 落 state.json 的 `options.ablation`——续跑（`alfred feed`）与孤儿恢复读
+/// 同一档位，run 与档位显式绑定（原生参数/状态版本绑定，非 env 侧通道）。
+///
+/// 边界（W11 内部逻辑修正设计 §七.4 硬约束，随档位绑定）：
+/// - 不改变独立测量读面：I01/I04 照常留存/读取全部原生证据（audit.jsonl、
+///   exec-N/、llm-calls/、sessions 原件不动）——消融只裁治理侧可见面/工具/
+///   处置连接，不删原件、不缩小独立评价读面；
+/// - escalated/abandoned 仍是真实结局：技术/宿主失败路径（审查宿主失败升级、
+///   执行机械失败重跑、规划失败升级）不因消融改判；
+/// - 消融裁剪治理成分，不把 API 事故当处置（错误路径语义不变）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceAblation {
+    /// A1 去执行过程证据：治理审查（plan/exec review）不可见执行过程证据
+    /// （run 根 audit.jsonl、exec-N/、llm-calls/）——审查提示不注入 + AGT
+    /// 读/命令双封闭（直接 read 与 shell/路径通道都取不到被禁文件）。
+    /// 原任务/契约/ws 产物、主动验证与完整编排保留；原件仍留存供 I04。
+    NoProcessEvidence,
+    /// A2 去主动验证：治理审查无命令执行通道（bash 等一律拒绝，AGT 层
+    /// 强制），只保留只读检查与 verdict 写出。执行者自检（executor 容器
+    /// 工具面）与 planner 探查不变——只裁治理侧主动验证。
+    NoActiveVerification,
+    /// A3 仅审计不强制处置：审查照常在线出结论并落审计/verdict 历史；
+    /// 审查结论驱动的指定强制处置断开（计划打回→重规划、执行审查非 C→
+    /// 机械重跑/升级），改走合法通过转移。执行机械失败重跑与审查宿主失败
+    /// 升级保持原生（错误路径，非审查处置）。离线仍走 unscored→升级，
+    /// 不以离线重放冒充在线审查。
+    AuditOnly,
+}
 
 /// 属主决策（§3.2 环节 3/6：重跑 / 改契约重新规划 / 放弃）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +343,26 @@ pub struct GovernanceOptions {
     pub settle_grace_seconds: f64,
     /// 兼容保留（inspect ctl 已随去 eval 退役，当前无观测面轮询）。
     pub ctl_enabled: bool,
+    /// 方案A消融档位（`None` = 完整治理链，默认）。落 state.json：续跑/
+    /// 孤儿恢复绑定同一档位（旧 state.json 无此字段 → 反序列化缺省 None =
+    /// 完整链，向后兼容；`skip_serializing_if` 保持完整链 state.json 字节
+    /// 与存量 run 一致——只有消融 run 才落该字段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ablation: Option<GovernanceAblation>,
+    /// 任务环境 compose（外层实验传入的原任务真实 compose 绝对路径）。
+    /// `None` = 内置形态（network none 单容器，既有行为）。落 state.json：
+    /// 续跑/孤儿恢复绑定同一环境（原生参数，不经 env——与 --ablation 同一
+    /// 纪律）。执行驱动按该 compose 复用原任务服务/环境变量/网络限制
+    /// （extra_hosts）/资源上限，default 服务镜像换成执行镜像（opts.image），
+    /// sidecar 服务（如 mysql）逐字保留。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_compose: Option<String>,
+    /// 任务环境 compose 的 `${SAMPLE_METADATA_*}` 插值键值（真源 = 外层
+    /// dataset/db_cases.yaml）。执行驱动的 sample_init 用这些值让 Inspect
+    /// 解析 compose 内的 `${SAMPLE_METADATA_*}` 引用（与原任务装载同一
+    /// 解析链）。空 = 无键。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env_metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// `planner_time_limit_secs` 缺省值（旧 state.json 无此字段时反序列化兜底）。
@@ -326,6 +380,9 @@ impl Default for GovernanceOptions {
             port_base: 13100,
             settle_grace_seconds: 20.0,
             ctl_enabled: true,
+            ablation: None,
+            env_compose: None,
+            env_metadata: std::collections::BTreeMap::new(),
         }
     }
 }

@@ -239,6 +239,8 @@ pub fn run_maintain(
         let agt_ext = prepare_host_agt(&work, &opts.agt, &outputs_dir, &opts.project_root)?;
         let pi_config_dir = work.join(PI_CONFIG_DIR);
         write_pi_config(&pi_config_dir, model)?;
+        // 原生 session 身份：每轮维护预指派唯一 id（与 converse 同一真源机制）。
+        let session_id = alfred_core::util::short_id("planner-maintain");
         let pi_stdout = spawn_planner_pi(
             opts,
             model,
@@ -247,6 +249,8 @@ pub fn run_maintain(
             agt_ext.as_deref(),
             &system_prompt,
             &prompt,
+            &session_id,
+            "maintain",
         )?;
         // 收割：session.json 必须存在且解析为合法会话文档（无静默出口）。
         let text = std::fs::read_to_string(&out_path).with_context(|| {
@@ -375,6 +379,7 @@ mod tests {
                 base_url: String::new(),
                 api_key: String::new(),
                 max_tokens: 1024,
+                context_window: None,
                 raw_id: true,
             };
             let doc = SessionDoc::default();

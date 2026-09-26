@@ -1,7 +1,9 @@
 # alfred 沙箱基础镜像：Debian 12 slim + node 22 + pi coding agent。
 # 三容器（planner/executor/reviewer）共用，差异只在 compose 挂载面（可见范围矩阵）。
 # apt 源用阿里云镜像（国内网络直连可靠），node 从 npmmirror 拉。
-FROM debian:12-slim
+# 基础镜像经国内 registry (DaoCloud) 拉取, 与 Docker Hub library/debian:12-slim
+# 同版同内容; digest = 2026-09-26 docker buildx imagetools inspect 核验的 index digest。
+FROM docker.m.daocloud.io/library/debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
     sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null; \

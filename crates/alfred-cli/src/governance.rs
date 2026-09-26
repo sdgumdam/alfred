@@ -22,7 +22,8 @@ use alfred_core::conversation::{
     append_to_disk, load_conversation, ConversationRole, ConversationSource,
 };
 use alfred_core::governance::{
-    GovernanceEvent, GovernanceOptions, GovernanceRun, GovernanceState, OwnerDecision,
+    GovernanceAblation, GovernanceEvent, GovernanceOptions, GovernanceRun, GovernanceState,
+    OwnerDecision,
 };
 use alfred_core::request::OwnerRequest;
 use alfred_core::util::now_rfc3339;
@@ -618,6 +619,32 @@ fn plan_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
                     event: GovernanceEvent::PlanReviewPassed,
                     effects,
                 }
+            } else if matches!(run.options.ablation, Some(GovernanceAblation::AuditOnly)) {
+                // A3 仅审计不强制处置：打回事实照常归档（verdict 入历史 +
+                // 审计），但"计划打回→强制重规划"处置断开——改走合法通过
+                // 转移（PlanReviewPassed），计划照常进入执行。属主重规划
+                // 维护触发（PlanReviewed，服务于打回重规划轮）随处置一并
+                effects.audit(
+                    "plan_review_rejected",
+                    serde_json::json!({ "reason": v.reason.clone() }),
+                );
+                // 审计显式区分：verdict_outcome = 审查真实结论（rejected）；
+                // applied_event 是 A3 消融分支的合法转移，不是审查裁决——
+                // "review passed"不得被读成原裁判结果（Main 硬约束）。
+                effects.audit(
+                    "ablation_a3_disposal_disconnected",
+                    serde_json::json!({
+                        "verdict_outcome": "rejected",
+                        "transition_source": "ablation_a3_audit_only",
+                        "would_event": "PlanReviewRejected",
+                        "applied_event": "PlanReviewPassed",
+                        "reason": v.reason,
+                    }),
+                );
+                StepIntent::Proceed {
+                    event: GovernanceEvent::PlanReviewPassed,
+                    effects,
+                }
             } else {
                 effects.audit(
                     "plan_review_rejected",
@@ -732,6 +759,11 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
         // ws——下游节点天然看到上游产物（挂载面不变）。
         workspace_dir: ctx.run_dir.join("ws"),
         image: run.options.image.clone(),
+        // 任务环境接线（G1 native_inspect 真实环境）：外层实验传入的原任务
+        // compose + 其 SAMPLE_METADATA 插值键（state.json 绑定，续跑/孤儿
+        // 恢复同一环境）。None = 内置 network none 单容器（既有行为）。
+        env_compose: run.options.env_compose.clone().map(std::path::PathBuf::from),
+        env_metadata: run.options.env_metadata.clone(),
         assignment,
         // A：节点契约声明优先（planner 大参考卷按规模声明 / timed_out 自适应
         // 放大写回 run.dagspec），未声明回退治理缺省 exec_time_limit_secs
@@ -1025,6 +1057,44 @@ fn exec_review_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<
             // verdict 归档由 commit_intent 的 verdicts 通道执行（分通道 flush）。
             let decision = alfred_core::route(&v).map_err(|e| anyhow::anyhow!(e))?;
             match decision {
+                // A3 仅审计不强制处置：非 C verdict 照常归档（verdict 入历史，
+                // 原生 route() 结论与判分依据落审计——audit 照写），但 verdict
+                // 驱动的指定强制处置（机械重跑 / 机械耗尽升级 / 语义升级 /
+                // contract_fault 预标注属主）全部断开——改走合法通过转移
+                // （ExecReviewPassed → Completed），执行产物按原样进入最终交付。
+                // C（Advance）不属处置，走原路。执行机械失败重跑（execution_step
+                // 读执行驱动状态判定）与审查宿主失败升级（Err 降级路径）不在
+                // 本档断开——那是错误路径不是审查处置，"escalated 仍是真实
+                // 结局"保持。离线回退仍 unscored→升级，不以离线重放冒充在线。
+                _ if matches!(run.options.ablation, Some(GovernanceAblation::AuditOnly))
+                    && !matches!(
+                        decision,
+                        alfred_core::RoutingDecision::Advance
+                    ) =>
+                {
+                    let mut effects = Effects::default();
+                    effects.verdicts.push(VerdictKind::Exec(v.clone()));
+                    effects.audit(
+                        "ablation_a3_disposal_disconnected",
+                        serde_json::json!({
+                            // 审计显式区分：verdict_outcome = 审查真实判分
+                            // （I/P）；applied_event 是 A3 消融分支的合法转移，
+                            // 不是审查裁决——"review passed"不得被读成原裁判
+                            // 结果（Main 硬约束）。
+                            "verdict_outcome": format!("{:?}", v.value),
+                            "transition_source": "ablation_a3_audit_only",
+                            "value": format!("{:?}", v.value),
+                            "failure_class": format!("{:?}", v.failure_class),
+                            "explanation": v.explanation,
+                            "would_route": format!("{:?}", decision),
+                            "applied_event": "ExecReviewPassed",
+                        }),
+                    );
+                    StepIntent::Proceed {
+                        event: GovernanceEvent::ExecReviewPassed,
+                        effects,
+                    }
+                }
                 alfred_core::RoutingDecision::Advance => {
                     let mut effects = Effects::default();
                     effects.verdicts.push(VerdictKind::Exec(v.clone()));
@@ -1874,6 +1944,7 @@ mod tests {
             base_url: String::new(),
             api_key: String::new(),
             max_tokens: 8192,
+            context_window: None,
             raw_id: true,
         };
         let ctx = GovernanceContext {

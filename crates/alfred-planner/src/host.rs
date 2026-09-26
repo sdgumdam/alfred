@@ -7,7 +7,7 @@
 //!
 //! spawn 形态（PiHostFormCheck 实测，pi 0.80.10 宿主）：
 //! ```text
-//! pi -p --no-session -nc \
+//! pi -p --session-dir <work>/sessions -nc \
 //!   --system-prompt "<CONVERSE_SYSTEM_PROMPT + 产出路径规则>" \
 //!   -e <run>/planner/agt/agt-policy.ts \
 //!   --provider <roles.planner 解析> --model <同> \
@@ -196,6 +196,10 @@ struct PiModel<'a> {
     id: &'a str,
     #[serde(rename = "maxTokens")]
     max_tokens: u32,
+    /// 声明上下文窗口（config.yml `contextWindow`；None = 未声明——省略该键，
+    /// pi 回落自身缺省 128000，不在此猜容量）。
+    #[serde(rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+    context_window: Option<u32>,
 }
 
 /// 生成 run 级 pi 配置（`<run>/planner/pi-config/agent/models.json` + `auth.json`）。
@@ -224,6 +228,7 @@ pub(crate) fn write_pi_config(pi_config_dir: &Path, model: &ExecutorModel) -> Re
                 models: vec![PiModel {
                     id: &model.model,
                     max_tokens: model.max_tokens,
+                    context_window: model.context_window,
                 }],
             }
         }
@@ -311,6 +316,9 @@ pub fn run_converse_on_host(
         request.id
     );
 
+    // 原生 session 身份：每轮 converse 预指派唯一 id（short_id 纳秒戳唯一），
+    // 经 --session-id 传给 pi；台账按 id 精确定位，消费方不扫目录猜最新。
+    let session_id = alfred_core::util::short_id("planner-converse");
     let _pi_stdout = spawn_planner_pi(
         opts,
         model,
@@ -319,6 +327,8 @@ pub fn run_converse_on_host(
         agt_ext.as_deref(),
         &system_prompt,
         &prompt,
+        &session_id,
+        "converse",
     )?;
 
     // 收割：两分支候选恰好一个非空（多/零显式报错，无静默出口）。
@@ -349,8 +359,15 @@ pub fn run_converse_on_host(
 }
 
 /// 宿主 pi 单次会话驱动（converse 与 maintain 的公共收割原语，照 host.rs converse
-/// spawn 形态单一真源）：spawn `pi -p --no-session -nc`，stdin 喂 prompt，自限时
+/// spawn 形态单一真源）：spawn `pi -p --session-dir <work>/sessions -nc`，stdin 喂 prompt，自限时
 /// 轮询收割，settle 后返回 stdout 文本（产出文件由调用方按各自路径规则收割）。
+///
+/// 原生 session 身份（可定位，不扫最新）：`session_id` 由调用方预指派并经
+/// `--session-id` 传给 pi（pi 无同 id 本地会话时创建之）；`invocation` 是本轮
+/// 调用种类（"converse" / "maintain"），进台账 kind 字段。pi 进程结束（成功/
+/// 超时/非零退出都记录）后经 [`alfred_core::session_index::record_session_identity`]
+/// 落一条身份台账到 `<work>/sessions/session-index.jsonl`——身份与落盘分开
+/// （W08 语义：身份已分配 ≠ 文件存在，`file_exists` 如实断言）。
 pub(crate) fn spawn_planner_pi(
     opts: &PlannerHostOptions,
     model: &ExecutorModel,
@@ -359,11 +376,19 @@ pub(crate) fn spawn_planner_pi(
     agt_ext: Option<&Path>,
     system_prompt: &str,
     prompt: &str,
+    session_id: &str,
+    invocation: &str,
 ) -> Result<String> {
-    // spawn：pi -p --no-session -nc --system-prompt <sys> -e <agt> --provider --model
+    // 原生会话保存在本次角色工作目录；不自动续接目录内的旧会话。
+    let sessions_dir = work.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).context("create planner sessions directory")?;
+    let sessions_dir = sessions_dir.canonicalize().context("resolve planner sessions directory")?;
     let mut cmd = Command::new("pi");
     cmd.arg("-p")
-        .arg("--no-session")
+        .arg("--session-dir")
+        .arg(&sessions_dir)
+        .arg("--session-id")
+        .arg(session_id)
         .arg("-nc")
         .arg("--system-prompt")
         .arg(system_prompt)
@@ -399,10 +424,12 @@ pub(crate) fn spawn_planner_pi(
     // 形态）。轮询收割 child，避免僵尸；超时先 terminate 再等待回收。
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(opts.time_limit_secs as u64);
-    let output = loop {
+    // 结局三态：正常退出（带退出码）/ 超时（已 kill+回收）。身份台账在两态
+    // 都落——超时被杀的会话只要已写盘（首条 assistant 消息后）照样可定位。
+    let settled: Result<std::process::Output, std::time::Duration> = loop {
         match child.try_wait()? {
             Some(status) => {
-                break std::process::Output {
+                break Ok(std::process::Output {
                     status,
                     stdout: child
                         .stdout
@@ -424,17 +451,32 @@ pub(crate) fn spawn_planner_pi(
                             b
                         })
                         .unwrap_or_default(),
-                };
+                });
             }
             None => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    bail!("planner host pi timed out after {}s", opts.time_limit_secs);
+                    break Err(std::time::Duration::from_secs(opts.time_limit_secs as u64));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(300));
             }
         }
+    };
+    // 身份台账：pi 进程已回收，先落身份（证据链要求，失败显式报错），再判
+    // pi 的退出结局——超时/非零退出的原始错误语义（消息原文）保持不变。
+    let pi_exit = match &settled {
+        Ok(output) => match output.status.code() {
+            Some(0) => "success".to_string(),
+            Some(c) => format!("exit:{c}"),
+            None => "signal".to_string(),
+        },
+        Err(_) => "timeout".to_string(),
+    };
+    alfred_core::session_index::record_session_identity(work, invocation, session_id, &pi_exit)?;
+    let output = match settled {
+        Ok(output) => output,
+        Err(limit) => bail!("planner host pi timed out after {}s", limit.as_secs()),
     };
     if !output.status.success() {
         bail!(
@@ -630,6 +672,7 @@ mod tests {
             base_url: "https://example.invalid/v4".into(),
             api_key: "sk-test".into(),
             max_tokens: 8192,
+            context_window: None,
             raw_id: false,
         };
         write_pi_config(&dir, &model).unwrap();
@@ -651,6 +694,40 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("auth.json")).unwrap(),
             "{}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pi_config_carries_declared_context_window() {
+        // 容量透传回归锁（2026-09-26 用户指令：输入输出用模型声明最大值）：
+        // config.yml 声明的 contextWindow 必须原样进 pi models.json——
+        // 未声明时省略该键（pi 回落自身缺省，不在此猜容量）。
+        let dir = std::env::temp_dir()
+            .join(format!("alfred-pi-cfg-cw-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let model = ExecutorModel {
+            provider: "zhipucoding".into(),
+            model: "glm-5.2".into(),
+            base_url: "https://example.invalid/v4".into(),
+            api_key: "sk-test".into(),
+            max_tokens: 131072,
+            context_window: Some(1048576),
+            raw_id: false,
+        };
+        write_pi_config(&dir, &model).unwrap();
+        let models: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("agent/models.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            models["providers"]["zhipucoding"]["models"][0]["contextWindow"],
+            1048576,
+            "declared contextWindow must reach pi models.json verbatim"
+        );
+        assert_eq!(
+            models["providers"]["zhipucoding"]["models"][0]["maxTokens"],
+            131072
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

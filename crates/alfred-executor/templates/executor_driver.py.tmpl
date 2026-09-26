@@ -11,7 +11,7 @@
   4. 容器生命周期（compose up/down）由本脚本经 Inspect 容器管理接口负责；宿主
      只 spawn 本脚本 + 轮询 done 记录 + 读 bind mount 产物。
 
-executor 只出产物：pi 在沙箱内（network none）按契约 prompt 产出工作区改动，
+executor 只出产物：pi 在沙箱内（内置形态 network none；任务环境 compose 形态沿用原任务网络限制）按契约 prompt 产出工作区改动，
 宿主侧从持久 ws 的 git diff 采集产物（见 alfred-executor run.rs）。本驱动不
 判分、不读验收标准（审查由 reviewer 容器承担）。
 
@@ -27,9 +27,21 @@ decisions land on the host — AGT audit trail). The policy keeps the executor's
 default tool surface but denies out-of-workspace writes and dangerous commands
 (rm -rf / sudo / secret reads) at the tool_call level — tool-level permission
 control, not prompt discipline.
+
+Native session identity: pi runs with `--session-dir CONTAINER_SESSIONS_DIR`
+(host <run>/sessions, retained on the host via the compose bind mount). At RPC
+startup — before the prompt — the driver issues a `get_state` command and
+records the exact sessionFile/sessionId from the real response into the done
+record (identity is assigned at startup; the file itself is only written after
+the first assistant message, so `file_exists` is asserted separately by
+isfile on the mapped host path — no directory scanning, no latest-guessing).
 """
 
 import json
+import hashlib
+import sys
+from pathlib import Path
+import os
 import time
 
 import anyio
@@ -59,6 +71,10 @@ PI_MODEL = __PI_MODEL_JSON__
 # 宿主侧 Inspect 模型 id（桥代发目标）：`inspect/<provider>/<model>` 形态。
 BRIDGE_MODEL = __BRIDGE_MODEL_JSON__
 MAX_TOKENS = int(__MAX_TOKENS__)
+# 声明上下文窗口（config.yml contextWindow；None = 未声明，不猜容量——
+# pi 回落自身缺省 128000）。声明时写进 pi models.json，pi 才按真实容量
+# 管理上下文（2026-09-26 用户指令：输入输出用模型声明最大值）。
+CONTEXT_WINDOW = __CONTEXT_WINDOW__
 WORKSPACE_DIR = __WORKSPACE_DIR_JSON__
 SANDBOX_USER = __SANDBOX_USER_JSON__
 AGT_EXT = __AGT_EXT_JSON__
@@ -74,24 +90,43 @@ TIME_LIMIT_SECS = float(__TIME_LIMIT_SECS__)
 DONE_MARKER = __DONE_MARKER_JSON__
 # docker compose 项目名基座（Inspect 加 uuid 后缀，每次运行独立项目）。
 TASK_NAME = __TASK_NAME_JSON__
+# 容器内原生 session 挂载点（compose 固定把宿主 <run>/sessions 挂到这里，rw）。
+CONTAINER_SESSIONS_DIR = "/tmp/.alfred-sessions"
+# 宿主侧原生 session 保留目录（<run>/sessions，compose 挂载源，绝对路径）。
+# done 记录据此把 RPC 返回的容器内 sessionFile 精确映射到宿主保留位置。
+SESSIONS_DIR_HOST = __SESSIONS_DIR_HOST_JSON__
+# G1 native_inspect 外层实验绑定（非秘密引用 JSON 对象；null = 未绑定）。
+# 随 done 记录回传：外层按 run_ref 关联本执行；本 driver 的 run_id 保持
+# native_exec_id 身份，两者不混用。
+EVIDENCE_BINDING = json.loads(__EVIDENCE_BINDING_JSON__)
+# 任务环境 compose 的 ${SAMPLE_METADATA_*} 插值键（G1 真实环境；空 dict =
+# compose 无插值引用，行为与既有完全一致）。sample_init 用它们解析 compose
+# 引用——与原任务装载同一解析链（resolve_config_environment 只注入 config
+# 文本引用到的键）。
+SANDBOX_METADATA = __SANDBOX_METADATA_JSON__
 
 
 def _models_json(port: int) -> dict:
+    model_entry = {
+        "id": "inspect",
+        "compat": {
+            "supportsDeveloperRole": False,
+            "supportsReasoningEffort": False,
+        },
+    }
+    if CONTEXT_WINDOW is not None:
+        # 声明容量透传（2026-09-26 用户指令）：pi 自身缺省会回落
+        # 128000/16384——声明时必须让 pi 看到真实容量（桥仍强制
+        # max_tokens=MAX_TOKENS，两侧一致）。
+        model_entry["contextWindow"] = CONTEXT_WINDOW
+        model_entry["maxTokens"] = MAX_TOKENS
     return {
         "providers": {
             "inspect-bridge": {
                 "baseUrl": f"http://localhost:{port}/v1",
                 "api": "openai-completions",
                 "apiKey": "sk-none",
-                "models": [
-                    {
-                        "id": "inspect",
-                        "compat": {
-                            "supportsDeveloperRole": False,
-                            "supportsReasoningEffort": False,
-                        },
-                    }
-                ],
+                "models": [model_entry],
             }
         }
     }
@@ -129,8 +164,7 @@ async def _respond_extension_ui(proc, msg: dict) -> None:
         resp = {"type": "extension_ui_response", "id": req_id, "value": ""}
     await proc.write_stdin(json.dumps(resp) + "\n")
 
-
-async def _drive_pi(proc, prompt: str) -> tuple[bool, int | None]:
+async def _drive_pi(proc, prompt: str, session_info: dict) -> tuple[bool, int | None]:
     """Drive pi RPC: send the task prompt, then process events until settled.
 
     Protocol (pi docs/rpc.md): JSONL over stdin/stdout, LF-only framing.
@@ -138,9 +172,23 @@ async def _drive_pi(proc, prompt: str) -> tuple[bool, int | None]:
     run is fully settled. After settle we close stdin (EOF) so pi exits
     cleanly; a settle_grace backstop kills a lingering process.
 
+    Native session identity: a `get_state` command is issued at startup
+    (before the prompt) and its response carries pi's assigned
+    sessionFile/sessionId into `session_info` (W08 acceptance: identity is
+    assigned at RPC startup, before any prompt/model call; the session file
+    itself is only persisted after the first assistant message, so identity
+    and on-disk existence are recorded separately — see `_session_record`).
+    The exact path comes from the RPC response; no directory scanning, no
+    guessing the latest file.
+
     Returns (settled, exit_code). exit_code is None if the process was killed
     or the loop ended without an ExecCompleted event.
     """
+    # 身份取回：启动即查（先于 prompt）——W08 phase A 实测无 prompt 时
+    # get_state 已返回已分配的 sessionFile/sessionId；id 关联响应。
+    await proc.write_stdin(
+        json.dumps({"id": "alfred-state", "type": "get_state"}) + "\n"
+    )
     await proc.write_stdin(json.dumps({"type": "prompt", "message": prompt}) + "\n")
 
     settled = False
@@ -162,7 +210,21 @@ async def _drive_pi(proc, prompt: str) -> tuple[bool, int | None]:
                     # non-JSON progress line (e.g. pi banner) — ignore
                     continue
                 kind = msg.get("type")
-                if kind == "extension_ui_request":
+                if kind == "response":
+                    # get_state 响应：登记真实分配的原生 session 身份（只认
+                    # 实测字段；不造默认身份，不以身份冒称文件存在）。
+                    if (
+                        msg.get("id") == "alfred-state"
+                        and msg.get("command") == "get_state"
+                        and msg.get("success")
+                    ):
+                        data = msg.get("data") or {}
+                        if isinstance(data.get("sessionFile"), str) and isinstance(
+                            data.get("sessionId"), str
+                        ):
+                            session_info["file"] = data["sessionFile"]
+                            session_info["id"] = data["sessionId"]
+                elif kind == "extension_ui_request":
                     await _respond_extension_ui(proc, msg)
                 elif kind == "agent_settled":
                     settled = True
@@ -193,13 +255,196 @@ async def _cleanup_running_projects() -> None:
         await project_cleanup(project, quiet=True)
 
 
-async def _run_container() -> None:
-    """起容器（Inspect DockerSandboxEnvironment）+ 桥代发 + 驱动容器内 pi。"""
+def _workspace_snapshot(root):
+    files = {}
+    for directory, dirs, names in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in {'.git', '.venv', 'node_modules'}
+                   and not (Path(directory) / name).is_symlink()]
+        for name in names:
+            path = Path(directory) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            raw = path.read_bytes()
+            files[relative] = {'path': relative, 'size': len(raw),
+                               'sha256': hashlib.sha256(raw).hexdigest()}
+    return files
+
+
+async def _prepare_workspace_state(sbox, session_info):
+    binding = EVIDENCE_BINDING or {}
+    if not binding.get('workspace_state_schema'):
+        return
+    root = Path(binding['workspace_state_root'])
+    import yaml
+    compose = yaml.safe_load(Path(COMPOSE_FILE).read_text())
+    volumes = compose['services']['default'].get('volumes', [])
+    workspace_sources = [v.rsplit(':', 2)[0] for v in volumes
+                         if isinstance(v, str) and v.endswith(':/workspace:rw')]
+    if workspace_sources != [str(root.resolve())]:
+        raise RuntimeError('workspace state binding differs from declared first workspace mount')
+    marker = Path(binding['workspace_state_marker'])
+    if marker.exists():
+        saved = json.loads(marker.read_text())
+        if saved.get('run_ref') != binding['run_ref'] or saved.get('schema') != binding['workspace_state_schema']:
+            raise RuntimeError('workspace state marker belongs to another binding')
+    else:
+        # This is dependency restoration, not installation. Only allowlisted
+        # paths baked by Dockerfile.case-alfred are reachable through the bind.
+        script = r'''
+import json, shutil
+from pathlib import Path
+state = Path('/opt/alfred/workspace-state')
+manifest = json.loads((state.parent / 'workspace-state.json').read_text())
+if manifest.get('schema') != 'alfred-workspace-state-v1':
+    raise RuntimeError('missing matching image workspace-state delivery')
+restored = []
+for relative in manifest['entries']:
+    rel = Path(relative)
+    if rel.is_absolute() or '..' in rel.parts or rel.name not in {'.git', '.venv', 'node_modules', 'pnpm-lock.yaml'}:
+        raise RuntimeError('invalid image workspace-state path')
+    source, target = state / rel, Path('/workspace') / rel
+    if target.exists() or target.is_symlink():
+        continue  # Sample initial state is authoritative (not overwritten).
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, target, symlinks=True)
+    else:
+        shutil.copy2(source, target)
+    restored.append(relative)
+print(json.dumps({'schema': manifest['schema'], 'restored': restored}))
+'''
+        result = await sbox.exec(['python3', '-c', script], timeout=600)
+        if not result.success:
+            raise RuntimeError('image workspace-state restoration failed: ' + result.stderr)
+        required = binding.get('workspace_state_required', [])
+        missing = [name for name in required if not (root / name).is_dir()]
+        if missing:
+            raise RuntimeError('bound image lacks required workspace state: ' + ', '.join(missing))
+        saved = json.loads(result.stdout)
+        saved['run_ref'] = binding['run_ref']
+        saved['initial_files'] = _workspace_snapshot(root)
+        with marker.open('x') as handle:
+            json.dump(saved, handle, ensure_ascii=False)
+    # Exact pre-agent baseline: installation/git bootstrap cannot masquerade
+    # as an executor change, including after native retries.
+    before = _workspace_snapshot(root.parent)
+    snapshot = Path(DONE_MARKER).parent / 'workspace.before.json'
+    with snapshot.open('x') as handle:
+        json.dump(before, handle, sort_keys=True)
+    session_info['workspace_state'] = {'schema': saved['schema'], 'marker': str(marker)}
+    # Bind-mount presentation can make the container's git reject the bound
+    # repository as dubious ownership even though stat shows uid 0 == euid
+    # (NativeVerify diag-case09/probe-case09: rc=128 flapping across runs;
+    # `git -c safe.directory=/workspace` always works). The original task
+    # environment had usable git at /workspace, so the replay must restore
+    # that capability: scope the exact run workspace as trusted in THIS
+    # ephemeral container only (never '*', never the host, never the image),
+    # then verify git actually works and fail loud otherwise. Runs on every
+    # container start, including native retries that reuse the marker, since
+    # /etc/gitconfig resets with each fresh container.
+    trust = r'''
+import json, subprocess
+from pathlib import Path
+status = None
+if Path('/workspace/.git').is_dir():
+    def run(*args):
+        return subprocess.run(['git', *args], capture_output=True, text=True)
+    listed = run('config', '--system', '--get-all', 'safe.directory')
+    if listed.returncode not in (0, 1):
+        raise RuntimeError('git system config unreadable: ' + listed.stderr)
+    if '/workspace' in (listed.stdout or '').splitlines():
+        status = 'preexisting'
+    else:
+        added = run('config', '--system', '--add', 'safe.directory', '/workspace')
+        if added.returncode != 0:
+            raise RuntimeError('cannot scope exact git trust for /workspace: ' + added.stderr)
+        status = 'added'
+    probe = run('-C', '/workspace', 'rev-parse', '--is-inside-work-tree')
+    if probe.returncode != 0 or probe.stdout.strip() != 'true':
+        raise RuntimeError('git unusable at /workspace after exact-path trust: ' + probe.stderr)
+print(json.dumps({'git_exact_path_trust': status}))
+'''
+    trust_result = await sbox.exec(['python3', '-c', trust], timeout=120)
+    if not trust_result.success:
+        raise RuntimeError('git exact-path trust step failed: ' + trust_result.stderr)
+    session_info['workspace_state']['git_exact_path_trust'] = json.loads(trust_result.stdout)['git_exact_path_trust']
+
+async def _inject_runtime_key_inputs(env, session_info: dict) -> None:
+    """CASE17-SIGNING: designated secret key into THIS run's sandbox.
+
+    Runs after the sandbox is up and workspace state is prepared, BEFORE the
+    agent's first action (bridge/pi start). Target is the exact container of
+    this sample_init compose project (uuid project name, label-selected; no
+    scanning, no guessing, no config re-render). The key travels through the
+    registered channel module (inspect_harness.case17_signing): explicit
+    source acquisition, host-side fingerprint pre-check BEFORE any import,
+    stdin-piped gpg import, ownertrust, and a real detach-sign warm-up — all
+    fail loud, so a run without the signing capability fails for a real
+    environmental reason instead of silently producing unsigned commits.
+    Private key material never touches disk, the image, logs or TOS; the
+    recorded report is public facts only (fpr/uid/container ids).
+    """
+    binding = EVIDENCE_BINDING or {}
+    inputs = binding.get('runtime_key_inputs') or []
+    if not inputs:
+        return
+    import subprocess
+    project = getattr(env, '_project', None)
+    service = getattr(env, '_service', 'default')
+    if project is None:
+        raise RuntimeError('runtime key injection needs the run compose project')
+    ps = subprocess.run(
+        ['docker', 'ps', '-q',
+         '--filter', f'label=com.docker.compose.project={project.name}',
+         '--filter', f'label=com.docker.compose.service={service}'],
+        capture_output=True, text=True, timeout=120,
+    )
+    cids = (ps.stdout or '').split()
+    if ps.returncode != 0 or len(cids) != 1:
+        raise RuntimeError(
+            f'cannot resolve the exact run container for runtime key injection '
+            f'(project={project.name!r}, service={service!r}, found={len(cids)}, '
+            f'rc={ps.returncode}): ' + (ps.stderr or '').strip()[:300]
+        )
+    container_id = cids[0]
+    import importlib
+    harness_root = os.environ.get('ALFRED_HARNESS_ROOT')
+    if not harness_root:
+        raise RuntimeError('ALFRED_HARNESS_ROOT missing for runtime key inputs')
+    sys.path.insert(0, harness_root)
+    reports = []
+    for entry in inputs:
+        kind = entry.get('kind')
+        if kind != 'gpg-secret-key':
+            raise RuntimeError(f'unsupported runtime key input kind: {kind!r}')
+        module_name = entry.get('module') or 'inspect_harness.case17_signing'
+        signing = importlib.import_module(module_name)
+        material = signing.acquire_secret_key_bytes(
+            entry.get('key_file'), entry.get('gnupg_home'))
+        signing.check_material_is_designated(material)
+        reports.append(signing.inject_into_container(container_id, material))
+    session_info['runtime_key_inputs'] = reports
+
+
+async def _run_container(session_info: dict) -> None:
+    """起容器（Inspect DockerSandboxEnvironment）+ 桥代发 + 驱动容器内 pi。
+
+    `session_info` 由调用方持有：`_drive_pi` 从 get_state 响应填充原生
+    session 身份；超时/异常取消后已取到的身份仍保留（启动即查，先于任何
+    agent 活动），供 done 记录如实关联。
+    """
     raw_envs = None
+    session_info["cleanup_status"] = "not_created"
     try:
         raw_envs = await DockerSandboxEnvironment.sample_init(
-            TASK_NAME, COMPOSE_FILE, metadata={}
+            TASK_NAME, COMPOSE_FILE, metadata=SANDBOX_METADATA
         )
+        session_info["cleanup_status"] = "open"
+        await _prepare_workspace_state(raw_envs['default'], session_info)
+        # CASE17-SIGNING: designated signing key enters the exact run sandbox
+        # before the agent's first action; failure fails the run loudly.
+        await _inject_runtime_key_inputs(raw_envs['default'], session_info)
         # exec_remote 依赖 SandboxEnvironmentProxy（事件记录包装，eval 路径同款）
         envs = {k: SandboxEnvironmentProxy(v) for k, v in raw_envs.items()}
         sandbox_environments_context_var.set(envs)
@@ -226,7 +471,7 @@ async def _run_container() -> None:
                 env["AGT_AUDIT_PATH"] = AGT_AUDIT_PATH
                 if REF_VOLUMES:
                     env["AGT_REF_VOLUMES"] = REF_VOLUMES
-            cmd = ["pi", "--mode", "rpc", "--no-session", "--model", PI_MODEL]
+            cmd = ["pi", "--mode", "rpc", "--session-dir", CONTAINER_SESSIONS_DIR, "--model", PI_MODEL]
             if AGT_EXT:
                 cmd += ["-e", AGT_EXT]
             proc = await sbox.exec_remote(
@@ -243,15 +488,35 @@ async def _run_container() -> None:
             # 契约 + 挂载翻译锚：锚定 workspace_subdirs[0] 即 /workspace 根，
             # 防契约目录名被字面嵌套（src 嵌套歧义治本）。
             settled, exit_code = await _drive_pi(
-                proc, CONTRACT_PROMPT + "\n\n" + MOUNT_ANCHOR
+                proc, CONTRACT_PROMPT + "\n\n" + MOUNT_ANCHOR, session_info
             )
-            if not settled:
+            if not settled or exit_code != 0:
                 raise RuntimeError(f"pi RPC did not settle (exit_code={exit_code})")
     finally:
         # 清理必须 shield：超时取消（fail_after）时，finally 内的 await 会立即抛
         # CancelledError——shield 保证 compose down 跑完，不泄漏容器。
         try:
             with anyio.CancelScope(shield=True):
+                if EVIDENCE_BINDING and EVIDENCE_BINDING.get("collector_entrypoint_ref"):
+                    try:
+                        if raw_envs is None:
+                            raise RuntimeError("task environment unavailable for terminal collection")
+                        import importlib
+                        harness_root = os.environ.get('ALFRED_HARNESS_ROOT')
+                        if not harness_root:
+                            raise RuntimeError('ALFRED_HARNESS_ROOT missing for bound collector')
+                        sys.path.insert(0, harness_root)
+                        module_name, entry_name = EVIDENCE_BINDING['collector_entrypoint_ref'].split(':', 1)
+                        collector = getattr(importlib.import_module(module_name), entry_name)
+
+                        session_info["terminal_collection"] = await collector(
+                            raw_envs["default"], EVIDENCE_BINDING, RUN_ID,
+                        )
+                    except Exception as collect_ex:
+                        session_info["terminal_collection"] = {
+                            "status": "error", "error": str(collect_ex),
+                        }
+                had_resources = raw_envs is not None or bool(list(running_projects()))
                 if raw_envs is not None:
                     await DockerSandboxEnvironment.sample_cleanup(
                         TASK_NAME, COMPOSE_FILE, raw_envs, False
@@ -260,31 +525,80 @@ async def _run_container() -> None:
                     # sample_init 中途被取消：raw_envs 未赋值，但项目已登记进
                     # running_projects()——兜底遍历登记表逐个 down。
                     await _cleanup_running_projects()
+                session_info["cleanup_status"] = "released" if had_resources else "not_created"
         except Exception as cleanup_ex:
+            session_info["cleanup_status"] = "error"
+            session_info["cleanup_error"] = str(cleanup_ex)
             print(f"[alfred-driver] container cleanup failed: {cleanup_ex}")
 
 
-def _write_done(status: str, error: str | None = None) -> None:
-    doc = {"event": "done", "status": status, "run_id": RUN_ID}
+def _session_record(session_info: dict) -> dict | None:
+    """把 RPC 取得的原生 session 身份关联为 done 记录的 session 字段。
+
+    身份与落盘分开记录（W08 核收：pi `_persist()` 需首条 assistant 消息才
+    写盘，身份已分配 ≠ 文件存在）。`host_file` 只经 compose 挂载的固定前缀
+    精确映射，前缀不符即 None（不猜）；`file_exists` 只在宿主文件可定位时
+    以 isfile 实测断言——不扫描目录、不按时间猜最新、不以身份冒称文件存在。
+    """
+    if not session_info.get("id") or not session_info.get("file"):
+        return None
+    rec: dict = {
+        "id": session_info["id"],
+        "file": session_info["file"],
+        "host_file": None,
+        "file_exists": None,
+    }
+    prefix = CONTAINER_SESSIONS_DIR + "/"
+    if session_info["file"].startswith(prefix):
+        rel = session_info["file"][len(prefix):]
+        if rel and not os.path.isabs(rel) and all(part not in ("", ".", "..") for part in rel.split("/")):
+            host = os.path.join(SESSIONS_DIR_HOST, rel)
+            rec["host_file"] = host
+            rec["file_exists"] = os.path.isfile(host)
+    return rec
+
+
+def _write_done(status: str, error: str | None, session_info: dict) -> None:
+    doc = {
+        "event": "done",
+        "status": status,
+        "run_id": RUN_ID,
+        # 原生 session 关联：null = 未从 RPC 取到身份（如实缺席，不伪造）。
+        "session": _session_record(session_info),
+        # G1 native_inspect：本执行实际使用的容器环境关联（driver 自己
+        # sample_init 起的 compose 项目基座 + compose 文件）+ 外层实验绑定
+        # 原文回传（null = 未绑定，如手工 feed 续跑）。
+        "environment": {"task_name": TASK_NAME, "compose_file": COMPOSE_FILE},
+        "evidence_binding": EVIDENCE_BINDING,
+        "terminal_collection": session_info.get("terminal_collection"),
+        # CASE17-SIGNING injection report (public facts only; absent when
+        # the binding declares no runtime key inputs).
+        "runtime_key_inputs": session_info.get("runtime_key_inputs"),
+        "cleanup_status": session_info.get("cleanup_status", "not_created"),
+        "cleanup_error": session_info.get("cleanup_error"),
+    }
     if error:
         doc["error"] = error
     with open(DONE_MARKER, "w") as f:
         json.dump(doc, f)
 
 
-async def _run_with_timeout() -> None:
+async def _run_with_timeout(session_info: dict) -> None:
     # fail_after 是 async 上下文管理器（同步 with 会 NoEventLoopError）——包一层
     # async 函数再交给 anyio.run。超时后 _run_container 的 finally（shield 清理）
     # 先跑完，再向 main 抛 TimeoutError。
     with anyio.fail_after(TIME_LIMIT_SECS):
-        await _run_container()
+        await _run_container(session_info)
 
 
 def main() -> None:
     status = "success"
     error: str | None = None
+    # 原生 session 身份容器：_drive_pi 从 get_state 响应填充（启动即查）；
+    # 超时/异常路径已取到的身份保留，done 记录如实落盘。
+    session_info: dict = {}
     try:
-        anyio.run(_run_with_timeout)
+        anyio.run(_run_with_timeout, session_info)
     except TimeoutError:
         status = "timed_out"
         error = f"driver timed out after {TIME_LIMIT_SECS:.0f}s"
@@ -295,7 +609,7 @@ def main() -> None:
         print(f"[alfred-driver] driver failed: {error}", flush=True)
         raise
     finally:
-        _write_done(status, error)
+        _write_done(status, error, session_info)
 
 
 if __name__ == "__main__":

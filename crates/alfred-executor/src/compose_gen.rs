@@ -40,6 +40,28 @@ struct Service {
 /// 容器内工作区路径（固定，执行驱动专用挂载）。
 pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
 
+/// Nodes may use only the network already bound by the owner. `false`
+/// always means network none; it is never an alias for a task bridge.
+pub fn validate_task_network(network: bool, compose: Option<&Path>) -> Result<()> {
+    let enabled = if let Some(path) = compose {
+        let doc: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(path)?)?;
+        let service = doc.get("services").and_then(|v| v.get("default"))
+            .and_then(|v| v.as_mapping())
+            .context("task env compose: services.default mapping missing")?;
+        match service.get(&serde_yaml::Value::String("network_mode".into())) {
+            None => true, // Compose default bridge, including sidecar DNS.
+            Some(serde_yaml::Value::String(mode)) if !mode.contains("${") => mode != "none",
+            _ => bail!("task env compose: network_mode must be a literal string"),
+        }
+    } else {
+        false
+    };
+    if network != enabled {
+        bail!("sandbox.network={network} conflicts with owner-bound environment (network enabled={enabled}); revise the plan, never silently widen permissions");
+    }
+    Ok(())
+}
+
 /// executor 容器挂载参数（R6a：矩阵 §1.1 executor 行落码）。
 ///
 /// - `workspace_subdirs`：契约声明的工作区子目录（相对持久 ws）。**非空必挂**
@@ -55,6 +77,8 @@ pub struct ExecutorMounts {
     pub ref_volumes: Vec<VolumeMount>,
     pub agt_dir: Option<PathBuf>,
     pub agt_audit_dir: Option<PathBuf>,
+    /// Native pi sessions, retained independently of workspace and AGT policy.
+    pub sessions_dir: Option<PathBuf>,
 }
 
 /// 校验 workspace subdir 声明：必须相对、非空、不含 `.`/`..`（防 rw 挂载逃逸持久 ws，
@@ -144,7 +168,7 @@ pub fn validate_ref_volume(vol: &VolumeMount) -> Result<()> {
             vol.container_path
         );
     }
-    for reserved in ["/workspace", "/tmp/.agt"] {
+    for reserved in ["/workspace", "/tmp/.agt", "/tmp/.alfred-sessions"] {
         if target == Path::new(reserved) || target.starts_with(reserved) {
             bail!(
                 "ref volume container_path '{}' conflicts with reserved mount point '{reserved}'",
@@ -172,6 +196,26 @@ pub fn generate_executor_compose(
     image: &str,
     mounts: &ExecutorMounts,
 ) -> Result<String> {
+    let volumes = alfred_mount_volumes(workspace_host_dir, mounts)?;
+    let compose = ComposeFile {
+        services: Services {
+            default: Service {
+                image: image.to_string(),
+                command: "tail -f /dev/null".to_string(),
+                init: true,
+                network_mode: "none".to_string(),
+                stop_grace_period: "1s".to_string(),
+                volumes,
+            },
+        },
+    };
+    serde_yaml::to_string(&compose).context("serialize compose yaml")
+}
+
+fn alfred_mount_volumes(
+    workspace_host_dir: &Path,
+    mounts: &ExecutorMounts,
+) -> Result<Vec<String>> {
     let abs = canonicalize_workspace(workspace_host_dir)?;
     let mut volumes: Vec<String> = Vec::new();
     if mounts.workspace_subdirs.is_empty() {
@@ -223,19 +267,13 @@ pub fn generate_executor_compose(
         // R6a：审计输出子目录 rw——agent 可写审计但不可改策略（拆开挂载）。
         volumes.push(format!("{}:/tmp/.agt/audit:rw", audit_abs.display()));
     }
-    let compose = ComposeFile {
-        services: Services {
-            default: Service {
-                image: image.to_string(),
-                command: "tail -f /dev/null".to_string(),
-                init: true,
-                network_mode: "none".to_string(),
-                stop_grace_period: "1s".to_string(),
-                volumes,
-            },
-        },
-    };
-    serde_yaml::to_string(&compose).context("serialize compose yaml")
+    if let Some(sessions) = &mounts.sessions_dir {
+        let sessions_abs = sessions
+            .canonicalize()
+            .with_context(|| format!("canonicalize sessions dir {}", sessions.display()))?;
+        volumes.push(format!("{}:/tmp/.alfred-sessions:rw", sessions_abs.display()));
+    }
+    Ok(volumes)
 }
 
 /// canonicalize 工作区宿主目录；存在性/可访问性校验。
@@ -259,4 +297,165 @@ pub fn canonicalize_workspace(dir: &Path) -> Result<std::path::PathBuf> {
         );
     }
     Ok(abs)
+}
+
+/// 任务环境 compose 生成（G1 native_inspect 真实环境，per-run）。
+///
+/// 输入 = 外层实验传入的原任务 compose（`--env-compose`，绝对路径）。
+/// 输出在 `<exec>/executor.compose.yaml`，由 driver 的 Inspect `sample_init`
+/// 起容器（compose up --wait + 健康检查——sidecar 不健康即失败，不静默
+/// 放行）与 `sample_cleanup` 回收（生命周期不变，仍是 Inspect）。
+///
+/// 复用语义（不丢原任务环境事实）：
+/// - `services.default`（agent 服务）：**镜像**换成执行镜像（`image` =
+/// 原任务依赖镜像 + node/pi，Main 构建）；`volumes` 追加 alfred 挂载面
+/// （workspace 子目录 rw + 只读参考卷 + AGT 策略/审计 + 原生 session）；
+/// `stop_grace_period` 钉 1s（快速回收）；**其余字段逐字保留**——
+/// `command`/`init`/`working_dir`/`mem_limit`/`extra_hosts`（原任务网络
+/// 限制：参考域名钉 127.0.0.1）/`environment`（原任务 env 注入，如 DB 连接
+/// 坐标）/`depends_on`（sidecar 健康门）/`x-local` 等。
+/// - 其余服务（sidecar，如 mysql）：**逐字复制**（镜像 digest、healthcheck、
+/// init SQL bind mount、`${SAMPLE_METADATA_*}` 引用原样——由 driver 的
+/// sample_init 用 `--env-metadata` 的键值解析，与原任务装载同一链）。
+/// - 网络：不注入 `network_mode: none`——原任务环境的网络形态（compose
+/// 自建 bridge + extra_hosts 钉参考域名）原样保留（sidecar 服务名可解析）。
+///
+/// 防呆（fail-closed，不静默放行）：
+/// - default 无 `image`（换不了执行镜像）/带 `build` 段（2026-09-25 Main
+///   裁决：build+image 并存导致 tag 身份漂移）/带 `container_name`
+///   （Inspect 拒绝）/无 `command`（容器必须常驻）→ 报错。
+/// - default 自带 `volumes`（与 alfred 挂载面冲突面未定义）→ 报错
+///   （本仓任务 compose 的 default 一律无 volumes——workspace 由
+///   Sample.files 注入；sidecar 的 volumes 不在此列，逐字保留）。
+/// - default `depends_on` 引用的服务不存在，或 `condition: service_healthy`
+///   引用的 sidecar 无 `healthcheck` → 报错（无健康门的 sidecar = 放行
+///   条件缺失）。
+pub fn generate_task_env_compose(
+    orig_compose: &Path,
+    workspace_host_dir: &Path,
+    image: &str,
+    mounts: &ExecutorMounts,
+) -> Result<String> {
+    fn skey(s: &str) -> serde_yaml::Value {
+        serde_yaml::Value::String(s.to_string())
+    }
+    let orig_abs = orig_compose
+        .canonicalize()
+        .with_context(|| format!("canonicalize task env compose {}", orig_compose.display()))?;
+    let text = std::fs::read_to_string(&orig_abs)
+        .with_context(|| format!("read task env compose {}", orig_abs.display()))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&text).context("parse task env compose yaml")?;
+    let services = doc
+        .get("services")
+        .and_then(|v| v.as_mapping())
+        .with_context(|| "task env compose: top-level 'services' mapping missing")?;
+    let default = services
+        .get(&skey("default"))
+        .and_then(|v| v.as_mapping())
+        .with_context(|| "task env compose: services.default mapping missing")?;
+
+    // default 服务防呆（见函数级文档）。
+    let dep_image = default
+        .get(&skey("image"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .with_context(|| "task env compose: services.default.image missing（执行镜像需替换原任务依赖镜像）")?
+        .to_string();
+    if default.get(&skey("build")).is_some() {
+        bail!("task env compose services.default 带 build 段（预构建镜像形态，build+image 并存会 tag 身份漂移）: {dep_image}");
+    }
+    if default.get(&skey("container_name")).is_some() {
+        bail!("task env compose services.default 带 container_name（Inspect 拒绝：多 epoch 容器名冲突）");
+    }
+    if default
+        .get(&skey("command"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        bail!("task env compose services.default 缺 command（执行容器必须常驻，如 tail -f /dev/null）");
+    }
+    if default.get(&skey("volumes")).is_some() {
+        bail!(
+            "task env compose services.default 自带 volumes（与 alfred 挂载面冲突面未定义，拒绝合并；本仓任务 workspace 由 Sample.files 注入，default 不应有 volumes）"
+        );
+    }
+
+    // sidecar 健康门：default depends_on 引用的服务必须存在；
+    // condition: service_healthy 的 sidecar 必须定义 healthcheck（无健康
+    // 门 = 放行条件缺失，显式拒绝——docker compose 也会失败，这里给早错）。
+    if let Some(depends_on) = default.get(&skey("depends_on")) {
+        let entries: Vec<(String, Option<serde_yaml::Value>)> = match depends_on {
+            serde_yaml::Value::Sequence(seq) => seq
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| (s.to_string(), None)))
+                .collect(),
+            serde_yaml::Value::Mapping(map) => map
+                .iter()
+                .filter_map(|(k, v)| {
+                    k.as_str().map(|s| (s.to_string(), Some(v.clone())))
+                })
+                .collect(),
+            _ => bail!("task env compose services.default.depends_on 形态不支持（序列或映射）"),
+        };
+        for (svc, cond) in entries {
+            let sidecar = services
+                .get(&skey(&svc))
+                .with_context(|| format!("task env compose services.default.depends_on 引用不存在的服务 '{svc}'"))?;
+            let healthy = matches!(&cond, Some(serde_yaml::Value::Mapping(m))
+                if m.get(&skey("condition")).and_then(|v| v.as_str()) == Some("service_healthy"));
+            if healthy {
+                let has_healthcheck = sidecar
+                    .as_mapping()
+                    .map(|m| m.contains_key(&skey("healthcheck")))
+                    .unwrap_or(false);
+                if !has_healthcheck {
+                    bail!(
+                        "task env compose sidecar '{svc}' 被 depends_on(service_healthy) 引用但无 healthcheck（无健康门的 sidecar = 放行条件缺失）"
+                    );
+                }
+            }
+        }
+    }
+
+    // alfred 挂载面（与内置 compose 共用单一真源 alfred_mount_volumes）。
+    let volumes = alfred_mount_volumes(workspace_host_dir, mounts)?;
+
+    // default 服务：镜像换执行镜像 + volumes 注入 + stop_grace_period 钉 1s，
+    // 其余字段（command/init/working_dir/mem_limit/extra_hosts/environment/
+    // depends_on/x-local…）逐字保留。
+    let mut out_default = default.clone();
+    out_default.insert(skey("image"), serde_yaml::Value::String(image.to_string()));
+    out_default.insert(skey("stop_grace_period"), skey("1s"));
+    let volume_values: Vec<serde_yaml::Value> =
+        volumes.into_iter().map(serde_yaml::Value::String).collect();
+    out_default.insert(
+        skey("volumes"),
+        serde_yaml::Value::Sequence(volume_values),
+    );
+
+    let mut out_services = serde_yaml::Mapping::new();
+    for (name, svc) in services {
+        if name.as_str() == Some("default") {
+            out_services.insert(
+                name.clone(),
+                serde_yaml::Value::Mapping(std::mem::take(&mut out_default)),
+            );
+        } else {
+            out_services.insert(name.clone(), svc.clone());
+        }
+    }
+    // Preserve named networks/volumes and other top-level task constraints.
+    let mut out = doc.as_mapping().context("task env compose must be a mapping")?.clone();
+    out.insert(skey("services"), serde_yaml::Value::Mapping(out_services));
+    let rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(out))
+        .context("serialize task env compose yaml")?;
+    Ok(rendered
+        + &format!(
+            "# task environment compose from {}\n# executor image: {image} (dependency: {dep_image})\n",
+            orig_abs.display()
+        ))
 }
