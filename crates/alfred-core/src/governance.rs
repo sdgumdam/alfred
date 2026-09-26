@@ -363,6 +363,16 @@ pub struct GovernanceOptions {
     /// 解析链）。空 = 无键。
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env_metadata: std::collections::BTreeMap<String, String>,
+    /// 执行侧 AGT 策略显式目录（`--executor-agt-dir`，绝对路径）。作用域仅
+    /// executor 行：planner/reviewer 仍走 `resolve_agt_source()`（共享 env 语
+    /// 义），因此 A1/A2 消融下 reviewer 保持内置源（原守卫强制不变），同时
+    /// executor 经本字段持有 run-scoped 边界策略目录。`None` = 沿用既有
+    /// env 解析（无旗标旧调用行为不变）。落 state.json：续跑/孤儿恢复绑定
+    /// 同一执行侧策略（与 --ablation/--env-compose 同一原生参数纪律，不经
+    /// env）。`ALFRED_AGT_DISABLE=1` 全局关闭优先级不变：显式目录与之冲突
+    /// 由执行侧构造显式拒绝（fail-closed），旗标不得绕过全局关闭。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_agt_dir: Option<String>,
 }
 
 /// `planner_time_limit_secs` 缺省值（旧 state.json 无此字段时反序列化兜底）。
@@ -383,6 +393,7 @@ impl Default for GovernanceOptions {
             ablation: None,
             env_compose: None,
             env_metadata: std::collections::BTreeMap::new(),
+            executor_agt_dir: None,
         }
     }
 }

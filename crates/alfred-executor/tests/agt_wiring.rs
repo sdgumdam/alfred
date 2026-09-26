@@ -19,7 +19,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use alfred_executor::agt::{assets, prepare_agt_work, resolve_agt_source, AgtSource};
+use alfred_executor::agt::{
+    assets, executor_agt_source, prepare_agt_work, resolve_agt_source, AgtSource,
+};
 use alfred_executor::compose_gen::{generate_executor_compose, ExecutorMounts};
 use alfred_executor::task_gen::{generate_task_py, TaskGenParams};
 
@@ -268,4 +270,38 @@ fn resolve_agt_source_unset_defaults_builtin() {
     // 空串等价未设（沿用原语义）。
     let _g = EnvGuard::set("ALFRED_AGT_DIR", "");
     assert_eq!(resolve_agt_source(), AgtSource::Builtin, "空串 ALFRED_AGT_DIR → 内置默认");
+}
+
+#[test]
+fn executor_agt_source_explicit_dir_scopes_to_executor_only() {
+    let _lock = GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("ALFRED_AGT_DIR");
+    std::env::remove_var("ALFRED_AGT_DISABLE");
+    // 显式目录（--executor-agt-dir）→ executor 持 Dir；同一进程 env 下
+    // planner/reviewer 的共享解析不受影响（Builtin）——A1/A2 消融下
+    // reviewer 守卫（requires built-in AGT layer）因此保持成立。
+    assert_eq!(
+        executor_agt_source(Some(Path::new("/tmp/some-agt-dir"))).unwrap(),
+        AgtSource::Dir(PathBuf::from("/tmp/some-agt-dir"))
+    );
+    assert_eq!(resolve_agt_source(), AgtSource::Builtin);
+}
+
+#[test]
+fn executor_agt_source_none_falls_back_to_shared_env_semantics() {
+    let _lock = GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = EnvGuard::set("ALFRED_AGT_DIR", "/tmp/some-agt-dir");
+    assert_eq!(
+        executor_agt_source(None).unwrap(),
+        AgtSource::Dir(PathBuf::from("/tmp/some-agt-dir")),
+        "无旗标 = 共享 env 解析（无旗标旧调用行为不变）"
+    );
+}
+
+#[test]
+fn executor_agt_source_conflicts_with_global_disable_fail_closed() {
+    let _lock = GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _d = EnvGuard::set("ALFRED_AGT_DISABLE", "1");
+    // 全局关闭优先：显式目录不得绕过（显式拒绝，非静默 Off/Dir）。
+    assert!(executor_agt_source(Some(Path::new("/tmp/some-agt-dir"))).is_err());
 }

@@ -27,7 +27,7 @@ use alfred_core::governance::{
 };
 use alfred_core::request::OwnerRequest;
 use alfred_core::util::now_rfc3339;
-use alfred_executor::agt::resolve_agt_source;
+use alfred_executor::agt::executor_agt_source;
 use alfred_executor::config::{
     load_executor_model, load_planner_model, load_reviewer_model, ExecutorModel,
 };
@@ -774,9 +774,14 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
         settle_grace_seconds: run.options.settle_grace_seconds,
         ctl_enabled: run.options.ctl_enabled,
         // AGT 拦写层（executor 行，属主拍板项：权限控制不让写文件 + 默认启用）：
-        // 与 planner/reviewer 共用解析语义——`ALFRED_AGT_DISABLE=1` 关，
-        // `ALFRED_AGT_DIR` 显式目录覆盖，未设 = 内置默认策略（alfred_core::agt）。
-        agt: resolve_agt_source(),
+        // --executor-agt-dir 显式目录（run.options，state.json 续跑绑定）优先，
+        // 作用域仅 executor——planner/reviewer 仍走共享 env 解析（A1/A2 消融
+        // 下 reviewer 保持内置源，原守卫强制不变）；无旗标 = 共用解析语义
+        // （`ALFRED_AGT_DISABLE=1` 关，`ALFRED_AGT_DIR` 覆盖，未设 = 内置默认）。
+        // 显式目录与全局 DISABLE 冲突 = 显式拒绝（不绕过全局关闭）。
+        agt: executor_agt_source(
+            run.options.executor_agt_dir.as_deref().map(std::path::Path::new),
+        )?,
     };
     match execute_run(&opts, &ctx.executor_model, &run.request) {
         Ok(outcome) => {

@@ -323,7 +323,8 @@ pub fn canonicalize_workspace(dir: &Path) -> Result<std::path::PathBuf> {
 /// 防呆（fail-closed，不静默放行）：
 /// - default 无 `image`（换不了执行镜像）/带 `build` 段（2026-09-25 Main
 ///   裁决：build+image 并存导致 tag 身份漂移）/带 `container_name`
-///   （Inspect 拒绝）/无 `command`（容器必须常驻）→ 报错。
+///   （Inspect 拒绝）/无 `command`（容器必须常驻）→ 报错。`command` 支持
+///   非空字符串或非空字符串列表；列表的空参数和 argv 边界原样保留。
 /// - default 自带 `volumes`（与 alfred 挂载面冲突面未定义）→ 报错
 ///   （本仓任务 compose 的 default 一律无 volumes——workspace 由
 ///   Sample.files 注入；sidecar 的 volumes 不在此列，逐字保留）。
@@ -369,14 +370,21 @@ pub fn generate_task_env_compose(
     if default.get(&skey("container_name")).is_some() {
         bail!("task env compose services.default 带 container_name（Inspect 拒绝：多 epoch 容器名冲突）");
     }
-    if default
-        .get(&skey("command"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_none()
-    {
-        bail!("task env compose services.default 缺 command（执行容器必须常驻，如 tail -f /dev/null）");
+    // Compose `command` 的合法形态 = 非空字符串 或 非空字符串序列（argv 形
+    // 态；元素逐字保留、不做 shell join，字符串形态也保持原语义不被拆分）。
+    // 缺失/空串/纯空白/空序列/全空串元素/非字符串元素一律按缺 command 拒
+    // 绝（fail-closed 防呆语义不变：执行容器必须常驻）。
+    let command_present = match default.get(&skey("command")) {
+        Some(serde_yaml::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_yaml::Value::Sequence(seq)) => !seq.is_empty()
+            && seq.iter().all(|item| item.as_str().is_some())
+            && seq
+                .iter()
+                .any(|item| item.as_str().is_some_and(|s| !s.trim().is_empty())),
+        _ => false,
+    };
+    if !command_present {
+        bail!("task env compose services.default 缺 command（执行容器必须常驻，如 tail -f /dev/null；合法形态=非空字符串或非空字符串序列）");
     }
     if default.get(&skey("volumes")).is_some() {
         bail!(

@@ -54,6 +54,28 @@ pub fn resolve_agt_source() -> AgtSource {
     }
 }
 
+/// 执行侧 AGT 源（`--executor-agt-dir` 专用作用域，入 `GovernanceOptions`
+/// 落 state.json）：`Some(dir)` → executor 持该 run-scoped Dir 策略，**不**改
+/// planner/reviewer 的 `resolve_agt_source()`（A1/A2 消融下 reviewer 保持内
+/// 置源，原守卫强制不变；消融链因此可同时满足 executor 边界与 reviewer
+/// 消融强制）。`None` → 回退共享 env 解析（无旗标旧调用行为不变）。
+///
+/// `ALFRED_AGT_DISABLE=1` 全局关闭优先级不变：显式目录与之冲突 = 显式
+/// 拒绝（fail-closed），旗标不得绕过全局关闭。
+pub fn executor_agt_source(explicit_dir: Option<&Path>) -> anyhow::Result<AgtSource> {
+    if let Some(dir) = explicit_dir {
+        if std::env::var("ALFRED_AGT_DISABLE").as_deref() == Ok("1") {
+            anyhow::bail!(
+                "executor AGT dir {} 与 ALFRED_AGT_DISABLE=1 冲突（全局关闭优先；\
+                 拒绝经 --executor-agt-dir 绕过）",
+                dir.display()
+            );
+        }
+        return Ok(AgtSource::Dir(dir.to_path_buf()));
+    }
+    Ok(resolve_agt_source())
+}
+
 /// AGT 拦写层准备（三容器同一范式）：把策略 + 扩展落到 `<work>/agt/`，建审计
 /// 子目录 `audit/`（rw 挂载源，审计 JSONL 落宿主）。
 ///

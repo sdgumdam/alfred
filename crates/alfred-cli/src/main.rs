@@ -99,7 +99,7 @@ fn print_help() {
         "  chat    owner 持续会话入口（REPL：需求收集/对话/拍板/断点恢复；[--run-dir <dir>]）"
     );
     println!("  feed    喂属主决策（revise|retry|abandon）并从挂起态续跑");
-    println!("  run     初始化治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 路由；[--ablation a1|a2|a3] 方案A消融档位，缺省完整链；[--env-compose <绝对路径>] [--env-metadata <JSON文件>] 任务真实环境接线（原任务 compose + SAMPLE_METADATA 插值键，缺省内置 network none 单容器））");
+    println!("  run     初始化治理环（request → 规划 → 计划审查 → 执行 → 执行审查 → 路由；[--ablation a1|a2|a3] 方案A消融档位，缺省完整链；[--env-compose <绝对路径>] [--env-metadata <JSON文件>] 任务真实环境接线（原任务 compose + SAMPLE_METADATA 插值键，缺省内置 network none 单容器）；[--executor-agt-dir <绝对路径>] 执行侧 AGT 策略显式目录（作用域仅 executor；planner/reviewer 仍走 env 解析，A1/A2 消融下 reviewer 保持内置源；ALFRED_AGT_DISABLE=1 与之冲突显式拒绝））");
     println!();
     println!("通用 flag: --append-system-prompt <value>（前置注入，追加到 planner pi 系统提示）; -h/--help; -V/--version");
 }
@@ -116,6 +116,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let mut ablation: Option<GovernanceAblation> = None;
     let mut env_compose: Option<String> = None;
     let mut env_metadata: Option<std::collections::BTreeMap<String, String>> = None;
+    let mut executor_agt_dir: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -128,7 +129,8 @@ fn cmd_run(args: &[String]) -> Result<()> {
             | "--image"
             | "--ablation"
             | "--env-compose"
-            | "--env-metadata" => {
+            | "--env-metadata"
+            | "--executor-agt-dir" => {
                 i += 1;
                 let val = args
                     .get(i)
@@ -163,6 +165,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
                             })?,
                         );
                     }
+                    "--executor-agt-dir" => executor_agt_dir = Some(val),
                     _ => unreachable!(),
                 }
             }
@@ -206,6 +209,24 @@ fn cmd_run(args: &[String]) -> Result<()> {
         }
         (None, _) => std::collections::BTreeMap::new(),
     };
+    // 执行侧 AGT 策略显式目录（--executor-agt-dir）：绝对路径 + 存在校验
+    // （同 --env-compose 纪律）。作用域仅 executor（planner/reviewer 仍走
+    // 共享 env 解析）；值进 GovernanceOptions → state.json（续跑/孤儿恢复
+    // 绑定同一执行侧策略）。
+    let executor_agt_dir = executor_agt_dir
+        .map(|p| {
+            let path = PathBuf::from(&p);
+            if !path.is_absolute() {
+                bail!(
+                    "alfred run: --executor-agt-dir 必须为绝对路径（相对路径挂载会静默降级）: {p}"
+                );
+            }
+            if !path.is_dir() {
+                bail!("alfred run: --executor-agt-dir 目录不存在: {p}");
+            }
+            Ok(p)
+        })
+        .transpose()?;
     let options = GovernanceOptions {
         image,
         exec_time_limit_secs: time_limit,
@@ -217,6 +238,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
         ablation,
         env_compose,
         env_metadata,
+        executor_agt_dir,
     };
     let run_dir = run_dir.unwrap_or_else(default_governance_dir);
     let mut run = init_governance_run(&run_dir, request, options)?;

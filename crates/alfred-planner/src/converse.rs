@@ -562,25 +562,27 @@ fn read_offline_plan(path: &str, request: &OwnerRequest) -> Result<DagSpec> {
     Ok(plan)
 }
 
-/// 剥 markdown 代码围栏 / 只取首个平衡 JSON 数组。
+/// 只剥“顶层”代码围栏；不裁剪、不猜 JSON 边界。
+///
+/// 合法输入恰两种（与 converse 提示词契约一致——建图指令只允许纯 JSON
+/// 数组或一对围栏包裹的纯 JSON 数组）：
+/// - 整个回复（去首尾空白后）以 ``` 开头、以 ``` 收尾：剥掉这一对外层
+///   围栏（首行含语言标签），内部原样返回；
+/// - 未围栏：整段就是候选 JSON。
+///
+/// payload（如 add_node.contract.prompt）内嵌的 Markdown 围栏、括号、
+/// 嵌套数组只是字符串内容，永远不参与定位或裁剪——此前“首个 ``` 后的
+/// `[` 到末个 `]`”切片会把含围栏任务文本的合法指令斩头成残片（真实事故：
+/// case02-a3/v14-a3/e01-a1 的合法 instructions.json 均被误裁成
+/// "trailing characters"）。前导/尾随垃圾交 serde 如实拒绝（fail-loud，
+/// 无宽松修补）。
 pub fn strip_fences(text: &str) -> String {
     let trimmed = text.trim();
-    // 先找 ```json ... ``` 围栏块
-    if let Some(start) = trimmed.find("```") {
-        if let Some(rel) = trimmed[start..].find('[') {
-            let abs = start + rel;
-            if let Some(end) = trimmed.rfind(']') {
-                if end > abs {
-                    return trimmed[abs..=end].to_string();
-                }
-            }
-        }
-    }
-    // 直接取首个 [ ... ] 平衡块
-    if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
-            if end > start {
-                return trimmed[start..=end].to_string();
+    if trimmed.starts_with("```") {
+        if let Some(nl) = trimmed.find('\n') {
+            let body = &trimmed[nl + 1..];
+            if let Some(inner) = body.strip_suffix("```") {
+                return inner.trim().to_string();
             }
         }
     }
@@ -1170,4 +1172,52 @@ mod tests {
             "缺正解锚点：后继声明覆盖前置产物所在子目录"
         );
     }
+    #[test]
+    fn fenced_outer_json_is_unwrapped() {
+        // 聊天分支合规形态：唯一一对顶层围栏包裹纯 JSON 数组。
+        let fenced = "```json\n[{\"op\":\"begin\",\"request_id\":\"req-1\"}]\n```";
+        assert_eq!(strip_fences(fenced), "[{\"op\":\"begin\",\"request_id\":\"req-1\"}]");
+        // 首尾空白容忍，围栏前后不允许非空白文字（那是垃圾，交 serde 拒绝）。
+        assert_eq!(strip_fences("\n```json\n[1, 2]\n```\n"), "[1, 2]");
+        // 未闭合围栏：原样返回，让解析器如实报错。
+        assert_eq!(strip_fences("```json\n[1, 2]"), "```json\n[1, 2]");
+    }
+
+    #[test]
+    fn embedded_fence_payload_is_never_sliced() {
+        // 真实事故形态（case02-a3 / v14-a3 / e01-a1）：合法指令数组中
+        // add_node.contract.prompt 内嵌 markdown 围栏 + 布尔矩阵等括号
+        // 内容。旧实现从“内嵌围栏后的首个 `[`”切到“末个 `]`”，把文件
+        // 斩头成 "[mounts…}, set_routes, commit]" 残片 → trailing
+        // characters。新实现不动 payload。
+        let prompt = "任务：\n\n### 步骤\n\n```bash\npython3 -m pytest tests/\n```\n\n矩阵：[[True, False], [False, True]]"
+            .replace('\n', "\\n");
+        let text = format!(
+            r#"[{{"op":"begin","request_id":"req-1"}},
+{{"op":"add_node","id":"task-1","summary":"s",
+"contract":{{"prompt":"{}","acceptance_criteria":"a"}},
+"sandbox":{{"volumes":[{{"host_path":"/tmp/x","container_path":"/references","mode":"ro"}}],"workspace_subdirs":["src"]}}}},
+{{"op":"set_routes","start":["task-1"]}},
+{{"op":"commit"}}]"#,
+            prompt
+        );
+        // 逐字节保真：strip_fences 不改一个字符。
+        assert_eq!(strip_fences(&text), text);
+        let dag = instructions_to_dagspec(&text, &owner_request()).unwrap();
+        assert_eq!(dag.nodes.len(), 1);
+        assert!(dag.nodes[0].contract.prompt.contains("```bash"));
+        assert!(dag.nodes[0].contract.prompt.contains("[[True, False], [False, True]]"));
+    }
+
+    #[test]
+    fn trailing_garbage_is_rejected_not_rescued() {
+        // 前导/尾随垃圾必须 fail-loud：不允许旧式“首个 `[` 到末个 `]`”
+        // 宽松抢救把非合规回复静默洗成合法指令。
+        let garbage = "计划如下：\n[{\"op\":\"begin\",\"request_id\":\"req-1\"},\"{\"op\":\"commit\"}] 以上。";
+        assert!(instructions_to_dagspec(garbage, &owner_request()).is_err());
+        let trailing = "[{\"op\":\"begin\",\"request_id\":\"req-1\"}] 尾随说明文字";
+        assert!(strip_fences(trailing) == trailing);
+        assert!(instructions_to_dagspec(trailing, &owner_request()).is_err());
+    }
+
 }

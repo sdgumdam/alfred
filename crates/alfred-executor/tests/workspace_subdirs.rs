@@ -153,3 +153,72 @@ networks:
     assert!(validate_task_network(true, Some(&original)).is_err());
     validate_task_network(false, Some(&original)).unwrap();
 }
+
+#[test]
+fn task_env_command_accepts_compose_string_or_argv_list() {
+    // compose_gen 372-379 防呆只认 as_str：合法 Compose command 序列（argv
+    // 形态，Bandit/ALFWorld 等任务 compose）被误报「缺 command」。契约：
+    // 字符串与字符串序列两形态都放行；command 值逐字透传（不做 shell
+    // join、字符串形态不被拆分）；缺失/空串/纯空白/空序列/全空串元素/
+    // 非字符串元素仍按缺 command fail-closed。
+    use alfred_executor::compose_gen::generate_task_env_compose;
+
+    let ws = make_ws("command-forms");
+    let original = ws.parent().unwrap().join("task.yaml");
+
+    // argv 形态（非空字符串序列）→ 放行，渲染输出 command 逐字保留。
+    fs::write(
+        &original,
+        "services:\n  default:\n    image: dependency:fixed\n    command: [\"tail\", \"-f\", \"/dev/null\"]\n",
+    )
+    .unwrap();
+    let rendered =
+        generate_task_env_compose(&original, &ws, "executor:fixed", &mounts(&["src"])).unwrap();
+    let after: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+    assert_eq!(
+        after["services"]["default"]["command"],
+        serde_yaml::Value::Sequence(vec!["tail".into(), "-f".into(), "/dev/null".into()])
+    );
+
+    // 序列含空串元素（argv 合法边界）：有实际命令内容 → 放行且逐字透传。
+    fs::write(
+        &original,
+        "services:\n  default:\n    image: dependency:fixed\n    command: [\"sh\", \"-c\", \"\"]\n",
+    )
+    .unwrap();
+    let rendered =
+        generate_task_env_compose(&original, &ws, "executor:fixed", &mounts(&["src"])).unwrap();
+    let after: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+    assert_eq!(
+        after["services"]["default"]["command"],
+        serde_yaml::Value::Sequence(vec!["sh".into(), "-c".into(), "".into()])
+    );
+
+    // 缺 command 字段 → 拒绝（只断言行为，不匹配实现措辞）。
+    fs::write(&original, "services:\n  default:\n    image: dependency:fixed\n").unwrap();
+    assert!(
+        generate_task_env_compose(&original, &ws, "executor:fixed", &mounts(&["src"])).is_err()
+    );
+
+    // null / 数字 / 映射 / 空序列 / 全空串元素 / 混合类型 / 纯空白字符串 → 拒绝。
+    for bad in [
+        "command:",
+        "command: 42",
+        "command: {sh: -c}",
+        "command: []",
+        "command: [\"\", \"\"]",
+        "command: [1, \"tail\"]",
+        "command: \"   \"",
+    ] {
+        fs::write(
+            &original,
+            format!("services:\n  default:\n    image: dependency:fixed\n    {bad}\n"),
+        )
+        .unwrap();
+        assert!(
+            generate_task_env_compose(&original, &ws, "executor:fixed", &mounts(&["src"]))
+                .is_err(),
+            "command {bad:?} should be rejected"
+        );
+    }
+}
