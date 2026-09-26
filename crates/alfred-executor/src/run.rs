@@ -99,7 +99,8 @@ pub struct RunOutcome {
     pub run_id: String,
     pub task_id: String,
     pub executor_model: String,
-    /// 容器驱动状态（"success" / "error" / "timed_out"）。字段名沿用旧名
+    /// 容器驱动状态（"success" / "error" / "timed_out" / "cancelled"——SIGTERM
+    /// 等可捕获终止：shield 清理后如实落盘）。字段名沿用旧名
     /// `eval_status`（state.json 兼容，r6d.sh 断言 eval_status == "success"；
     /// 现承载 driver 状态，非 eval 状态）。
     pub eval_status: String,
