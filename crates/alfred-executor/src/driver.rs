@@ -20,6 +20,12 @@
 //! - `{"event":"done","status":"timed_out","error":"..."}`：驱动脚本自限时
 //!   （`anyio.fail_after`）触达——先清理容器再写 done。
 //! - 进程消失无 done = crash / 被 kill。
+//! - done 记录另携 `session`（原生 session 关联；未取到身份 = null）：
+//!   `{id, file, host_file, file_exists}`——`id`/`file` 来自 pi RPC
+//!   `get_state` 实测响应（身份在 RPC 启动即分配，先于 prompt），`host_file`
+//!   经 compose 挂载固定前缀精确映射，`file_exists` 只在宿主文件可定位时
+//!   isfile 实测断言（W08 核收：pi 需首条 assistant 消息才落盘，身份已
+//!   分配 ≠ 文件存在）。
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -27,6 +33,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::ExecutorModel;
@@ -93,11 +100,31 @@ pub struct DriverLaunch {
     child: Child,
 }
 
+/// done 记录携带的原生 session 关联（driver 从 pi RPC `get_state` 响应取得；
+/// 未取到身份 = None）。
+///
+/// W08 核收事实：pi 启动即分配 sessionFile/sessionId，但 `_persist()` 需首条
+/// assistant 消息才写盘——身份与落盘分开记录；`file_exists` 仅在宿主路径可
+/// 定位时由 isfile 实测断言，不以身份冒称文件存在。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DriverSession {
+    /// pi 分配的原生 session id（get_state.data.sessionId，原样）。
+    pub id: String,
+    /// 容器内 session 文件路径（get_state.data.sessionFile，原样）。
+    pub file: String,
+    /// 宿主侧保留路径（compose 挂载固定前缀的精确映射；前缀不符 = None）。
+    pub host_file: Option<String>,
+    /// done 落盘时点宿主文件实际存在（isfile 实测）；无法定位 = None。
+    pub file_exists: Option<bool>,
+}
+
 /// done 记录（驱动脚本产出；status: "success" | "error" | "timed_out"）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DriverDone {
     pub status: String,
     pub error: Option<String>,
+    /// 原生 session 关联（pi RPC get_state 实测响应；无 = None）。
+    pub session: Option<DriverSession>,
 }
 
 /// 轮询结果。
@@ -223,6 +250,19 @@ pub fn read_done_marker(path: &Path) -> Result<Option<DriverDone>> {
                 .unwrap_or_default()
                 .to_string(),
             error: v.get("error").and_then(|e| e.as_str()).map(String::from),
+            // session 关联：只认实测字段（id+file 齐全才成身份；残缺/null →
+            // None——不以部分字段造身份，与驱动的“如实缺席”语义一致）。
+            session: v.get("session").and_then(|s| {
+                Some(DriverSession {
+                    id: s.get("id")?.as_str()?.to_string(),
+                    file: s.get("file")?.as_str()?.to_string(),
+                    host_file: s
+                        .get("host_file")
+                        .and_then(|h| h.as_str())
+                        .map(String::from),
+                    file_exists: s.get("file_exists").and_then(|e| e.as_bool()),
+                })
+            }),
         }));
     }
     Ok(None)
@@ -231,7 +271,7 @@ pub fn read_done_marker(path: &Path) -> Result<Option<DriverDone>> {
 /// 驱动子进程 env 白名单（`env_clear` 后注入）。
 ///
 /// - 固定项：`PYTHONDONTWRITEBYTECODE=1`（驱动 import 时不写 __pycache__）。
-/// - 基础变量：PATH/HOME/LANG/TZ/TERM（父进程有则保留）。
+/// - 基础变量：PATH/HOME/LANG/TZ/TERM 和无凭据的 NO_PROXY/no_proxy 豁免列表。
 /// - 透传：`ALFRED_*`（ALFRED_STATE_DIR 等按需保留）。
 ///
 /// 白名单从根上排除继承的凭据形态变量（KEY/TOKEN/SECRET/PASSWORD 及常见
@@ -239,7 +279,7 @@ pub fn read_done_marker(path: &Path) -> Result<Option<DriverDone>> {
 /// `{PROVIDER}_BASE_URL` / `ALFRED_EXEC_API_KEY` 注入（见 `container_child_env`）。
 fn whitelisted_env() -> Vec<(String, String)> {
     let mut envs = vec![("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())];
-    for key in ["PATH", "HOME", "LANG", "TZ", "TERM"] {
+    for key in ["PATH", "HOME", "LANG", "TZ", "TERM", "NO_PROXY", "no_proxy"] {
         if let Ok(v) = std::env::var(key) {
             envs.push((key.to_string(), v));
         }

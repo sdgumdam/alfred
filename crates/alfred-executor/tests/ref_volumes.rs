@@ -147,6 +147,7 @@ fn compose_appends_ref_volume_ro_line() {
         ref_volumes: vec![vol(&refs, "/references", "ro")],
         agt_dir: None,
         agt_audit_dir: None,
+        sessions_dir: None,
     };
     let compose = generate_executor_compose(&ws, "alfred-executor:latest", &mounts)
         .expect("generate compose with ref volume");
@@ -172,6 +173,7 @@ fn compose_rejects_illegal_ref_volume_not_silent() {
         ref_volumes: vec![vol(&refs, "/references", "rw")],
         agt_dir: None,
         agt_audit_dir: None,
+        sessions_dir: None,
     };
     assert!(
         generate_executor_compose(&ws, "alfred-executor:latest", &mounts).is_err(),
@@ -183,6 +185,7 @@ fn compose_rejects_illegal_ref_volume_not_silent() {
         ref_volumes: vec![vol(&ws.join("missing-refs"), "/references", "ro")],
         agt_dir: None,
         agt_audit_dir: None,
+        sessions_dir: None,
     };
     assert!(
         generate_executor_compose(&ws, "alfred-executor:latest", &mounts).is_err(),
@@ -199,6 +202,7 @@ fn compose_without_ref_volumes_unchanged() {
         ref_volumes: vec![],
         agt_dir: None,
         agt_audit_dir: None,
+        sessions_dir: None,
     };
     let compose = generate_executor_compose(&ws, "alfred-executor:latest", &mounts)
         .expect("generate compose without ref volumes");
@@ -221,6 +225,7 @@ fn driver_py_injects_ref_volume_env() {
         pi_model: "inspect-bridge/inspect".into(),
         bridge_model: "inspect/mockllm/model".into(),
         max_tokens: 8192,
+        context_window: None,
         workspace_dir: "/workspace".into(),
         sandbox_user: "root".into(),
         agt_ext: "/tmp/.agt/agt-policy.ts".into(),
@@ -232,6 +237,9 @@ fn driver_py_injects_ref_volume_env() {
         time_limit_secs: 600,
         done_marker: "/tmp/driver.done.json".into(),
         task_name: "alfred-executor".into(),
+        sessions_dir_host: "/tmp/run-1/sessions".into(),
+        evidence_binding: String::new(),
+        sandbox_metadata: std::collections::BTreeMap::new(),
     })
     .expect("generate driver.py with ref volumes");
 

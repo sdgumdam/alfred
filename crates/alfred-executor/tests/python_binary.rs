@@ -147,6 +147,43 @@ fn falls_back_to_path_python3_when_no_venv() {
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
+#[test]
+fn driver_preserves_proxy_exclusions_without_inheriting_secrets() {
+    let _g = lock();
+    let _python = EnvGuard::set("ALFRED_PYTHON", "python3");
+    let _upper = EnvGuard::set("NO_PROXY", "internal.example,localhost");
+    let _lower = EnvGuard::set("no_proxy", "internal.example,localhost");
+    let _secret = EnvGuard::set("UNRELATED_API_KEY", "must-not-inherit");
+    let dir = temp_dir("proxy-exclusions");
+    std::fs::create_dir_all(&dir).expect("create driver dir");
+    let script = dir.join("probe.py");
+    std::fs::write(
+        &script,
+        "import os\nassert os.environ['NO_PROXY'] == 'internal.example,localhost'\nassert os.environ['no_proxy'] == 'internal.example,localhost'\nassert 'UNRELATED_API_KEY' not in os.environ\n",
+    )
+    .expect("write probe");
+    let model = alfred_executor::config::ExecutorModel {
+        provider: "mockllm".into(),
+        model: "mockllm/model".into(),
+        base_url: String::new(),
+        api_key: String::new(),
+        max_tokens: 16,
+        context_window: None,
+        raw_id: true,
+    };
+    let mut launch = alfred_executor::driver::spawn_container_driver(&script, &model, &dir)
+        .expect("spawn real driver process");
+    let outcome = alfred_executor::driver::poll_container_driver(&mut launch, 10)
+        .expect("poll driver process");
+    let stderr = std::fs::read_to_string(dir.join("driver.stderr.log")).expect("read stderr");
+    std::fs::remove_dir_all(&dir).expect("remove probe files");
+    assert_eq!(
+        outcome,
+        alfred_executor::driver::DriverOutcome::Crashed(Some(0)),
+        "probe exits without a done marker; routing/isolation failed: {stderr}"
+    );
+}
+
 /// 测试 exe 定位的"仓根"（与 python_binary() 的 venv 解析同一推导：current_exe
 /// 上两级）。测试 bin 在 `<workspace>/target/<profile>/deps/` → 上两级 =
 /// `<workspace>/target`——venv 落点即 `<workspace>/target/.plans/...`。生产行为

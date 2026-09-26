@@ -4,12 +4,15 @@
 //! `.plans/施工方案-宿主pi化.md`——reviewer 从"容器 pi（ws ro + /inputs + /outputs
 //! 挂载面）"演进为"宿主 pi agent"：
 //!
-//!   spawn `pi -p --no-session -nc --system-prompt <审查 prompt> -e <agt 扩展>
+//!   spawn `pi -p --session-dir <work>/sessions -nc --system-prompt <审查 prompt> -e <agt 扩展>
 //!   --provider <P> --model <M>`，cwd = 治理对象项目根（宿主材料 + run 产物都经
 //!   绝对路径可见，reviewer 全可见），`PI_CODING_AGENT_DIR` 指向 run 级 pi 配置
 //!   （`<run>/reviewer/pi-config/models.json`——config.yml 仍是唯一真源，orchestrator
 //!   按 roles.reviewer 解析后投影生成），env 注入 AGT 三件套
 //!   （AGT_POLICY_PATH / AGT_AUDIT_PATH / AGT_WORKSPACE_DIR）。
+//!   A1 消融档位：reviewer 改经 harness host-pi Seatbelt 包装器启动——内核
+//!   拒绝被禁过程证据（audit.jsonl / exec-N / llm-calls）的读取（见
+//!   `prepare_a1_kernel_boundary`），AGT 只做工具层对齐。
 //!
 //! prompt = 审查材料全可见：request/dagspec/session/contract/sandbox 输入文件落
 //! 盘 `<run>/plan-review|exec-review/inputs/`，prompt 注入这些绝对路径 + run 目录
@@ -26,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use alfred_core::conversation::ConversationLog;
 use alfred_core::dagspec::DagSpec;
+use alfred_core::governance::GovernanceAblation;
 use alfred_core::request::OwnerRequest;
 use alfred_core::session::SessionDoc;
 use alfred_core::util::now_rfc3339;
@@ -62,6 +66,9 @@ pub struct ReviewerHostOptions {
     /// AGT 拦写层源（默认内置策略；`ALFRED_AGT_DIR` 显式目录沿用覆盖；
     /// `ALFRED_AGT_DISABLE=1` 关）。Off = 不注入 AGT 三件套、不加载扩展。
     pub agt: AgtSource,
+    /// 方案A消融档位（A1/A2 在本驱动内强制执行边界；A3 由编排层断处置，
+    /// 审查本身不变）。`None` = 完整治理链。
+    pub ablation: Option<GovernanceAblation>,
 }
 
 impl Default for ReviewerHostOptions {
@@ -71,6 +78,7 @@ impl Default for ReviewerHostOptions {
             project_root: PathBuf::new(),
             time_limit_secs: 300,
             agt: AgtSource::Builtin,
+            ablation: None,
         }
     }
 }
@@ -79,12 +87,12 @@ impl ReviewerHostOptions {
     /// 从治理环运行选项派生宿主选项（`run_dir` 由调用方填——计划/执行审查各自的
     /// 工作目录；`project_root` = 治理 run 所在项目根，即 alfred 发起 cwd）。
     pub fn from_governance(run_dir: PathBuf, project_root: PathBuf, opts: &alfred_core::governance::GovernanceOptions) -> Self {
-        let _ = opts; // 宿主形态无镜像/端口概念；时间上限走 review_time_limit_secs 显式传参
         Self {
             run_dir,
             project_root,
             time_limit_secs: opts.review_time_limit_secs,
             agt: alfred_executor::agt::resolve_agt_source(),
+            ablation: opts.ablation,
         }
     }
 }
@@ -340,6 +348,27 @@ fn build_exec_review_prompt(
     let _ = conversation; // 对话记录经 run 根目录全可见路径自由读，prompt 不内嵌内容
     let run_root = review_run_root(opts)?;
     let inputs = opts.run_dir.join(INPUTS_DIR);
+    // 方案A消融的提示裁剪（与 apply_ablation_review_policy 的 AGT 强制同面；
+    // 提示与权限双改是 W07 A1 核收的明确要求——只删提示不改权限 = 未生效）：
+    // - A1：不注入执行过程证据行（run 根 audit.jsonl；读/命令通道由策略封闭）；
+    // - A2：不指示命令/git 主动验证（bash 全拒；指示只会浪费审查轮次）。
+    let audit_line = match opts.ablation {
+        Some(GovernanceAblation::NoProcessEvidence) => String::new(),
+        _ => format!(
+            "- {run_root}/audit.jsonl —— 编排器执行轨迹（node_started / node_completed 事件：节点的实际执行顺序与完成情况）\n",
+            run_root = run_root.display()
+        ),
+    };
+    let inspect_block = match opts.ablation {
+        Some(GovernanceAblation::NoActiveVerification) => format!(
+            "- {ws} —— 执行者产物（ws 全量，审查者无写入权限）：用 read/find/ls 检查产物文件；\n  本审查无命令执行通道（bash 一律不可用，git 基线对照不可执行）——按文件内容与结构直接判断产物 vs 验收标准\n",
+            ws = ws_dir.display()
+        ),
+        _ => format!(
+            "- {ws} —— 执行者产物（ws 全量，审查者无写入权限）：用 read/bash/glob 检查产物文件；\n  对照 git 基线（run 开始时 `git init` + 空提交）用 `git status` / `git diff` /\n  `git log` 看执行者新建/改了什么（含未提交文件），判断产物 vs 验收标准\n",
+            ws = ws_dir.display()
+        ),
+    };
     if dagspec.nodes.len() > 1 {
         return Ok(format!(
             r#"你的任务：把执行审查结论产出为文件，而不是聊天回复。
@@ -352,11 +381,7 @@ fn build_exec_review_prompt(
 - {run_root}/{CONVERSATION_FILE} —— 属主↔规划器对话记录（JSON 对象，turns[]）
 - {run_root}/{PLAN_VERDICTS_FILE} —— 计划审查结论历史（JSON 数组，每项 {{"pass","reason"}}；回看该计划此前是否被打回及理由）
 - {run_root}/{EXEC_VERDICTS_FILE} —— 先前轮次执行审查结论历史（JSON 数组，每项 {{"grade","failure_class","rationale"}}；重跑轮回看先前判分）
-- {run_root}/audit.jsonl —— 编排器执行轨迹（node_started / node_completed 事件：节点的实际执行顺序与完成情况）
-- {ws} —— 执行者产物（ws 全量，审查者无写入权限）：用 read/bash/glob 检查产物文件；
-  对照 git 基线（run 开始时 `git init` + 空提交）用 `git status` / `git diff` /
-  `git log` 看执行者新建/改了什么（含未提交文件），判断产物 vs 验收标准
-按 SYSTEM_PROMPT 的规则判分，把结论写入：
+{audit_line}{inspect_block}按 SYSTEM_PROMPT 的规则判分，把结论写入：
 {outputs}/{VERDICT_OUTPUT_FILE}
 （目录已存在，直接用 write 工具写；不要建其他文件。）
 
@@ -366,8 +391,9 @@ fn build_exec_review_prompt(
             node_count = dagspec.nodes.len(),
             inputs = inputs.display(),
             run_root = run_root.display(),
-            ws = ws_dir.display(),
             outputs = opts.run_dir.join(OUTPUTS_DIR).display(),
+            audit_line = audit_line,
+            inspect_block = inspect_block,
             PLAN_VERDICTS_FILE = PLAN_VERDICTS_FILE,
             EXEC_VERDICTS_FILE = EXEC_VERDICTS_FILE,
             CONVERSATION_FILE = CONVERSATION_FILE,
@@ -383,19 +409,16 @@ fn build_exec_review_prompt(
 - {run_root}/{CONVERSATION_FILE} —— 属主↔规划器对话记录（JSON 对象，turns[]）
 - {run_root}/{PLAN_VERDICTS_FILE} —— 计划审查结论历史（JSON 数组，每项 {{"pass","reason"}}；回看该计划此前是否被打回及理由）
 - {run_root}/{EXEC_VERDICTS_FILE} —— 先前轮次执行审查结论历史（JSON 数组，每项 {{"grade","failure_class","rationale"}}；重跑轮回看先前判分）
-- {ws} —— 执行者产物（ws 全量，审查者无写入权限）：用 read/bash/glob 检查产物文件；
-  对照 git 基线（run 开始时 `git init` + 空提交）用 `git status` / `git diff` /
-  `git log` 看执行者新建/改了什么（含未提交文件），判断产物 vs 验收标准
-- {run_root}/{CONVERSATION_FILE} —— 属主↔规划器对话记录（上下文，判忠实度用）
+{inspect_block}- {run_root}/{CONVERSATION_FILE} —— 属主↔规划器对话记录（上下文，判忠实度用）
 按 SYSTEM_PROMPT 的规则判分，把结论写入：
 {outputs}/{VERDICT_OUTPUT_FILE}
 （目录已存在，直接用 write 工具写；不要建其他文件。）
 
 先做路径翻译：按 sandbox.json 的 workspace_subdirs 判定执行者的工作区根——契约/验收标准里"workspace 根/根目录"的产物 → 查 ws/<workspace_subdirs[0]>/ 下（如 workspace_subdirs=["output"] → 执行者的根 = 你看到的 ws/output）；workspace_subdirs 为空时按字面路径判（无翻译提示）。产物位置以此翻译后的落点为准，不要把"执行者在 ws/<首子目录> 下写出的文件"误判为"不在 workspace 根"。
 写完即结束。"#,
+        inspect_block = inspect_block,
         inputs = inputs.display(),
         run_root = run_root.display(),
-        ws = ws_dir.display(),
         outputs = opts.run_dir.join(OUTPUTS_DIR).display(),
         PLAN_VERDICTS_FILE = PLAN_VERDICTS_FILE,
         EXEC_VERDICTS_FILE = EXEC_VERDICTS_FILE,
@@ -420,7 +443,7 @@ fn review_run_root(opts: &ReviewerHostOptions) -> Result<PathBuf> {
 ///   2. AGT 拦写层落 `<review_dir>/agt/`（策略 + 扩展 + 审计子目录）；
 ///   3. 生成 run 级 pi 配置 `<review_dir>/pi-config/`（models.json 投影自
 ///      config.yml roles.reviewer + auth.json 占位——PI_CODING_AGENT_DIR 指向）；
-///   4. spawn `pi -p --no-session -nc --system-prompt … -e <agt> --provider …
+///   4. spawn `pi -p --session-dir <work>/sessions -nc --system-prompt … -e <agt> --provider …
 ///      --model …`（cwd = 项目根），prompt 经 stdin 喂入（多行材料不受 argv
 ///      长度/转义限制）；
 ///   5. 等待退出 → 收割 `<review_dir>/outputs/verdict.json` → 落 driver.done.json
@@ -457,6 +480,31 @@ fn run_reviewer_on_host(
     if let Some(agt) = &agt_work {
         render_reviewer_policy(agt, &outputs_dir)?;
     }
+    // 方案A消融（A1/A2）：审查边界在 AGT 层强制——非内置策略源（显式目录
+    // 覆盖 / 关闭）会让消融失去强制层，fail-closed 拒绝跑未强制的消融审查
+    // （A3 不改审查工具面，无此约束）。
+    apply_ablation_review_policy(&agt_work, &opts.agt, opts)?;
+    // 消融档位进审查目录审计（原生记录：本轮审查以哪个档位运行）。
+    if let Some(abl) = opts.ablation {
+        append_review_audit(
+            work,
+            "review_ablation",
+            &serde_json::json!({ "mode": mode, "arm": format!("{:?}", abl) }),
+        )?;
+    }
+
+    // A1（去执行过程证据）：读面隔离由内核强制——经 harness host-pi 包装器把
+    // 被禁证据 deny 组合进同一 Seatbelt profile，落到真实 reviewer 进程树
+    // （见 `prepare_a1_kernel_boundary`）。AGT 规则只做工具层对齐；旧 bash/
+    // 扫掠字符串规则已随内核边界移除——`git diff HEAD~1..HEAD` 等 revision
+    // 范围与批准参考树检索恢复可用。A2 边界仍在 AGT 命令拒绝层；A3 不改
+    // 审查面。
+    let a1_boundary = match opts.ablation {
+        Some(GovernanceAblation::NoProcessEvidence) => {
+            Some(prepare_a1_kernel_boundary(opts, work)?)
+        }
+        _ => None,
+    };
 
     // run 级 pi 配置（模型单一真源仍是 config.yml：这里只做 roles.reviewer 解析
     // 结果的投影——pi 只认 models.json，orchestrator 收编其生成）。
@@ -475,9 +523,28 @@ fn run_reviewer_on_host(
         None => (PathBuf::new(), PathBuf::new(), PathBuf::new()),
     };
 
-    let mut cmd = std::process::Command::new("pi");
+    // 原生 session 身份：每轮审查预指派唯一 id（short_id 纳秒戳唯一），经
+    // --session-id 传给 pi；台账按 id 精确定位（不扫目录猜最新）。
+    let session_id = alfred_core::util::short_id(mode);
+    let sessions_dir = work.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).context("create reviewer sessions directory")?;
+    let sessions_dir = sessions_dir.canonicalize().context("resolve reviewer sessions directory")?;
+    // A1：经解析出的 host-pi 包装器绝对路径启动（PATH 首位 pi——与普通档位
+    // `pi` 的解析同源），注入 HOST_PI_EXTRA_SB 让包装器把内核边界组合进
+    // profile 后再 exec 真 pi。
+    let mut cmd = match &a1_boundary {
+        Some(boundary) => {
+            let mut sandboxed = std::process::Command::new(&boundary.wrapper);
+            sandboxed.env(HOST_PI_EXTRA_SB_ENV, &boundary.extra_profile);
+            sandboxed
+        }
+        None => std::process::Command::new("pi"),
+    };
     cmd.arg("-p")
-        .arg("--no-session")
+        .arg("--session-dir")
+        .arg(&sessions_dir)
+        .arg("--session-id")
+        .arg(&session_id)
         .arg("-nc")
         .arg("--system-prompt")
         .arg(system_prompt)
@@ -511,19 +578,36 @@ fn run_reviewer_on_host(
     }
 
     let deadline = Instant::now() + Duration::from_secs(u64::from(opts.time_limit_secs));
-    let status = loop {
+    // 结局二态（与 planner 宿主驱动同构）：正常退出 / 超时（已 kill+回收）。
+    // 身份台账在两态都落——超时被杀的审查会话只要已写盘照样可定位。
+    let settled: Option<std::process::ExitStatus> = loop {
         if let Some(st) = child.try_wait()? {
-            break st;
+            break Some(st);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
-                "reviewer host pi timed out after {}s (mode={mode})",
-                opts.time_limit_secs
-            );
+            break None;
         }
         std::thread::sleep(Duration::from_millis(300));
+    };
+    // 身份台账：pi 进程已回收，先落身份（失败显式报错），再判退出结局——
+    // 超时/非零退出的原始错误语义（消息原文）保持不变。
+    let pi_exit = match &settled {
+        Some(status) => match status.code() {
+            Some(0) => "success".to_string(),
+            Some(c) => format!("exit:{c}"),
+            None => "signal".to_string(),
+        },
+        None => "timeout".to_string(),
+    };
+    alfred_core::session_index::record_session_identity(work, mode, &session_id, &pi_exit)?;
+    let status = match settled {
+        Some(status) => status,
+        None => bail!(
+            "reviewer host pi timed out after {}s (mode={mode})",
+            opts.time_limit_secs
+        ),
     };
     if !status.success() {
         bail!(
@@ -582,20 +666,25 @@ fn write_pi_config(work: &Path, model: &ExecutorModel) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create pi config dir {}", dir.display()))?;
     if !model.raw_id {
+        let mut model_entry = serde_json::json!({
+            "id": model.model,
+            "reasoning": false,
+            "maxTokens": model.max_tokens,
+        });
+        if let Some(context_window) = model.context_window {
+            // 声明容量透传（2026-09-26 用户指令：输入输出用模型声明最大值）：
+            // 原硬编码 contextWindow=131072 移除——pi 看到的是 config.yml
+            // 声明的 contextWindow；未声明则省略该键（pi 回落自身缺省，
+            // 不在此猜容量）。
+            model_entry["contextWindow"] = serde_json::json!(context_window);
+        }
         let models = serde_json::json!({
             "providers": {
                 model.provider.clone(): {
                     "baseUrl": model.base_url,
                     "api": "openai-completions",
                     "apiKey": model.api_key,
-                    "models": [
-                        {
-                            "id": model.model,
-                            "reasoning": false,
-                            "contextWindow": 131072,
-                            "maxTokens": model.max_tokens,
-                        }
-                    ],
+                    "models": [model_entry],
                 }
             }
         });
@@ -656,6 +745,304 @@ fn render_reviewer_policy(agt_dir: &Path, outputs_dir: &Path) -> Result<()> {
     };
     std::fs::write(&path, rendered)
         .with_context(|| format!("render reviewer policy {}", path.display()))
+}
+
+/// 方案A消融（A1/A2）审查边界强制：把档位规则追加进已落盘的 reviewer 策略
+/// （priority 1，压过全部内置 0 级规则——A2 的全量 bash 拒绝必须先于内置
+/// "放行 bash 重定向到产出目录"命中）。
+///
+/// fail-closed：A1/A2 只在内置策略源上强制——`ALFRED_AGT_DISABLE=1`（无强制
+/// 层）或 `ALFRED_AGT_DIR`（显式覆盖，不含消融规则）时显式报错，绝不跑一个
+/// 边界实际未生效的消融审查。A3 不改审查工具/可见面，无此要求。
+///
+/// 规则语义（agt-policy.ts 求值核心）：`path_prefixes` 只匹配携带 path 参数的
+/// 工具调用（read/find/grep/ls/write/edit——pi 的路径参数键是 `path`）。
+/// A1 的读面隔离本体在内核（`prepare_a1_kernel_boundary` 经 host-pi 包装器
+/// 组合 Seatbelt deny——glob/相对路径/符号链接/python 全在 open(2) 被拒）；
+/// 本层只保留与内核边界同集的 read 类 deny 做工具层对齐。A2 的命令通道
+/// 拒绝仍以 `condition`（tool_name）表达。
+fn apply_ablation_review_policy(
+    agt_work: &Option<PathBuf>,
+    agt_source: &AgtSource,
+    opts: &ReviewerHostOptions,
+) -> Result<()> {
+    let ablation = match opts.ablation {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+    let rules = match ablation {
+        GovernanceAblation::NoProcessEvidence => ablation_a1_rules(opts)?,
+        GovernanceAblation::NoActiveVerification => vec![serde_json::json!({
+            "name": "ablation-a2-deny-command-execution",
+            "description": "A2 去主动验证：治理审查无命令执行通道（bash 等一律拒绝；只读检查与 verdict 写出保留，执行者自检不变）",
+            "priority": 1,
+            "condition": "tool_name in ['bash', 'shell', 'sh', 'terminal', 'execute']",
+            "action": "deny",
+        })],
+        // A3 只断编排层处置（governance.rs step 档位分支），审查工具面不变。
+        GovernanceAblation::AuditOnly => return Ok(()),
+    };
+    if !matches!(agt_source, AgtSource::Builtin) {
+        bail!(
+            "reviewer ablation {:?} requires the built-in AGT layer to enforce the \
+             boundary (ALFRED_AGT_DISABLE=1 / ALFRED_AGT_DIR would leave the ablation \
+             unenforced); refusing to run an unenforced ablation review",
+            ablation
+        );
+    }
+    let agt_dir = agt_work
+        .as_ref()
+        .context("reviewer ablation: built-in AGT staging produced no policy dir")?;
+    let policy_path = agt_dir.join("policy.json");
+    let mut policy: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&policy_path)
+            .with_context(|| format!("read staged reviewer policy {}", policy_path.display()))?,
+    )
+    .with_context(|| format!("parse staged reviewer policy {}", policy_path.display()))?;
+    let policy_rules = policy
+        .get_mut("rules")
+        .and_then(|r| r.as_array_mut())
+        .context("staged reviewer policy carries no rules array")?;
+    for rule in rules {
+        policy_rules.push(rule);
+    }
+    let text = serde_json::to_string_pretty(&policy)
+        .context("serialize ablation-augmented reviewer policy")?;
+    std::fs::write(&policy_path, format!("{text}\n"))
+        .with_context(|| format!("write ablation-augmented reviewer policy {}", policy_path.display()))
+}
+
+/// A1 规则集：执行过程证据的 AGT 工具层对齐（真实读面隔离在内核——
+/// [`prepare_a1_kernel_boundary`] 经 host-pi 包装器落到 reviewer 进程树）。
+///
+/// 被禁对象（run 根下的执行过程证据，I04 原件不动，只是审查不可读）：
+/// - `audit.jsonl`（编排器执行轨迹：node_started / node_completed / 重跑审计）
+/// - `exec-<N>/`（逐执行 driver 记录：state.json / driver.done.json / audit /
+///   submission / sessions——按落盘时刻实际存在的目录枚举精确前缀；治理环
+///   单线程，审查期间不会新增执行目录）
+/// - `llm-calls/`（全部角色原始模型调用记录）
+///
+/// 内核 deny 覆盖这些路径的一切读取通道（glob 展开、相对路径、符号链接、
+/// python `open()` 都在 open(2) 处被拒，实测），命令文本不再需要字符串级
+/// 规则；旧 bash 锚/ws 圈禁与扫掠根规则随之移除——它们既被
+/// `cd R/ws && cat R/*.jsonl` 的 glob 绕过（字符串匹配发生在内核外），又
+/// 误伤合法主动验证（`git diff HEAD~1..HEAD` 的 `..`、批准参考树的
+/// grep/find/ls）。保留的这条规则按实际访问对象（被禁路径前缀）拒绝
+/// read/write 类工具调用，与内核边界同集，零误伤。
+fn ablation_a1_rules(opts: &ReviewerHostOptions) -> Result<Vec<serde_json::Value>> {
+    let read_prefixes: Vec<String> = a1_evidence_entries(&review_run_root(opts)?)?
+        .into_iter()
+        .map(|(path, _kind)| path.to_string_lossy().into_owned())
+        .collect();
+    Ok(vec![serde_json::json!({
+        "name": "ablation-a1-deny-process-evidence-read",
+        "description": "A1 去执行过程证据：read/write 类工具进 audit.jsonl / exec-N / llm-calls → 拒绝（与内核 Seatbelt 边界同集的工具层对齐；真实读面隔离由 host-pi 包装器组合 profile 落到 reviewer 进程树）",
+        "priority": 1,
+        "path_prefixes": read_prefixes,
+        "action": "deny",
+    })])
+}
+
+/// host-pi 包装器消费的内核边界钩子：指向本驱动落盘的 sbpl 片段（A1 被禁
+/// 过程证据的 deny 子句）。包装器把它追加到基础 profile 后**单次**应用——
+/// 沙箱不能嵌套（已沙箱进程再 sandbox-exec 直接 EPERM，实测 rc=71），组合
+/// 是扩展边界的唯一途径。
+const HOST_PI_EXTRA_SB_ENV: &str = "HOST_PI_EXTRA_SB";
+
+/// harness host-pi 包装器目录的固定 profile 文件名（`prepare_host_pi_isolation`
+/// 落盘；本驱动以"PATH 首位可执行 `pi` 旁存在该文件"识别 harness 包装器）。
+const HOST_PI_WRAPPER_PROFILE: &str = "host-pi.sb";
+
+/// A1 内核边界片段落盘文件名（`<review_dir>/a1-boundary.sb`）。
+const A1_BOUNDARY_FILE: &str = "a1-boundary.sb";
+
+/// A1 内核边界句柄：spawn 改走 harness host-pi 包装器并注入
+/// [`HOST_PI_EXTRA_SB_ENV`]，使被禁过程证据的读取拒绝落到真实 reviewer
+/// 进程树——而不是只落一份无人消费的配置文件。
+struct A1KernelBoundary {
+    /// 解析出的 host-pi 包装器绝对路径（PATH 首位 pi，带 host-pi.sb 标记）。
+    wrapper: PathBuf,
+    /// 落盘的 sbpl deny 片段路径（HOST_PI_EXTRA_SB_ENV 指向它）。
+    extra_profile: PathBuf,
+}
+
+/// 枚举 run 根下 A1 被禁过程证据：`(路径, sbpl 过滤形态)`——文件用
+/// `literal`（只禁该文件），目录用 `subpath`（目录自身 readdir + 全部
+/// 后代，实测含目录自身）。`root` 需为绝对路径；给内核过滤的调用方须传
+/// canonical 形态（Seatbelt 按解析后路径匹配，符号链接拼出的前缀匹配不到
+/// 真实访问）。
+fn a1_evidence_entries(root: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
+    let mut entries = vec![
+        (root.join("audit.jsonl"), "literal"),
+        (root.join("llm-calls"), "subpath"),
+    ];
+    let mut exec_numbers: Vec<u32> = Vec::new();
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("list run root {} for A1 exec dirs", root.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix("exec-") {
+            if let Ok(n) = rest.parse::<u32>() {
+                exec_numbers.push(n);
+            }
+        }
+    }
+    exec_numbers.sort_unstable();
+    for n in exec_numbers {
+        entries.push((root.join(format!("exec-{n}")), "subpath"));
+    }
+    Ok(entries)
+}
+
+/// A1 内核边界准备（仅 NoProcessEvidence 档位调用）：
+///
+/// 1. 宿主能力 fail-closed：非 macOS / 缺 `/usr/bin/sandbox-exec` / PATH 首位
+///    `pi` 不是 harness host-pi 包装器（旁无 `host-pi.sb`）→ 显式拒绝启动
+///    A1 审查（不跑一个边界只在策略字符串里生效的消融，也不声称跨平台
+///    通过）；
+/// 2. 落盘边界片段 `<review_dir>/a1-boundary.sb`：对被禁路径
+///    `(deny file-read-data …)`——只封 W07 A1 约定的读面（本实验约定被禁
+///    过程记录，不承诺通用完备）：glob/相对路径/符号链接/python 都在
+///    open(2) 被拒（实测）。其余一切（ws 产物 / 审查 inputs/outputs /
+///    显式参考树 / git revision 范围检索 / 写面）不受影响——编排器与收割
+///    在沙箱外照常落 audit.jsonl、llm-calls、exec-N，I04 原件保持；
+/// 3. 边界事实进审查目录审计（机制 / 包装器 / 被禁路径清单）。
+fn prepare_a1_kernel_boundary(opts: &ReviewerHostOptions, work: &Path) -> Result<A1KernelBoundary> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (opts, work);
+        bail!(
+            "A1 reviewer isolation requires macOS Seatbelt for the kernel-enforced \
+             evidence read boundary; this host is not macOS — refusing to run an \
+             unenforced A1 review"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            bail!(
+                "A1 reviewer isolation requires /usr/bin/sandbox-exec (macOS \
+                 Seatbelt) and it is missing — refusing to run an A1 review \
+                 without a kernel-enforced evidence read boundary"
+            );
+        }
+        let wrapper = resolve_host_pi_wrapper()?;
+        let run_root = review_run_root(opts)?;
+        let canonical_root = run_root
+            .canonicalize()
+            .with_context(|| format!("canonicalize run root {} for A1 kernel boundary", run_root.display()))?;
+        let entries = a1_evidence_entries(&canonical_root)?;
+        let mut profile_text = String::from(
+            "; A1 reviewer evidence boundary (alfred-reviewer host driver)\n\
+             ; denied process evidence for this reviewer process tree\n",
+        );
+        for (path, kind) in &entries {
+            let quoted = sb_quote(path)?;
+            profile_text.push_str(&format!("(deny file-read-data ({} {}))\n", kind, quoted));
+        }
+        let extra_profile = work.join(A1_BOUNDARY_FILE);
+        std::fs::write(&extra_profile, profile_text)
+            .with_context(|| format!("write A1 seatbelt boundary {}", extra_profile.display()))?;
+        let denied: Vec<String> = entries
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .collect();
+        append_review_audit(
+            work,
+            "review_a1_kernel_boundary",
+            &serde_json::json!({
+                "mechanism": "host-pi-wrapper-composed-seatbelt",
+                "hook": HOST_PI_EXTRA_SB_ENV,
+                "wrapper": wrapper.to_string_lossy(),
+                "extra_profile": extra_profile.to_string_lossy(),
+                "deny_read": denied,
+            }),
+        )?;
+        Ok(A1KernelBoundary {
+            wrapper,
+            extra_profile,
+        })
+    }
+}
+
+/// 在 PATH 上解析 harness host-pi 包装器（A1 内核边界的真实执行者）。
+///
+/// 按本进程 spawn `pi` 的同序（execvp 首个命中）取候选，并要求其旁存在
+/// [`HOST_PI_WRAPPER_PROFILE`]（`prepare_host_pi_isolation` 的固定落盘），
+/// 以此区分 harness Seatbelt 包装器与裸 `pi`。命中裸 `pi` / 无 `pi` =
+/// 本宿主无法把 A1 边界落到真实进程 → 显式拒绝（fail-closed：绝不静默跑
+/// 一个钩子无人消费、边界只在策略文件里的消融审查）。
+#[cfg(target_os = "macos")]
+fn resolve_host_pi_wrapper() -> Result<PathBuf> {
+    let path_var = std::env::var("PATH").context("resolve host-pi wrapper: PATH is not set")?;
+    for dir in path_var.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join("pi");
+        if !is_executable_file(&candidate) {
+            continue;
+        }
+        let wrapper_profile = candidate.parent().map(|p| p.join(HOST_PI_WRAPPER_PROFILE));
+        let is_harness_wrapper = wrapper_profile.map(|p| p.is_file()).unwrap_or(false);
+        if !is_harness_wrapper {
+            bail!(
+                "A1 reviewer isolation requires the native host-pi Seatbelt wrapper \
+                 first on PATH; resolved pi {} carries no {} beside it \
+                 (prepare_host_pi_isolation layout) — refusing to run an A1 review \
+                 without a kernel-enforced read boundary",
+                candidate.display(),
+                HOST_PI_WRAPPER_PROFILE
+            );
+        }
+        return Ok(candidate);
+    }
+    bail!(
+        "A1 reviewer isolation found no executable pi on PATH — the native host-pi \
+         Seatbelt wrapper is required to enforce the evidence read boundary; \
+         refusing to run an A1 review"
+    );
+}
+
+/// `path` 是否为可执行普通文件（近似 execvp 语义：目录不是可执行目标）。
+#[cfg(target_os = "macos")]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// sbpl 字符串字面量（与 harness `prepare_host_pi_isolation` 的 json.dumps
+/// 引用同构：serde_json 输出自带外层引号，即 `(literal "/abs/path")` 形态）。
+fn sb_quote(path: &Path) -> Result<String> {
+    serde_json::to_string(&path.to_string_lossy().into_owned())
+        .context("json-escape seatbelt path literal")
+}
+
+/// 审查目录审计追加（一行 JSONL；与 exec_review/plan_review 的 append_audit
+/// 同构——host 层自记消融档位，落 `<review_dir>/audit.jsonl`）。
+fn append_review_audit(run_dir: &Path, event: &str, data: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    let line = serde_json::json!({
+        "event": event,
+        "at": now_rfc3339(),
+        "data": data,
+    });
+    let path = run_dir.join("audit.jsonl");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create review audit parent {}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open review audit {}", path.display()))?;
+    writeln!(file, "{}", line)
+        .with_context(|| format!("append review audit {}", path.display()))
 }
 
 /// 最小正则转义（只转义路径常见元字符；serde_json 已处理引号层）。

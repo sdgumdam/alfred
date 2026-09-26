@@ -23,6 +23,10 @@ pub struct TaskGenParams {
     pub bridge_model: String,
     /// 宿主侧模型 max_tokens（桥代发生成配置；eval 路径曾经 `--max-tokens` 传入）。
     pub max_tokens: u32,
+    /// 宿主侧模型声明上下文窗口（config.yml `contextWindow`；None = 未声明
+    /// ——env 覆盖/mockllm 路径不猜容量）。渲染为 driver.py 的 CONTEXT_WINDOW
+    /// （Python 字面量：整数或 None），声明时写进 pi models.json。
+    pub context_window: Option<u32>,
     /// 容器内工作区路径（"/workspace"）。
     pub workspace_dir: String,
     /// 容器内执行用户（"root"）。
@@ -46,6 +50,18 @@ pub struct TaskGenParams {
     pub done_marker: String,
     /// docker compose 项目名基座（Inspect 加 uuid 后缀）。
     pub task_name: String,
+    /// 宿主侧原生 session 保留目录（`<run>/sessions`，绝对路径；compose 挂载
+    /// 源）。driver 据此把 pi RPC 返回的容器内 sessionFile 精确映射到宿主
+    /// 保留位置（见 executor_driver.py.tmpl `_session_record`）。
+    pub sessions_dir_host: String,
+    /// G1 native_inspect 外层实验绑定（非秘密引用的 JSON 对象原文；空串 =
+    /// 未绑定）。注入 driver 后随 done 记录回传——外层按 run_ref 关联本
+    /// 执行，native_exec_id 保持 exec 目录身份，两者不混用。
+    pub evidence_binding: String,
+    /// 任务环境 compose 的 `${SAMPLE_METADATA_*}` 插值键值（G1 真实环境：
+    /// driver 的 sample_init 用它们解析 compose 引用，与原任务装载同一
+    /// 解析链）。空 = compose 无插值引用（sample_init 行为与既有一致）。
+    pub sandbox_metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// 执行者驱动 prompt 的工作区挂载锚（src 嵌套歧义治本）。
@@ -86,6 +102,13 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
         ("__PI_MODEL_JSON__", json(&params.pi_model)?),
         ("__BRIDGE_MODEL_JSON__", json(&params.bridge_model)?),
         ("__MAX_TOKENS__", params.max_tokens.to_string()),
+        (
+            "__CONTEXT_WINDOW__",
+            params
+                .context_window
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "None".into()),
+        ),
         ("__WORKSPACE_DIR_JSON__", json(&params.workspace_dir)?),
         ("__SANDBOX_USER_JSON__", json(&params.sandbox_user)?),
         ("__AGT_EXT_JSON__", json(&params.agt_ext)?),
@@ -101,8 +124,23 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
             format!("{}", params.settle_grace_seconds),
         ),
         ("__TIME_LIMIT_SECS__", format!("{}", params.time_limit_secs)),
+        ("__SESSIONS_DIR_HOST_JSON__", json(&params.sessions_dir_host)?),
+        (
+            "__EVIDENCE_BINDING_JSON__",
+            json(if params.evidence_binding.trim().is_empty() {
+                "null"
+            } else {
+                &params.evidence_binding
+            })?,
+        ),
         ("__DONE_MARKER_JSON__", json(&params.done_marker)?),
         ("__TASK_NAME_JSON__", json(&params.task_name)?),
+        // 任务环境插值键（JSON 对象字面量，driver 直接作 Python dict 用）。
+        (
+            "__SANDBOX_METADATA_JSON__",
+            serde_json::to_string(&params.sandbox_metadata)
+                .context("json-encode sandbox metadata")?,
+        ),
     ];
     for (token, value) in inject {
         if !out.contains(token) {
@@ -120,6 +158,7 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
         "__PI_MODEL_JSON__",
         "__BRIDGE_MODEL_JSON__",
         "__MAX_TOKENS__",
+        "__CONTEXT_WINDOW__",
         "__WORKSPACE_DIR_JSON__",
         "__AGT_AUDIT_PATH_JSON__",
         "__REF_VOLUMES_JSON__",
@@ -130,6 +169,9 @@ pub fn generate_task_py(params: &TaskGenParams) -> Result<String> {
         "__TIME_LIMIT_SECS__",
         "__DONE_MARKER_JSON__",
         "__TASK_NAME_JSON__",
+        "__SESSIONS_DIR_HOST_JSON__",
+        "__EVIDENCE_BINDING_JSON__",
+        "__SANDBOX_METADATA_JSON__",
     ] {
         if out.contains(token) {
             anyhow::bail!("template token replacement incomplete: {token}");

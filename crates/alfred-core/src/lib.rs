@@ -12,6 +12,7 @@ pub mod dagspec;
 pub mod governance;
 pub mod request;
 pub mod session;
+pub mod session_index;
 pub mod util;
 pub mod verdict;
 pub mod visibility;
@@ -26,8 +27,8 @@ pub use conversation::{
 };
 pub use dagspec::{DagSpec, Edge, PlanNode};
 pub use governance::{
-    route, GovernanceEvent, GovernanceOptions, GovernanceRun, GovernanceState,
-    GovernanceStateMachine, OwnerDecision, RoutingDecision, TransitionError,
+    route, GovernanceAblation, GovernanceEvent, GovernanceOptions, GovernanceRun,
+    GovernanceState, GovernanceStateMachine, OwnerDecision, RoutingDecision, TransitionError,
 };
 pub use request::OwnerRequest;
 pub use session::SessionDoc;

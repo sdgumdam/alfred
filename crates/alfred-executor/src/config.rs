@@ -38,6 +38,9 @@ pub struct ExecutorModel {
     /// max_tokens（reasoning 模型思考耗 token：4096 实测会被思考吃光致正文空/
     /// 无 tool_calls——缺省 8192，见 R6c tier3b 根因与 R3 验方实测）。
     pub max_tokens: u32,
+    /// 声明上下文窗口（config.yml `contextWindow`；None = 未声明——env 覆盖
+    /// /mockllm 路径不猜容量；pi 投影层省略该键由 pi 自身缺省接管）。
+    pub context_window: Option<u32>,
     /// 原始 inspect 模型 id（不经 openai-api/ 前缀包装），如 mockllm/model。
     pub raw_id: bool,
 }
@@ -74,6 +77,11 @@ struct ModelEntry {
     /// 解析会静默吞掉该键（None → 恒落 4096 下限）。alias 同时接受两种拼写。
     #[serde(default, alias = "maxTokens")]
     max_tokens: Option<u32>,
+    /// config.yml 用 `contextWindow`（camelCase）；alias 同上。宿主侧
+    /// run-scoped config（inspect_harness/alfred_method.py）总是声明两容量；
+    /// 缺省 None = 未声明，不猜。
+    #[serde(default, alias = "contextWindow")]
+    context_window: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +139,7 @@ fn raw_builtin_model(model_id: &str) -> Option<ExecutorModel> {
             base_url: String::new(),
             api_key: String::new(),
             max_tokens: 1024,
+            context_window: None,
             raw_id: true,
         })
     } else {
@@ -168,10 +177,11 @@ fn load_role_model(role: &str) -> Result<ExecutorModel> {
     }
 
     let entry = cfg.models.iter().find(|m| m.id == model_id);
-    let (provider_name, max_tokens) = match entry {
+    let (provider_name, max_tokens, context_window) = match entry {
         Some(e) => (
             e.provider.clone(),
             e.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            e.context_window,
         ),
         None => {
             // env 覆盖的模型不在列表：沿用基础角色的 provider；基础角色缺失
@@ -186,7 +196,7 @@ fn load_role_model(role: &str) -> Result<ExecutorModel> {
                         "model '{model_id}' not in models list and no base role model to inherit provider"
                     )
                 })?;
-            (base.provider.clone(), DEFAULT_MAX_TOKENS)
+            (base.provider.clone(), DEFAULT_MAX_TOKENS, None)
         }
     };
     let prov = cfg.providers.get(&provider_name).with_context(|| {
@@ -202,6 +212,7 @@ fn load_role_model(role: &str) -> Result<ExecutorModel> {
         base_url,
         api_key,
         max_tokens,
+        context_window,
         raw_id: false,
     })
 }

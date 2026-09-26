@@ -46,6 +46,7 @@ fn mounts(subs: &[&str]) -> ExecutorMounts {
         ref_volumes: vec![],
         agt_dir: None,
         agt_audit_dir: None,
+        sessions_dir: None,
     }
 }
 
@@ -112,4 +113,43 @@ fn compose_with_distinct_subdirs_mounts_first_as_root() {
         1,
         "{yaml}"
     );
+}
+
+#[test]
+fn task_network_requires_truthful_node_permission_and_keeps_restrictions() {
+    use alfred_executor::compose_gen::{generate_task_env_compose, validate_task_network};
+    let ws = make_ws("task-network");
+    let original = ws.parent().unwrap().join("task.yaml");
+    fs::write(&original, r#"
+services:
+  default:
+    image: dependency:fixed
+    command: tail -f /dev/null
+    extra_hosts: ["github.com:127.0.0.1"]
+    networks: [task]
+    depends_on:
+      mysql:
+        condition: service_healthy
+  mysql:
+    image: mysql:fixed
+    healthcheck:
+      test: [CMD, mysqladmin, ping]
+    networks: [task]
+networks:
+  task:
+    internal: true
+"#).unwrap();
+    assert!(validate_task_network(false, Some(&original)).is_err());
+    validate_task_network(true, Some(&original)).unwrap();
+    assert!(validate_task_network(true, None).is_err());
+    validate_task_network(false, None).unwrap();
+    let rendered = generate_task_env_compose(&original, &ws, "executor:fixed", &mounts(&["src"])).unwrap();
+    let before: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(&original).unwrap()).unwrap();
+    let after: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+    assert_eq!(before["networks"], after["networks"]);
+    assert_eq!(before["services"]["mysql"], after["services"]["mysql"]);
+    assert_eq!(before["services"]["default"]["extra_hosts"], after["services"]["default"]["extra_hosts"]);
+    fs::write(&original, "services:\n  default:\n    network_mode: none\n").unwrap();
+    assert!(validate_task_network(true, Some(&original)).is_err());
+    validate_task_network(false, Some(&original)).unwrap();
 }

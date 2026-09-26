@@ -20,6 +20,7 @@ fn params(time_limit_secs: u32) -> TaskGenParams {
         pi_model: "inspect-bridge/inspect".into(),
         bridge_model: "inspect/mockllm/model".into(),
         max_tokens: 8192,
+        context_window: None,
         workspace_dir: "/workspace".into(),
         sandbox_user: "root".into(),
         agt_ext: String::new(),
@@ -31,6 +32,9 @@ fn params(time_limit_secs: u32) -> TaskGenParams {
         time_limit_secs,
         done_marker: "/tmp/driver.done.json".into(),
         task_name: "alfred-executor".into(),
+        sessions_dir_host: "/tmp/run-1/sessions".into(),
+        evidence_binding: String::new(),
+        sandbox_metadata: std::collections::BTreeMap::new(),
     }
 }
 
@@ -46,4 +50,39 @@ fn time_limit_secs_renders_verbatim_into_driver() {
             "time_limit_secs={tl} 必须原样渲染（不得回落缺省 600）"
         );
     }
+}
+
+#[test]
+fn sessions_dir_host_renders_verbatim_into_driver() {
+    // 原生 session 宿主保留目录必须原样渲染（driver 据此把 pi RPC 返回的
+    // 容器内 sessionFile 精确映射到宿主保留路径；参数与渲染之间无第二真源）。
+    let py = generate_task_py(&params(600)).expect("generate driver.py");
+    assert!(
+        py.contains("SESSIONS_DIR_HOST = \"/tmp/run-1/sessions\""),
+        "sessions_dir_host 必须原样渲染进 driver.py"
+    );
+    assert!(
+        py.contains("CONTAINER_SESSIONS_DIR = \"/tmp/.alfred-sessions\""),
+        "容器内挂载点常量必须与 compose 挂载一致"
+    );
+}
+
+#[test]
+fn context_window_renders_verbatim_into_driver() {
+    // 容量透传回归锁（2026-09-26 用户指令：输入输出用模型声明最大值）：
+    // 声明的 contextWindow 原样渲染 CONTEXT_WINDOW（None 原样渲染 None）
+    // ——参数与渲染之间无第二真源。
+    let mut p = params(600);
+    p.context_window = Some(1048576);
+    let py = generate_task_py(&p).expect("generate driver.py");
+    assert!(
+        py.contains("CONTEXT_WINDOW = 1048576"),
+        "declared context_window must render verbatim: {}",
+        &py[..py.len().min(4000)]
+    );
+    let py = generate_task_py(&params(600)).expect("generate driver.py");
+    assert!(
+        py.contains("CONTEXT_WINDOW = None"),
+        "undeclared context_window must render None verbatim"
+    );
 }

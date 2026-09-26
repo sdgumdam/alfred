@@ -30,9 +30,10 @@ fn walk(root: &Path, dir: &Path, map: &mut BTreeMap<String, FileEntry>) -> Resul
             continue;
         }
         if ft.is_dir() {
-            // 跳过 VCS 内部目录（R6e：ws 是 git 仓库——`.git` 内部文件不算执行产物，
-            // 混入会污染 artifact 的文件清单/SHA，且让 diff 出现基线噪音）。
-            if path.file_name().and_then(|s| s.to_str()) == Some(".git") {
+            // VCS internals and installed dependency trees are environment
+            // state, not executor source artifacts (same boundary as inputs).
+            if matches!(path.file_name().and_then(|s| s.to_str()),
+                Some(".git" | ".venv" | "node_modules")) {
                 continue;
             }
             walk(root, &path, map)?;

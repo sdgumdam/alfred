@@ -6,6 +6,7 @@
 //!      回归锁：driver 静默死亡无 done 不得演成"等满超时"或永等。
 //!   2. 驱动子进程带退出码死亡（无 done）→ `Crashed(Some(code))`。
 //!   3. 驱动子进程写 done 记录 → [`DriverOutcome::Done`]（status 透传）。
+//!   4. done 记录的 `session` 原生 session 关联原样解析（null/残缺 → None）。
 //!
 //! 治理侧消费语义（Crashed → fail_run 落 state.json=crashed → 机械重跑路由）
 //! 由 governance 侧单测与 e2e r3（机械重跑面）覆盖。
@@ -14,7 +15,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use alfred_executor::config::ExecutorModel;
-use alfred_executor::driver::{poll_container_driver, spawn_container_driver, DriverOutcome};
+use alfred_executor::driver::{poll_container_driver, spawn_container_driver, DriverOutcome, DriverSession, read_done_marker};
 
 /// 占位模型（raw 内建形态，无 key/base_url 注入——poll 路径不消费模型）。
 fn model() -> ExecutorModel {
@@ -24,6 +25,7 @@ fn model() -> ExecutorModel {
         base_url: String::new(),
         api_key: String::new(),
         max_tokens: 8192,
+        context_window: None,
         raw_id: true,
     }
 }
@@ -98,8 +100,65 @@ fn driver_done_record_routes_done() {
         DriverOutcome::Done(alfred_executor::driver::DriverDone {
             status: "success".into(),
             error: None,
+            session: None,
         }),
         "done 记录 = Done（status 透传）"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// 原生 session 关联消费锁：done 记录的 `session` 对象（id/file/host_file/
+/// file_exists）必须原样进入 [`DriverDone`]——身份取回链的宿主侧消费面。
+/// 身份来自 pi RPC `get_state` 实测响应（驱动模板 `_session_record` 产出），
+/// 宿主侧只解析不伪造：null/残缺（缺 id 或 file）→ None。
+#[test]
+fn driver_done_record_session_identity_roundtrip() {
+    let dir = temp_work_dir("done-session");
+    let done = dir.join("driver.done.json");
+    let doc = serde_json::json!({
+        "event": "done",
+        "status": "success",
+        "run_id": "run-1",
+        "session": {
+            "id": "01a0d8a5-5928-71a3-b9d6-bfd16633128e",
+            "file": "/tmp/.alfred-sessions/2026-09-25T12-58-30-056Z_01a0d8a5-5928-71a3-b9d6-bfd16633128e.jsonl",
+            "host_file": "/state/alfred/runs/run-1/sessions/2026-09-25T12-58-30-056Z_01a0d8a5-5928-71a3-b9d6-bfd16633128e.jsonl",
+            "file_exists": true,
+        },
+    });
+    std::fs::write(&done, format!("{doc}\n")).unwrap();
+    let parsed = read_done_marker(&done)
+        .expect("read done marker")
+        .expect("done record present");
+    assert_eq!(
+        parsed.session,
+        Some(DriverSession {
+            id: "01a0d8a5-5928-71a3-b9d6-bfd16633128e".into(),
+            file: "/tmp/.alfred-sessions/2026-09-25T12-58-30-056Z_01a0d8a5-5928-71a3-b9d6-bfd16633128e.jsonl".into(),
+            host_file: Some("/state/alfred/runs/run-1/sessions/2026-09-25T12-58-30-056Z_01a0d8a5-5928-71a3-b9d6-bfd16633128e.jsonl".into()),
+            file_exists: Some(true),
+        }),
+        "session 身份字段必须原样透传（id/file/host_file/file_exists）"
+    );
+
+    // null（未取到身份）→ None：如实缺席，不伪造。
+    std::fs::write(&done, "{\"event\":\"done\",\"status\":\"success\",\"session\":null}\n").unwrap();
+    let parsed = read_done_marker(&done)
+        .expect("read done marker")
+        .expect("done record present");
+    assert_eq!(parsed.session, None, "session: null → None");
+
+    // 残缺身份（缺 file）→ None：不以部分字段造身份。
+    std::fs::write(
+        &done,
+        "{\"event\":\"done\",\"status\":\"success\",\"session\":{\"id\":\"x\"}}\n",
+    )
+    .unwrap();
+    let parsed = read_done_marker(&done)
+        .expect("read done marker")
+        .expect("done record present");
+    assert_eq!(parsed.session, None, "残缺 session（缺 file）→ None");
+
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -107,6 +107,7 @@ fn compose_mounts_agt_policy_ro_and_audit_rw() {
         ref_volumes: vec![],
         agt_dir: Some(staged.clone()),
         agt_audit_dir: Some(staged.join("audit")),
+        sessions_dir: None,
     };
     let compose = generate_executor_compose(&ws, "alfred-executor:latest", &mounts)
         .expect("generate compose with AGT");
@@ -131,6 +132,7 @@ fn compose_without_agt_has_no_agt_mounts() {
         ref_volumes: vec![],
         agt_dir: None,
         agt_audit_dir: None,
+        sessions_dir: None,
     };
     let compose = generate_executor_compose(&ws, "alfred-executor:latest", &mounts)
         .expect("generate compose without AGT");
@@ -153,6 +155,7 @@ fn params(agt: (&str, &str, &str)) -> TaskGenParams {
         pi_model: "inspect-bridge/inspect".into(),
         bridge_model: "inspect/mockllm/model".into(),
         max_tokens: 8192,
+        context_window: None,
         workspace_dir: "/workspace".into(),
         sandbox_user: "root".into(),
         agt_ext: agt.0.into(),
@@ -164,6 +167,9 @@ fn params(agt: (&str, &str, &str)) -> TaskGenParams {
         time_limit_secs: 600,
         done_marker: "/tmp/driver.done.json".into(),
         task_name: "alfred-executor".into(),
+        sessions_dir_host: "/tmp/run-1/sessions".into(),
+        evidence_binding: String::new(),
+        sandbox_metadata: std::collections::BTreeMap::new(),
     }
 }
 

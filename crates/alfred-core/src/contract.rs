@@ -34,7 +34,8 @@ pub struct SandboxProfile {
     /// 需要安装的依赖包。
     #[serde(default)]
     pub packages: Vec<String>,
-    /// 是否允许联网。**默认拒绝**（施工清单 §2.5 / P2）。
+    /// 是否允许联网。**默认拒绝**（施工清单 §2.5 / P2）。true 仅使用属主
+    /// 已绑定的任务 compose 网络；false 必须实际 network none。
     #[serde(default)]
     pub network: bool,
     /// 契约声明的工作区子目录（相对持久 ws 的**相对路径**；R6a/M5 显式声明制）。
