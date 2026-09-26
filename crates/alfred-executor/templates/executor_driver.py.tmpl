@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 import os
 import time
-
+import signal
 import anyio
 
 from inspect_ai.agent import sandbox_agent_bridge
@@ -254,6 +254,35 @@ async def _cleanup_running_projects() -> None:
     for project in list(running_projects()):
         await project_cleanup(project, quiet=True)
 
+def _record_project(raw_envs: dict) -> None:
+    """把 sample_init 实际创建的 compose 项目身份落盘（孤儿精确回收依据）。
+
+    Inspect 项目名 = 基座 + 随机 uuid 后缀（`inspect-<base>-i<6hex>`），只有
+    本驱动进程知道确切值；被不可捕获信号（SIGKILL）孤儿化后，任何前缀/全局
+    推断都无法精确定位（基座跨 run 共享）。sample_init 一返回即写：项目名 +
+    compose 文件 + 本进程 pid/解释器（回收方用同一解释器调 Inspect
+    project_cleanup）。sample_init 返回前被杀无记录——残余窗口由下次恢复的
+    审计如实区分，不猜项目名。
+    """
+    env = raw_envs.get("default")
+    project = getattr(env, "_project", None)
+    name = getattr(project, "name", None)
+    if not isinstance(name, str) or not name:
+        print("[alfred-driver] project record skipped: no project identity", flush=True)
+        return
+    record = {
+        "event": "project",
+        "project": name,
+        "task_name": TASK_NAME,
+        "compose_file": getattr(project, "config", None) or COMPOSE_FILE,
+        "pid": os.getpid(),
+        "python": sys.executable,
+        "recorded_at": time.time(),
+    }
+    path = Path(DONE_MARKER).parent / "driver.project.json"
+    with open(path, "w") as f:
+        json.dump(record, f)
+
 
 def _workspace_snapshot(root):
     files = {}
@@ -441,6 +470,7 @@ async def _run_container(session_info: dict) -> None:
             TASK_NAME, COMPOSE_FILE, metadata=SANDBOX_METADATA
         )
         session_info["cleanup_status"] = "open"
+        _record_project(raw_envs)
         await _prepare_workspace_state(raw_envs['default'], session_info)
         # CASE17-SIGNING: designated signing key enters the exact run sandbox
         # before the agent's first action; failure fails the run loudly.
@@ -493,6 +523,11 @@ async def _run_container(session_info: dict) -> None:
             if not settled or exit_code != 0:
                 raise RuntimeError(f"pi RPC did not settle (exit_code={exit_code})")
     finally:
+        # 收尾期先转为可捕获中断不可再打断：shield 只挡取消传播，挡不住默认
+        # SIGTERM 处置直接杀进程——SIG_IGN 后 compose down 才能跑完（真正
+        # 不可捕获的 SIGKILL 无进程内解法，由下次恢复按精确项目记录回收）。
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         # 清理必须 shield：超时取消（fail_after）时，finally 内的 await 会立即抛
         # CancelledError——shield 保证 compose down 跑完，不泄漏容器。
         try:
@@ -583,12 +618,50 @@ def _write_done(status: str, error: str | None, session_info: dict) -> None:
         json.dump(doc, f)
 
 
+class _DriverInterrupted(BaseException):
+    """可捕获终止（SIGTERM/SIGINT）在事件循环接管窗口之外（anyio.run 启动
+    前/退出后）到达时的等价物：进 main 的既有收尾链（shield 清理 + done
+    记录），而不是默认处置直接杀进程。事件循环运行期间由
+    open_signal_receiver 接管（转取消，同一条收尾链）。
+    """
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+
+
+def _install_early_signal_handlers() -> None:
+    def _interrupt(signum, _frame):
+        raise _DriverInterrupted(signum)
+
+    signal.signal(signal.SIGTERM, _interrupt)
+    signal.signal(signal.SIGINT, _interrupt)
+
+
 async def _run_with_timeout(session_info: dict) -> None:
     # fail_after 是 async 上下文管理器（同步 with 会 NoEventLoopError）——包一层
     # async 函数再交给 anyio.run。超时后 _run_container 的 finally（shield 清理）
     # 先跑完，再向 main 抛 TimeoutError。
-    with anyio.fail_after(TIME_LIMIT_SECS):
-        await _run_container(session_info)
+    #
+    # 可捕获终止（SIGTERM/SIGINT）同一条收尾链：open_signal_receiver 把信号
+    # 转成本协程内的取消（interrupt_scope），_run_container 的 shield 清理
+    # （Inspect compose down + 项目登记回收）跑完后取消在本层吸收、正常返回，
+    # main 按 session_info 里的中断事实写 done(status="cancelled")。默认
+    # SIGTERM 处置会直接杀进程——finally/done 全跳过、容器孤立（case02-a2-r1
+    # 宿主取消事故的孤儿根因）——本层把它拉回既有超时收尾链，不做第二套
+    # 清理框架。
+    with anyio.CancelScope() as interrupt_scope:
+        with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
+            async with anyio.create_task_group() as tg:
+
+                async def _watch_signals() -> None:
+                    async for sig in signals:
+                        session_info["driver_interrupted"] = signal.Signals(sig).name
+                        interrupt_scope.cancel()
+                        return
+
+                tg.start_soon(_watch_signals)
+                with anyio.fail_after(TIME_LIMIT_SECS):
+                    await _run_container(session_info)
 
 
 def main() -> None:
@@ -597,11 +670,21 @@ def main() -> None:
     # 原生 session 身份容器：_drive_pi 从 get_state 响应填充（启动即查）；
     # 超时/异常路径已取到的身份保留，done 记录如实落盘。
     session_info: dict = {}
+    _install_early_signal_handlers()
     try:
         anyio.run(_run_with_timeout, session_info)
     except TimeoutError:
         status = "timed_out"
         error = f"driver timed out after {TIME_LIMIT_SECS:.0f}s"
+        print(f"[alfred-driver] {error}", flush=True)
+    except _DriverInterrupted as ex:
+        # 事件循环接管窗口外的可捕获终止：同 cancelled 语义收尾。
+        status = "cancelled"
+        error = f"driver interrupted by signal {ex.args[0]} outside the event loop"
+        print(f"[alfred-driver] {error}", flush=True)
+    except KeyboardInterrupt:
+        status = "cancelled"
+        error = "driver interrupted (KeyboardInterrupt) outside the event loop"
         print(f"[alfred-driver] {error}", flush=True)
     except Exception as ex:
         status = "error"
@@ -609,7 +692,17 @@ def main() -> None:
         print(f"[alfred-driver] driver failed: {error}", flush=True)
         raise
     finally:
+        # 写 done 期间不可被默认 SIGTERM 处置打断：receiver 退出时 asyncio 把
+        # 处置恢复为默认——先转 SIG_IGN 再落盘（不可捕获的 SIGKILL 无解）。
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # 事件循环内的中断已在上层吸收为正常返回：唯一事实源是
+        # session_info 的中断标记（先到的时间上限/异常不被覆盖）。
+        if status == "success" and session_info.get("driver_interrupted"):
+            status = "cancelled"
+            error = f"driver interrupted by {session_info['driver_interrupted']}"
         _write_done(status, error, session_info)
+
 
 
 if __name__ == "__main__":

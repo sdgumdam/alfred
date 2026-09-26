@@ -733,12 +733,59 @@ fn execution_step(run: &mut GovernanceRun, ctx: &GovernanceContext) -> Result<()
     let orphan_dir = ctx.run_dir.join(format!("exec-{}", run.execution_count + 1));
     if orphaned_driver_run(&orphan_dir) {
         run.execution_count += 1;
-        let err = anyhow::anyhow!(
-            "orphaned driver run {}: previous process died mid-poll \
-             (driver launched without done/state record)",
-            orphan_dir.display()
-        );
-        let intent = execution_failure_intent(run, &dagspec, &node, Some("crashed"), &err, true);
+        // G1 孤儿恢复 = 状态处置 + 资源回收两件事。先按孤儿 exec 目录里
+        // driver 落的精确项目身份记录（driver.project.json，sample_init 返回
+        // 即写）把 compose 项目 down 掉——现成 Inspect project_cleanup，精确
+        // 关联本孤儿，非全局扫描；无记录/回收失败 → 审计如实，不阻塞状态
+        // 路由。被杀驱动的容器不因恢复而泄漏，也不碰其他 run 的项目。
+        let reclaim = alfred_executor::driver::reclaim_orphaned_project(&orphan_dir);
+        match reclaim {
+            Ok(fact) => {
+                audit(&ctx.run_dir, "orphaned_project_reclaim", &fact)?;
+            }
+            Err(e) => {
+                audit(
+                    &ctx.run_dir,
+                    "orphaned_project_reclaim",
+                    &serde_json::json!({
+                        "reclaimed": false,
+                        "error": format!("{e:#}"),
+                    }),
+                )?;
+            }
+        }
+        // done 记录 status="cancelled" = 可捕获中断已完整收尾（shield 清理 +
+        // done 证书都在）：非机械失败，不自动重跑（取消不冒充可重试的瞬时
+        // 故障）——升级属主，失败原样保留；无 done（SIGKILL 类）维持既有
+        // crashed 语义机械重跑/耗尽升级。
+        let done_cancelled = alfred_executor::driver::read_done_marker(
+            &orphan_dir.join("driver.done.json"),
+        )
+        .ok()
+        .flatten()
+        .map(|done| done.status == "cancelled")
+        .unwrap_or(false);
+        let (failure_status, err) = if done_cancelled {
+            (
+                None,
+                anyhow::anyhow!(
+                    "orphaned driver run {} was cancelled (driver done record \
+                     carries status 'cancelled'): interrupted execution, not a \
+                     mechanical failure",
+                    orphan_dir.display()
+                ),
+            )
+        } else {
+            (
+                Some("crashed"),
+                anyhow::anyhow!(
+                    "orphaned driver run {}: previous process died mid-poll \
+                     (driver launched without done/state record)",
+                    orphan_dir.display()
+                ),
+            )
+        };
+        let intent = execution_failure_intent(run, &dagspec, &node, failure_status, &err, true);
         commit_intent(run, ctx, intent)?;
         return Ok(());
     }
@@ -876,8 +923,13 @@ fn execution_failure_intent(
     err: &anyhow::Error,
     orphaned: bool,
 ) -> StepIntent {
-    let Some(status) = failure_status else {
-        // 非机械的硬错误（如非默认沙箱档案）→ 升级属主，不悄悄放行。
+    // done=cancelled 是外部中断的如实终态（可捕获中断已走 shield 清理 +
+    // done 证书）：与 None 同路升级属主，不自动重跑——取消不冒充可重试的
+    // 机械瞬时故障，失败原样保留（audit 的 error 串携带 cancelled 事实）。
+    let mechanical_status = failure_status.filter(|s| *s != "cancelled");
+    let Some(status) = mechanical_status else {
+        // 非机械的硬错误（如非默认沙箱档案 / driver done=cancelled）→ 升级
+        // 属主，不悄悄放行。
         let mut effects = Effects::default();
         effects.audit(
             "execution_hard_error_escalated",
@@ -2041,6 +2093,56 @@ mod tests {
                 .any(|(name, data)| name == "mechanical_budget_exhausted_escalated"
                     && data["failure_status"] == "crashed"),
             "耗尽升级审计带 crashed 失败形态"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn orphaned_driver_cancelled_done_escalates_without_retry() {
+        // G1 可捕获中断的恢复语义：孤儿目录带 done(status="cancelled",
+        // cleanup_status="released")（方法层取消向原生子树发 SIGTERM → 驱动
+        // 走既有 shield 清理 + done 证书）= 外部中断已如实收尾——不是可重试
+        // 的机械瞬时故障：升级属主、失败原样保留，不自动重跑已取消的执行。
+        // 资源回收按 done 证书短路（本测试无 driver.project.json：证书即
+        // released 事实，审计如实记录，不猜项目名）。
+        let (mut run, ctx, dir) = run_in_executing("cancelled-done");
+        let orphan = orphan_exec_dir(&dir, 1); // execution_count=0 → 下一目录 exec-1
+        std::fs::write(
+            orphan.join("driver.done.json"),
+            r#"{"event":"done","status":"cancelled","cleanup_status":"released"}"#,
+        )
+        .unwrap();
+
+        execution_step(&mut run, &ctx).unwrap();
+
+        assert_eq!(
+            run.state(),
+            GovernanceState::Escalated,
+            "cancelled 孤儿 → 升级属主，不自动重跑"
+        );
+        assert_eq!(run.attempts_used, 0, "外部取消不计入机械预算");
+        let events = run_audit_events(&dir);
+        assert!(
+            events
+                .iter()
+                .any(|(name, data)| name == "execution_hard_error_escalated"
+                    && data["error"].as_str().unwrap().contains("cancelled")),
+            "升级审计携带 cancelled 事实"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(name, data)| name == "orphaned_project_reclaim"
+                    && data["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("certifies cleanup released")),
+            "回收审计如实记录 done 证书（不重复 down）"
+        );
+        assert!(
+            !events.iter().any(|(name, _)| name == "mechanical_retry"),
+            "取消不触发机械重跑"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

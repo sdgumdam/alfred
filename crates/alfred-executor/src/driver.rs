@@ -19,7 +19,11 @@
 //!   settled / 容器未产出）——done 照发、驱动进程退出码非零；分支看 status。
 //! - `{"event":"done","status":"timed_out","error":"..."}`：驱动脚本自限时
 //!   （`anyio.fail_after`）触达——先清理容器再写 done。
-//! - 进程消失无 done = crash / 被 kill。
+//! - `{"event":"done","status":"cancelled","error":"..."}`：可捕获终止
+//!   （SIGTERM/SIGINT——宿主取消转发/人工终止）——先走同一 shield 清理
+//!   （Inspect compose down）再写 done；非机械失败，恢复路由不自动重跑。
+//! - 进程消失无 done = crash / 被不可捕获信号杀（SIGKILL；孤儿恢复按
+//!   `driver.project.json` 的精确项目记录回收，见 [`reclaim_orphaned_project`]）。
 //! - done 记录另携 `session`（原生 session 关联；未取到身份 = null）：
 //!   `{id, file, host_file, file_exists}`——`id`/`file` 来自 pi RPC
 //!   `get_state` 实测响应（身份在 RPC 启动即分配，先于 prompt），`host_file`
@@ -266,6 +270,140 @@ pub fn read_done_marker(path: &Path) -> Result<Option<DriverDone>> {
         }));
     }
     Ok(None)
+}
+
+/// G1 孤儿项目回收：按孤儿 exec 目录的 `driver.project.json`（驱动在
+/// sample_init 一返回就落盘的精确项目身份）把孤儿 compose 项目 down 掉。
+///
+/// 只用现成 Inspect 回收入口：`project_cleanup`（与驱动自身收尾、
+/// `DockerSandboxEnvironment.sample_cleanup` 同一接口），ComposeProject 用记录
+/// 里的项目名 + compose 文件重建——精确关联本孤儿，不做 docker 全局扫描/前缀
+/// 猜测（项目名基座跨 run 共享，前缀不唯一）。解释器用驱动记录的
+/// `sys.executable`（跑得起驱动的解释器必有 inspect_ai；缺失回落
+/// [`python_binary`] 解析链）。
+///
+/// 返回值 = 审计事实（reclaimed/原因/错误），调用方落 audit：
+/// - 无 `driver.project.json`（sample_init 返回前被杀）→ `reclaimed:false,
+///   reason:"no driver.project.json"`——不猜项目名；
+/// - done 记录已证 `cleanup_status == "released"`（可捕获中断的完整收尾）
+///   → 不重复 down；
+/// - 回收子进程失败/超时 → `reclaimed:false` + error——恢复路由不被资源
+///   回收失败阻塞（状态处置与资源回收分开，各自如实）。
+pub fn reclaim_orphaned_project(exec_dir: &Path) -> Result<Value> {
+    // done 记录已证明容器释放（可捕获中断的完整收尾）→ 最便宜的既有事实
+    // 先查：不重复 down，也不需要项目记录。
+    if let Ok(done_text) = std::fs::read_to_string(exec_dir.join("driver.done.json")) {
+        if let Ok(done) = serde_json::from_str::<Value>(&done_text) {
+            if done.get("cleanup_status").and_then(|s| s.as_str()) == Some("released") {
+                return Ok(serde_json::json!({
+                    "reclaimed": false,
+                    "reason": "driver done record certifies cleanup released",
+                }));
+            }
+        }
+    }
+    let record_path = exec_dir.join("driver.project.json");
+    let text = match std::fs::read_to_string(&record_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_json::json!({
+                "reclaimed": false,
+                "reason": "no driver.project.json (driver killed before sample_init returned)",
+            }));
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("read driver.project.json")),
+    };
+    let rec: Value =
+        serde_json::from_str(&text).context("parse driver.project.json")?;
+    let Some(project) = rec.get("project").and_then(|p| p.as_str()) else {
+        return Ok(serde_json::json!({
+            "reclaimed": false,
+            "reason": "project identity missing in driver.project.json",
+        }));
+    };
+    let compose = rec
+        .get("compose_file")
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    let python = rec
+        .get("python")
+        .and_then(|p| p.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(python_binary);
+    let script = r#"
+import json, sys
+import anyio
+from inspect_ai.util._sandbox.docker.cleanup import project_cleanup
+from inspect_ai.util._sandbox.docker.util import ComposeProject
+name, config = sys.argv[1], (sys.argv[2] or None)
+project = ComposeProject(name=name, config=config)
+anyio.run(project_cleanup, project, True)
+print(json.dumps({"down": name}))
+"#;
+    let mut cmd = Command::new(python);
+    cmd.arg("-c")
+        .arg(script)
+        .arg(project)
+        .arg(compose.clone().unwrap_or_default())
+        .env_clear()
+        .envs(whitelisted_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(serde_json::json!({
+                "reclaimed": false,
+                "project": project,
+                "error": format!("spawn reclaim python failed: {e}"),
+            }));
+        }
+    };
+    // 有界等待：compose down 常规数秒；卡死不拖垮恢复路由。
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(if status.success() {
+                    serde_json::json!({
+                        "reclaimed": true,
+                        "project": project,
+                        "compose_file": compose,
+                    })
+                } else {
+                    let stderr = child
+                        .wait_with_output()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "reclaimed": false,
+                        "project": project,
+                        "error": format!("reclaim python exited {status}: {stderr}"),
+                    })
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(serde_json::json!({
+                        "reclaimed": false,
+                        "project": project,
+                        "error": "reclaim python timed out after 120s",
+                    }));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Ok(serde_json::json!({
+                    "reclaimed": false,
+                    "project": project,
+                    "error": format!("reclaim python poll failed: {e}"),
+                }));
+            }
+        }
+    }
 }
 
 /// 驱动子进程 env 白名单（`env_clear` 后注入）。
